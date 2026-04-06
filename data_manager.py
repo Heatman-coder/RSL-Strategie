@@ -208,16 +208,23 @@ class MarketDataManager:
                 with open(path_str, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     return data if isinstance(data, dict) else {}
-            except: pass
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON-Formatfehler in {path_str}: {e}")
+            except Exception as e:
+                logger.error(f"Fehler beim Laden von {path_str}: {e}")
         return {}
 
     def save_info_cache(self):
-        info_cache_file = self.config['ticker_info_cache_file']
-        info_cache_dir = os.path.dirname(info_cache_file)
-        if info_cache_dir:
-            os.makedirs(info_cache_dir, exist_ok=True)
-        with open(self.config['ticker_info_cache_file'], 'w', encoding='utf-8') as f:
-            json.dump(self.info_cache, f, indent=2)
+        path = self.config.get('ticker_info_cache_file', 'ticker_info_cache.json')
+        try:
+            info_cache_dir = os.path.dirname(path)
+            if info_cache_dir:
+                os.makedirs(info_cache_dir, exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(self.info_cache, f, indent=2)
+            logger.debug(f"Info-Cache erfolgreich gespeichert: {path}")
+        except Exception as e:
+            logger.error(f"Konnte Info-Cache nicht speichern ({path}): {e}")
 
     def clear_cache(self) -> None:
         self.cache = {}

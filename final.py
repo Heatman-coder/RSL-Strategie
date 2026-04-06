@@ -11,6 +11,7 @@ Refactoring based on User Request:
 """
 import os
 import codecs
+from dotenv import load_dotenv
 
 def _fix_bom_in_file(file_path: str) -> None:
     """Checks for and removes the UTF-8 BOM from a file if present."""
@@ -2014,32 +2015,56 @@ def _auto_adjust_delays() -> None:
         pass # Fails silently
 
 # --- MAIN EXECUTION ---
+def _setup_run_environment() -> None:
+    """Initialisiert FX-Kurse und passt Delays an."""
+    logger.info("\n--- GLOBAL RSL V68 (Dashboard Plus) ---")
+    _auto_adjust_delays()
+    update_live_currency_rates()
+
+def _prepare_ticker_universe(selected_syms: List[str], etf_options: Dict[str, Any]) -> pd.DataFrame:
+    """Lädt, integriert und bereinigt das Ticker-Universum."""
+    master_df, _ = load_selected_etf_universe(
+        selected_syms=selected_syms,
+        etf_options=etf_options,
+        config=CONFIG,
+        logger=logger,
+        download_ishares_csv=download_ishares_csv,
+        normalize_sector_name=normalize_sector_name,
+        print_fn=print,
+        progress_fn=make_progress
+    )
+    
+    df = master_df
+    if CONFIG.get('exchange_scan_enabled', True):
+        exchange_df = data_pipeline_core.load_exchange_universe(CONFIG, logger, normalize_sector_name)
+        if not exchange_df.empty:
+            df = pd.concat([df, exchange_df], ignore_index=True)
+
+    # Namen- und Land-Enrichment
+    for cache_key, file_key in [('etf_names_cache_file', 'Name'), ('country_cache_file', 'Land')]:
+        cache_path = CONFIG.get(cache_key)
+        if cache_path and os.path.exists(cache_path):
+            c_data = load_json_config(cache_path)
+            if isinstance(c_data, dict):
+                lookup = {str(k).upper(): v for k, v in c_data.items()}
+                df[file_key] = df.apply(lambda r: lookup.get(str(r['Ticker']).upper(), r[file_key]), axis=1)
+
+    return data_pipeline_core.perform_final_deduplication(df)
+
 def run_analysis_pipeline(
     data_mgr: MarketDataManager, 
     portfolio_mgr: PortfolioManager, 
     first_seen_mgr: FirstSeenManager,
     mapper: TickerMapper
 ) -> None:
-    """Zentrale Pipeline für den vollständigen Analyse-Workflow."""
-    logger.info("\n--- GLOBAL RSL V68 (Dashboard Plus) ---")
-    logger.info(f"Speicherort fuer Dateien: {SCRIPT_DIR}")
-    logger.info(
-        f"Konsole: encoding={CONSOLE_RUNTIME.get('encoding')} "
-        f"unicode={CONSOLE_RUNTIME.get('unicode')} ansi={CONSOLE_RUNTIME.get('ansi')}"
-    )
+    """Zentrale Pipeline für den vollständigen Analyse-Workflow (Refactored)."""
+    load_dotenv()
+    _setup_run_environment()
 
-    # NEU: Delays basierend auf letztem Lauf anpassen
-    _auto_adjust_delays()
-    # NEU: Waehrungskurse vor Beginn live aktualisieren
-    update_live_currency_rates()
-
-    manual_fix = load_json_config(CONFIG['manual_fix_file'])
-   
-    blacklist = set(load_json_config(CONFIG['blacklist_file'], is_list=True))
-    blacklist = {x.strip().upper() for x in blacklist if x}
-    if blacklist:
-        logger.info(f"Blacklist geladen: {len(blacklist)} Eintraege.")
-    # --- QUICK START LOGIC ---
+    # --- 1. SETUP & SELECTION ---
+    manual_fix = cast(Dict, load_json_config(CONFIG['manual_fix_file']))
+    blacklist = {x.strip().upper() for x in cast(List, load_json_config(CONFIG['blacklist_file'], is_list=True)) if x}
+    
     last_run_cfg = load_json_config(CONFIG['last_run_config_file'])
     use_last_settings = False
     selected_syms = []
