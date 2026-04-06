@@ -2018,8 +2018,32 @@ def _auto_adjust_delays() -> None:
 def _setup_run_environment() -> None:
     """Initialisiert FX-Kurse und passt Delays an."""
     logger.info("\n--- GLOBAL RSL V68 (Dashboard Plus) ---")
+def _initialize_run_settings(data_mgr: MarketDataManager) -> None:
+    """Initialisiert die Umgebung, FX-Kurse und passt Delays an."""
+    logger.info("\n--- INITIALISIERUNG ANALYSE-LAUF ---")
     _auto_adjust_delays()
     update_live_currency_rates()
+    
+    # Optionaler Check auf Cache-Alter
+    if os.path.exists(CONFIG['history_cache_file']):
+        try:
+            age = _cache_age_hours(CONFIG['history_cache_file'])
+            if age is not None and age < CONFIG['cache_duration_hours']:
+                logger.info(f"Kursdaten-Cache ist aktuell ({age:.1f}h alt).")
+        except Exception:
+            pass
+
+def show_main_menu(has_snapshot: bool) -> str:
+    """Zeigt das Hauptmenü an und gibt die Auswahl des Benutzers zurück."""
+    print(f"\n\033[96m\033[1m{'-'*20} HAUPTMENUE {'-'*20}\033[0m")
+    if has_snapshot:
+        print("\033[94m [1]\033[0m \U0001F4C4 Letzten Datenstand neu anzeigen (Snapshot)")
+    else:
+        print(" [1] \033[90mLetzten Datenstand neu anzeigen (nicht verfuegbar)\033[0m")
+    print("\033[92m [2]\033[0m \U0001F504 Neuen Lauf starten (Download & Analyse)")
+    print("\033[93m [3]\033[0m \u2699\ufe0f  Einstellungen / Strategie-Anpassung")
+    print("\033[91m [0]\033[0m \u2716  Beenden")
+    return input("Auswahl [2]: ").strip()
 
 def _prepare_ticker_universe(selected_syms: List[str], etf_options: Dict[str, Any]) -> pd.DataFrame:
     """Lädt, integriert und bereinigt das Ticker-Universum."""
@@ -2049,7 +2073,7 @@ def _prepare_ticker_universe(selected_syms: List[str], etf_options: Dict[str, An
                 lookup = {str(k).upper(): v for k, v in c_data.items()}
                 df[file_key] = df.apply(lambda r: lookup.get(str(r['Ticker']).upper(), r[file_key]), axis=1)
 
-    return data_pipeline_core.perform_final_deduplication(df)
+    return df
 
 def run_analysis_pipeline(
     data_mgr: MarketDataManager, 
@@ -2060,6 +2084,7 @@ def run_analysis_pipeline(
     """Zentrale Pipeline für den vollständigen Analyse-Workflow (Refactored)."""
     load_dotenv()
     _setup_run_environment()
+    _initialize_run_settings(data_mgr)
 
     # --- 1. SETUP & SELECTION ---
     manual_fix = cast(Dict, load_json_config(CONFIG['manual_fix_file']))
@@ -2134,79 +2159,18 @@ def run_analysis_pipeline(
    
     # PERFORMANCE START
     perf_start_time = time.time()
-
-    # --- FEATURE 2: ETF CACHING & MULTI-DOWNLOAD (SMART CACHE) ---
-    master_df, final_rows = load_selected_etf_universe(
-        selected_syms=selected_syms,
-        etf_options=etf_options,
-        config=CONFIG,
-        logger=logger,
-        download_ishares_csv=download_ishares_csv,
-        normalize_sector_name=normalize_sector_name,
-        print_fn=print,
-        progress_fn=make_progress
-    )
-    if master_df.empty:
+    # --- 2. UNIVERSE PREPARATION ---
+    df = _prepare_ticker_universe(selected_syms, etf_options)
+    if df.empty:
+        logger.error("Ticker-Universum konnte nicht vorbereitet werden.")
         return
-    df = master_df
-    if 'Listing_Source' not in df.columns:
-        df['Listing_Source'] = ""
-
-    # --- NEU: Exchange Universe Integration ---
-    if CONFIG.get('exchange_scan_enabled', True):
-        logger.info("Integriere Exchange-Daten (Xetra/Frankfurt)...")
-        exchange_df = data_pipeline_core.load_exchange_universe(
-            config=CONFIG,
-            logger=logger,
-            normalize_sector_name=normalize_sector_name
-        )
-        if not exchange_df.empty:
-            df = pd.concat([df, exchange_df], ignore_index=True)
-            logger.info(f"Exchange-Integration: {len(exchange_df)} Ticker zur Deduplizierung hinzugefügt.")
-
-    # --- NEU: Namen-Enrichment aus etf_names_cache.json ---
-    names_cache_file = CONFIG.get('etf_names_cache_file')
-    if names_cache_file and os.path.exists(names_cache_file):
-        names_cache = load_json_config(names_cache_file)
-        if names_cache:
-            updated_names = 0
-            for idx, row in df.iterrows():
-                t = str(row['Ticker']).strip().upper()
-                if t in names_cache:
-                    # Wir ueberschreiben den Namen mit dem sauberen Yahoo-Namen aus dem Cache
-                    df.at[idx, 'Name'] = names_cache[t]
-                    updated_names += 1
-            if updated_names > 0:
-                logger.info(f"Namen-Abgleich: {updated_names} Namen aus {os.path.basename(names_cache_file)} aktualisiert.")
-
-    # --- NEU: Land-Enrichment aus etf_country_cache.json ---
-    country_cache_file = CONFIG.get('country_cache_file')
-    if country_cache_file and os.path.exists(country_cache_file):
-        country_cache_raw = load_json_config(country_cache_file)
-        if country_cache_raw:
-            # Case-insensitiver Abgleich vorbereiten
-            country_lookup = {str(k).strip().upper(): v for k, v in country_cache_raw.items()}
-            updated_countries = 0
-            for idx, row in df.iterrows():
-                t = str(row['Ticker']).strip().upper()
-                if t in country_lookup:
-                    df.at[idx, 'Land'] = country_lookup[t]
-                    updated_countries += 1
-            if updated_countries > 0:
-                logger.info(f"Land-Abgleich: {updated_countries} Einträge aus {os.path.basename(country_cache_file)} aktualisiert.")
-
-    pre_dedup_df = df.copy()
-
-    if not df.empty:
-        if final_support_core.has_meaningful_isin_data(df):
-            df['NAME_CLEAN'] = df['Name'].apply(final_support_core.normalize_name_for_dedup_key)
-    history_symbol_overrides = final_support_core.build_history_symbol_overrides(pre_dedup_df, df, LOCATION_SUFFIX_MAP, UNSUPPORTED_EXCHANGES, EXCHANGE_SUFFIX_MAP)
-    if history_symbol_overrides:
-        logger.info(f"History-Overrides aktiv: {len(history_symbol_overrides)} Frankfurt-Ticker nutzen bevorzugte Referenzhistorien.")
-
     final_rows = len(df)
+    history_symbol_overrides = final_support_core.build_history_symbol_overrides(
+        df, df, LOCATION_SUFFIX_MAP, UNSUPPORTED_EXCHANGES, EXCHANGE_SUFFIX_MAP
+    )
 
     # --- VERARBEITUNG ---
+    # --- 3. DATA COLLECTION & PROCESSING ---
     batch_queue = []
     complex_queue = []
     dropped_critical = []
@@ -2656,42 +2620,37 @@ def run_analysis_pipeline(
 
 def main() -> None:
     """Haupteinstiegspunkt mit Menüführung."""
+    load_dotenv()
+    
     mapper = TickerMapper(CONFIG['mapping_file'])
     data_mgr = MarketDataManager(CONFIG, CURRENCY_RATES)
     portfolio_mgr = PortfolioManager(CONFIG['portfolio_file'])
     first_seen_mgr = FirstSeenManager(CONFIG['first_seen_cache_file'])
 
-    capture_file = CONFIG['last_console_output_file']
-    snapshot_file = CONFIG['last_analysis_snapshot_file']
+    capture_file = str(CONFIG['last_console_output_file'])
+    snapshot_file = str(CONFIG['last_analysis_snapshot_file'])
 
     while True:
         has_snapshot = os.path.exists(snapshot_file)
-        print(f"\n\033[96m\033[1m{'-'*20} HAUPTMENUE {'-'*20}\033[0m")
-        if has_snapshot:
-            print("\033[94m [1]\033[0m \U0001F4C4 Letzten Datenstand neu anzeigen (Snapshot)")
-        else:
-            print(" [1] \033[90mLetzten Datenstand neu anzeigen (nicht verfuegbar)\033[0m")
-        print("\033[92m [2]\033[0m \U0001F504 Neuen Lauf starten (Download & Analyse)")
-        print("\033[93m [3]\033[0m \u2699\ufe0f  Einstellungen / Strategie-Anpassung")
-        print("\033[91m [0]\033[0m \u2716  Beenden")
-        
-        choice = input("Auswahl [2]: ").strip()
+        choice = show_main_menu(has_snapshot)
         
         try:
             if choice == "0":
+                logger.info("Programm beendet.")
                 break
             elif choice in ("", "2"):
                 with ConsoleCapture(capture_file):
                     run_analysis_pipeline(data_mgr, portfolio_mgr, first_seen_mgr, mapper)
             elif choice == "1" and has_snapshot:
                 with ConsoleCapture(capture_file):
-                    rerender_last_analysis()
+                    if not rerender_last_analysis():
+                        logger.warning("Re-Render fehlgeschlagen.")
             elif choice == "3":
                 configure_user_settings_interactive()
             else:
                 print("Ungueltige Auswahl.")
         except KeyboardInterrupt:
-            print("\nAbbruch durch Benutzer.")
+            print("\nAbbruch durch Benutzer. Zurueck zum Menue.")
         except Exception as e:
             logger.exception(f"Kritischer Fehler im Hauptablauf: {e}")
 
