@@ -289,7 +289,7 @@ def load_exchange_universe(
 
 def perform_final_deduplication(results: List[Any]) -> List[Any]:
     """Führt eine globale ISIN- und Namens-Deduplizierung am Ende der Pipeline durch."""
-    if not results: return []
+    if results is None or len(results) == 0: return []
     from core import final_support as support
 
     # STUFE 1: Nach Yahoo-Ticker gruppieren

@@ -1,10 +1,13 @@
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
+import logging
 
+logger = logging.getLogger(__name__)
 
 def calculate_market_regime(stock_results: List[Any]) -> Dict[str, Any]:
     """Berechnet die Marktbreite und das daraus resultierende Markt-Regime."""
+    logger.info("Starte Berechnung des Markt-Regimes...")
     if not stock_results:
         return {'breadth_pct': 0, 'regime': 'UNBEKANNT', 'strong_count': 0, 'total_count': 0, 'median_rsl': 0}
 
