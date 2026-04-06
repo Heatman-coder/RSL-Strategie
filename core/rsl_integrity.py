@@ -1,0 +1,312 @@
+"""
+Modul für die RSL-Integritätsprüfung.
+PHILOSOPHIE: Aktien werden niemals allein aufgrund von hohen oder niedrigen Kennzahlen (wie RSL) ausgeschlossen.
+Wenn Werte unplausibel erscheinen, muss die Ursache in der Datenbasis oder Berechnung untersucht werden,
+anstatt den Wert zu löschen. Die Integritätsprüfung dient der Markierung und Warnung, nicht der Zensur.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+
+SECONDARY_LISTING_SUFFIXES = {
+    ".BE",
+    ".DE",
+    ".DU",
+    ".F",
+    ".HM",
+    ".MU",
+    ".SG",
+}
+
+
+def _context_value(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def _clean_symbol(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _symbol_suffix(symbol: Any) -> str:
+    sym = _clean_symbol(symbol)
+    if "." not in sym:
+        return ""
+    return f".{sym.rsplit('.', 1)[-1]}"
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    parsed = _optional_float(value)
+    if parsed is None:
+        return float(default)
+    return parsed
+
+
+def _home_suffix(item: Any, location_suffix_map: Dict[str, str]) -> str:
+    land = str(_context_value(item, "land", "") or "").strip()
+    return str(location_suffix_map.get(land, "") or "").strip().upper()
+
+
+def get_history_status(item: Any, location_suffix_map: Dict[str, str]) -> str:
+    original_ticker = _clean_symbol(_context_value(item, "original_ticker", ""))
+    history_symbol = _clean_symbol(_context_value(item, "yahoo_symbol", original_ticker))
+    primary_liquidity_symbol = _clean_symbol(_context_value(item, "primary_liquidity_symbol", ""))
+    home_suffix = _home_suffix(item, location_suffix_map)
+    original_suffix = _symbol_suffix(original_ticker)
+    history_suffix = _symbol_suffix(history_symbol)
+
+    history_matches_home = False
+    if primary_liquidity_symbol:
+        history_matches_home = history_symbol == primary_liquidity_symbol
+    if not history_matches_home and home_suffix:
+        history_matches_home = history_symbol.endswith(home_suffix)
+
+    original_is_secondary = bool(
+        original_suffix
+        and original_suffix in SECONDARY_LISTING_SUFFIXES
+        and original_suffix != home_suffix
+    )
+    history_is_secondary = bool(
+        history_suffix
+        and history_suffix in SECONDARY_LISTING_SUFFIXES
+        and history_suffix != home_suffix
+    )
+
+    if history_matches_home and original_ticker and history_symbol and original_ticker != history_symbol:
+        return "OVERRIDDEN_TO_HOME" if home_suffix and history_symbol.endswith(home_suffix) else "OVERRIDDEN_TO_BETTER_LISTING"
+    if history_is_secondary:
+        return "SECONDARY_HISTORY_ACTIVE"
+    if original_is_secondary and history_symbol and history_symbol != original_ticker:
+        return "OVERRIDDEN_TO_BETTER_LISTING"
+    if home_suffix and history_symbol.endswith(home_suffix):
+        return "HOME_HISTORY_ACTIVE"
+    if history_symbol and "." not in history_symbol:
+        return "PRIMARY_WITHOUT_SUFFIX"
+    return "UNKNOWN"
+
+
+def get_rsl_integrity_drop_reasons(
+    item: Any,
+    location_suffix_map: Dict[str, str],
+    raw_rsl: Any = None,
+) -> List[str]:
+    reasons: List[str] = []
+    history_status = get_history_status(item, location_suffix_map)
+    raw_rsl_value = _optional_float(raw_rsl)
+    if raw_rsl_value is None:
+        raw_rsl_value = _optional_float(_context_value(item, "rsl", None))
+
+    mom_6m = _optional_float(_context_value(item, "mom_6m", None))
+    mom_3m = _optional_float(_context_value(item, "mom_3m", None))
+    rsl_change_1w = _optional_float(_context_value(item, "rsl_change_1w", None))
+    trend_smoothness = _optional_float(_context_value(item, "trend_smoothness", None))
+    flag_scale = str(_context_value(item, "flag_scale", "") or "").strip().upper()
+    flag_stale = str(_context_value(item, "flag_stale", "") or "").strip().upper()
+
+    if history_status == "SECONDARY_HISTORY_ACTIVE":
+        reasons.append("secondary_history_not_allowed")
+
+    if flag_scale == "CRITICAL":
+        reasons.append("critical_price_scale_error")
+
+    if flag_stale == "CRITICAL":
+        reasons.append("critical_stale_data")
+
+    return list(dict.fromkeys(reasons))
+
+
+def filter_stock_results_for_rsl_integrity(
+    stock_results: List[Any],
+    location_suffix_map: Dict[str, str],
+) -> Tuple[List[Any], pd.DataFrame]:
+    valid_results: List[Any] = []
+    dropped_rows: List[Dict[str, Any]] = []
+
+    for stock in stock_results or []:
+        reasons = get_rsl_integrity_drop_reasons(stock, location_suffix_map)
+        rsl = _safe_float(_context_value(stock, "rsl", 0.0))
+        
+        if rsl > 0 and not reasons:
+            valid_results.append(stock)
+        else:
+            # Diese Aktien landen NICHT in valid_results, werden aber im dropped_df erfasst
+            dropped_rows.append(
+                {
+                    "original_ticker": _context_value(stock, "original_ticker", ""),
+                    "yahoo_symbol": _context_value(stock, "yahoo_symbol", ""),
+                    "name": _context_value(stock, "name", ""),
+                    "land": _context_value(stock, "land", ""),
+                    "history_status": get_history_status(stock, location_suffix_map),
+                    "drop_reasons": ", ".join(reasons),
+                    "rsl": _context_value(stock, "rsl", None),
+                    "mom_12m": _context_value(stock, "mom_12m", None),
+                    "mom_6m": _context_value(stock, "mom_6m", None),
+                    "mom_3m": _context_value(stock, "mom_3m", None),
+                    "rsl_change_1w": _context_value(stock, "rsl_change_1w", None),
+                    "trust_score": _context_value(stock, "trust_score", None),
+                    "trend_smoothness": _context_value(stock, "trend_smoothness", None),
+                    "trend_quality": _context_value(stock, "trend_quality", None),
+                    "flag_scale": _context_value(stock, "flag_scale", None),
+                    "flag_stale": _context_value(stock, "flag_stale", None),
+                    "flag_gap": _context_value(stock, "flag_gap", None),
+                }
+            )
+
+    columns = [
+        "original_ticker",
+        "yahoo_symbol",
+        "name",
+        "land",
+        "history_status",
+        "drop_reasons",
+        "rsl",
+        "mom_12m",
+        "mom_6m",
+        "mom_3m",
+        "rsl_change_1w",
+        "trust_score",
+        "trend_smoothness",
+        "trend_quality",
+        "flag_scale",
+        "flag_stale",
+        "flag_gap",
+    ]
+    dropped_df = pd.DataFrame(dropped_rows, columns=columns)
+    return valid_results, dropped_df
+
+
+def build_home_market_rsl_audit(
+    results: List[Any],
+    location_suffix_map: Dict[str, str],
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+
+    for stock in results or []:
+        history_status = get_history_status(stock, location_suffix_map)
+        history_symbol = _clean_symbol(_context_value(stock, "yahoo_symbol", ""))
+        primary_liquidity_symbol = _clean_symbol(_context_value(stock, "primary_liquidity_symbol", ""))
+        home_suffix = _home_suffix(stock, location_suffix_map)
+        history_matches_home = False
+        if primary_liquidity_symbol:
+            history_matches_home = history_symbol == primary_liquidity_symbol
+        if not history_matches_home and home_suffix:
+            history_matches_home = history_symbol.endswith(home_suffix)
+
+        review_reasons: List[str] = []
+        if history_status == "SECONDARY_HISTORY_ACTIVE":
+            review_reasons.append("secondary_history_active")
+            if primary_liquidity_symbol and primary_liquidity_symbol != history_symbol:
+                review_reasons.append("secondary_without_override")
+
+        flag_scale = str(_context_value(stock, "flag_scale", "") or "").strip().upper()
+        if flag_scale and flag_scale != "OK":
+            review_reasons.append("scale_flag_active")
+
+        review_reasons = list(dict.fromkeys(review_reasons))
+        review_score = 0
+        weight_map = {
+            "secondary_history_active": 5,
+            "secondary_without_override": 4,
+            "scale_flag_active": 3,
+        }
+        for reason in review_reasons:
+            review_score += weight_map.get(reason, 1)
+
+        rows.append(
+            {
+                "history_status": history_status,
+                "needs_review": bool(review_reasons),
+                "review_score": review_score,
+                "review_reasons": ", ".join(review_reasons),
+                "history_matches_home": bool(history_matches_home),
+                "home_suffix": home_suffix,
+                "original_ticker": _context_value(stock, "original_ticker", ""),
+                "history_symbol": _context_value(stock, "yahoo_symbol", ""),
+                "primary_liquidity_symbol": _context_value(stock, "primary_liquidity_symbol", ""),
+                "primary_liquidity_basis": _context_value(stock, "primary_liquidity_basis", ""),
+                "name": _context_value(stock, "name", ""),
+                "isin": _context_value(stock, "isin", ""),
+                "land": _context_value(stock, "land", ""),
+                "listing_source": _context_value(stock, "listing_source", ""),
+                "source_etf": _context_value(stock, "source_etf", ""),
+                "rsl_rank": _context_value(stock, "rsl_rang", None),
+                "rsl": _context_value(stock, "rsl", None),
+                "mom_6m": _context_value(stock, "mom_6m", None),
+                "mom_3m": _context_value(stock, "mom_3m", None),
+                "rsl_change_1w": _context_value(stock, "rsl_change_1w", None),
+                "trust_score": _context_value(stock, "trust_score", None),
+                "flag_scale": _context_value(stock, "flag_scale", ""),
+            }
+        )
+
+    columns = [
+        "history_status",
+        "needs_review",
+        "review_score",
+        "review_reasons",
+        "history_matches_home",
+        "home_suffix",
+        "original_ticker",
+        "history_symbol",
+        "primary_liquidity_symbol",
+        "primary_liquidity_basis",
+        "name",
+        "isin",
+        "land",
+        "listing_source",
+        "source_etf",
+        "rsl_rank",
+        "rsl",
+        "mom_6m",
+        "mom_3m",
+        "rsl_change_1w",
+        "trust_score",
+        "flag_scale",
+    ]
+    audit_df = pd.DataFrame(rows, columns=columns)
+    if not audit_df.empty:
+        audit_df = audit_df.sort_values(
+            ["needs_review", "review_score", "rsl_rank", "original_ticker"],
+            ascending=[False, False, True, True],
+            na_position="last",
+        ).reset_index(drop=True)
+    return audit_df
+
+
+def build_home_market_rsl_review_shortlist(audit_df: pd.DataFrame, top_rank: int = 300) -> pd.DataFrame:
+    if audit_df is None or audit_df.empty:
+        return pd.DataFrame(columns=list(getattr(audit_df, "columns", [])))
+
+    work = audit_df.copy()
+    if "needs_review" not in work.columns:
+        return pd.DataFrame(columns=work.columns)
+
+    try:
+        top_rank = max(1, int(top_rank))
+    except Exception:
+        top_rank = 300
+
+    if "rsl_rank" in work.columns:
+        rank_series = pd.to_numeric(work["rsl_rank"], errors="coerce")
+        work = work[rank_series <= float(top_rank)]
+
+    work = work[work["needs_review"].astype(bool)]
+    if work.empty:
+        return work.reset_index(drop=True)
+
+    sort_cols = [col for col in ["review_score", "rsl_rank", "original_ticker"] if col in work.columns]
+    ascending = [False, True, True][: len(sort_cols)]
+    return work.sort_values(sort_cols, ascending=ascending, na_position="last").reset_index(drop=True)

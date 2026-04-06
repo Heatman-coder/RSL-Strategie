@@ -1,0 +1,846 @@
+# BLOCKS FOR AI REVIEW
+
+
+## File: final.py
+
+
+### def _normalize_mom_weights
+
+def _normalize_mom_weights(w12: Any, w6: Any, w3: Any) -> Tuple[float, float, float]:
+    def _coerce(val: Any) -> float:
+        try:
+            return max(0.0, float(val))
+        except Exception:
+            return 0.0
+    v12 = _coerce(w12)
+    v6 = _coerce(w6)
+    v3 = _coerce(w3)
+    total = v12 + v6 + v3
+    if total <= 0:
+        return 0.5, 0.3, 0.2
+    return v12 / total, v6 / total, v3 / total
+
+### def _normalize_cluster_weights
+
+def _normalize_cluster_weights(w_mom12: Any, w_accel: Any) -> Tuple[float, float]:
+    def _coerce(val: Any) -> float:
+        try:
+            return max(0.0, float(val))
+        except Exception:
+            return 0.0
+    v1 = _coerce(w_mom12)
+    v2 = _coerce(w_accel)
+    total = v1 + v2
+    if total <= 0:
+        return 0.6, 0.4
+    return v1 / total, v2 / total
+
+### def calculate_market_regime
+
+def calculate_market_regime(stock_results: List["StockData"]) -> Dict[str, Any]:
+    """
+    Berechnet die Marktbreite und das daraus resultierende Markt-Regime.
+    """
+    if not stock_results:
+        return {'breadth_pct': 0, 'regime': 'UNBEKANNT', 'strong_count': 0, 'total_count': 0}
+
+    total_count = len(stock_results)
+    strong_count = sum(1 for s in stock_results if s.rsl > 1.0)
+    
+    breadth = (strong_count / total_count) if total_count > 0 else 0.0
+    breadth_pct = breadth * 100
+
+    regime = "SCHWACH"
+    if breadth > 0.40:
+        regime = "STARK"
+    elif breadth >= 0.20:
+        regime = "NORMAL"
+
+    return {
+        'breadth_pct': breadth_pct,
+        'regime': regime,
+        'strong_count': strong_count,
+        'total_count': total_count
+    }
+# --- GLOBALE DATEN LADEN ---
+apply_user_settings(load_user_settings())
+UNSUPPORTED_EXCHANGES = load_json_config(CONFIG['unsupported_exchanges_file'], is_list=True)
+LOCATION_SUFFIX_MAP = load_json_config(CONFIG['location_suffix_map_file'])
+EXCHANGE_SUFFIX_MAP = load_json_config(CONFIG['exchange_suffix_map_file'])
+CURRENCY_RATES = load_json_config(CONFIG['currency_rates_file'])
+if not CURRENCY_RATES:
+    CURRENCY_RATES = {"DEFAULT": 1.0, ".T": 0.0065, ".L": 0.0126, ".JO": 0.00053, ".DE": 1.05}
+
+### def _rank_thresholds
+
+def _rank_thresholds(universe_size: int, top_percent_threshold: float) -> Tuple[int, int]:
+    return ranking_core.rank_thresholds(universe_size, top_percent_threshold)
+
+### def _evaluate_rank
+
+def _evaluate_rank(rank: int, universe_size: int, top_percent_threshold: float) -> Dict[str, Any]:
+    return ranking_core.evaluate_rank(rank, universe_size, top_percent_threshold)
+
+### def build_multiscope_status_map
+
+def build_multiscope_status_map(
+    stock_results: List[StockData],
+    top_percent_threshold: float,
+    etf_options: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, Any]]:
+    return ranking_core.build_multiscope_status_map(
+        stock_results=stock_results,
+        top_percent_threshold=top_percent_threshold,
+        etf_options=etf_options
+    )
+
+### def build_industry_rsl_summary
+
+def build_industry_rsl_summary(
+    stock_results: List[StockData],
+    previous_industry_data: Optional[Dict[str, Any]] = None
+) -> pd.DataFrame:
+    """ Erstellt eine Zusammenfassung auf Branchenebene mit Breadth- und Leadership-Score. """
+    data = [s.to_dict() for s in stock_results]
+    df = pd.DataFrame(data)
+   
+    if df.empty:
+        return pd.DataFrame()
+    df['rsl'] = pd.to_numeric(df['rsl'], errors='coerce').fillna(0.0)
+    df = df[df['rsl'] > 0] # Robustheit: entferne ungueltige/Null-RSL-Werte
+    df['industry'] = (
+        df['industry']
+        .fillna('Unknown')
+        .astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .replace("", "Unknown")
+    )
+    df['sector'] = (
+        df['sector']
+        .fillna('Unknown')
+        .astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .replace("", "Unknown")
+    )
+    if not CONFIG.get('industry_summary_include_unknown', True):
+        df = df[~df['industry'].isin(['Unknown', 'ETF'])]
+    grouped = df.groupby('industry')
+   
+    summary_list = []
+    for industry, group in grouped:
+        count_total = len(group)
+       
+        # Breadth: Anteil Aktien mit RSL > 1.1
+        count_strong = int((group['rsl'] > 1.1).sum())
+        breadth = count_strong / count_total
+        
+        # NEU (Feedback): Strong Breadth (RSL > 1.2)
+        count_very_strong = int((group['rsl'] > 1.2).sum())
+        strong_breadth_ratio = count_very_strong / count_total
+        
+        # NEU: Leadership-Kennzahlen (RSL > 1.3)
+        leader_count = int((group['rsl'] > 1.3).sum())
+        leader_ratio = leader_count / count_total
+       
+        # NEU: Top RSL der Branche
+        top_rsl = group['rsl'].max()
+       
+        avg_rsl = group['rsl'].mean()
+       
+        # NEU (Feedback): Median RSL
+        median_rsl = group['rsl'].median()
+       
+        # Angepasster Score mit gedeckeltem Avg RSL + Median-RSL
+        avg_rsl_adj = avg_rsl - 1.0
+        avg_rsl_adj = min(avg_rsl_adj, CONFIG.get('industry_avg_rsl_cap', 0.6))
+        median_rsl_adj = median_rsl - 1.0
+        score = (
+            CONFIG.get('industry_score_w_breadth', 0.4) * breadth
+            + CONFIG.get('industry_score_w_avg', 0.2) * avg_rsl_adj
+            + CONFIG.get('industry_score_w_median', 0.2) * median_rsl_adj
+            + CONFIG.get('industry_score_w_leader', 0.2) * leader_ratio
+        )
+       
+        representative_sector = group['sector'].mode().iloc[0] if not group['sector'].mode().empty else 'Unbekannt'
+        prev_score = None
+        prev_rank = None
+        score_change = None
+        early_score = None
+        if previous_industry_data and industry in previous_industry_data:
+            try:
+                prev_score = float(previous_industry_data[industry].get('score'))
+            except Exception:
+                prev_score = None
+            try:
+                prev_rank = int(previous_industry_data[industry].get('rank'))
+            except Exception:
+                prev_rank = None
+        if prev_score is not None:
+            score_change = score - prev_score
+            early_score = score + score_change
+       
+        summary_list.append({
+            'Branche': industry,
+            'Sektor (repräsentativ)': representative_sector,
+            'Aktien': count_total,
+            'Breadth > 1.1': count_strong,
+            'Breadth Ratio': breadth,
+            'Strong Breadth > 1.2': count_very_strong,
+            'Strong Breadth Ratio': strong_breadth_ratio,
+            'Leader > 1.3': leader_count,
+            'Leader Ratio': leader_ratio,
+            'Avg RSL': avg_rsl,
+            'Median RSL': median_rsl,
+            'Top RSL': top_rsl,
+            'Score': score,
+            'Score Change': score_change,
+            'Early Score': early_score,
+            'Prev Rank': prev_rank
+        })
+       
+    summary_df = pd.DataFrame(summary_list)
+   
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(by='Score', ascending=False)
+        summary_df['Rank'] = range(1, len(summary_df) + 1)
+    return summary_df
+
+### def build_momentum_cluster_summary
+
+def build_momentum_cluster_summary(
+    stock_results: List[StockData]
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    if not CONFIG.get('cluster_enabled', True):
+        return pd.DataFrame(), {}
+    rows = []
+    for s in stock_results:
+        rows.append({
+            "Symbol": str(getattr(s, "yahoo_symbol", "")).strip().upper(),
+            "mom_12m": s.mom_12m,
+            "mom_6m": s.mom_6m,
+            "mom_3m": s.mom_3m,
+            "mom_accel": s.mom_accel,
+            "rsl": s.rsl
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(), {}
+    for col in ["mom_12m", "mom_6m", "mom_3m", "mom_accel", "rsl"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Symbol", "mom_12m", "mom_6m", "mom_3m", "mom_accel"])
+    df = df[df["Symbol"].astype(str).str.len() > 0]
+    if df.empty:
+        return pd.DataFrame(), {}
+
+    def _bucket(p: float) -> Optional[int]:
+        if pd.isna(p):
+            return None
+        if p < 0.33:
+            return 0
+        if p < 0.66:
+            return 1
+        return 2
+
+    df["p_mom12"] = df["mom_12m"].rank(pct=True)
+    df["p_mom6"] = df["mom_6m"].rank(pct=True)
+    df["p_mom3"] = df["mom_3m"].rank(pct=True)
+    df["p_accel"] = df["mom_accel"].rank(pct=True)
+
+    df["b12"] = df["p_mom12"].apply(_bucket)
+    df["b6"] = df["p_mom6"].apply(_bucket)
+    df["b3"] = df["p_mom3"].apply(_bucket)
+    df["ba"] = df["p_accel"].apply(_bucket)
+    df = df.dropna(subset=["b12", "b6", "b3", "ba"])
+    if df.empty:
+        return pd.DataFrame(), {}
+
+    df["Cluster"] = (
+        df["b12"].astype(int).astype(str)
+        + df["b6"].astype(int).astype(str)
+        + df["b3"].astype(int).astype(str)
+        + df["ba"].astype(int).astype(str)
+    )
+
+    w_mom, w_acc = _normalize_cluster_weights(
+        CONFIG.get("cluster_score_w_mom12", 0.6),
+        CONFIG.get("cluster_score_w_accel", 0.4)
+    )
+    total = len(df)
+    summary = (
+        df.groupby("Cluster")
+        .agg(
+            Anzahl=("Symbol", "count"),
+            Avg_Mom12=("mom_12m", "mean"),
+            Avg_Mom6=("mom_6m", "mean"),
+            Avg_Mom3=("mom_3m", "mean"),
+            Avg_Accel=("mom_accel", "mean"),
+            Avg_RSL=("rsl", "mean"),
+        )
+        .reset_index()
+    )
+    summary["Cluster Anteil %"] = (summary["Anzahl"] / total) * 100.0
+    summary["Score"] = summary["Avg_Mom12"] * w_mom + summary["Avg_Accel"] * w_acc
+    summary = summary.sort_values(by="Score", ascending=False)
+    summary["Rank"] = range(1, len(summary) + 1)
+    cluster_map = dict(zip(df["Symbol"], df["Cluster"]))
+    return summary, cluster_map
+
+### def suggest_portfolio_candidates
+
+def suggest_portfolio_candidates(
+    stock_results: List[StockData],
+    industry_summary: pd.DataFrame,
+    cluster_summary: Optional[pd.DataFrame],
+    portfolio_symbols: set,
+    sell_list_symbols: set,
+    symbol_lookup: Dict[str, StockData],
+    top_n_industries: Optional[int] = None,
+    max_stocks_per_sector: int = 2,
+    portfolio_size: int = 5
+) -> List[StockData]:
+    """ Schlaegt Portfolio-Kandidaten basierend auf der Branchen-Momentum-Strategie vor. """
+    if industry_summary is None or industry_summary.empty or not stock_results:
+        return []
+    # 1. Top N Branchen nach Score auswählen
+    if top_n_industries is None:
+        top_n_industries = CONFIG.get('industry_top_n', 10)
+    industry_filtered = industry_summary
+    score_min = CONFIG.get('industry_score_min', 0.0)
+    breadth_min = CONFIG.get('industry_breadth_min', 0.25)
+    min_size = int(CONFIG.get('industry_min_size', 5) or 5)
+    if "Aktien" in industry_summary.columns and min_size > 0:
+        industry_filtered = industry_filtered[industry_filtered["Aktien"] >= min_size]
+    if "Breadth Ratio" in industry_summary.columns and breadth_min is not None:
+        industry_filtered = industry_filtered[industry_filtered["Breadth Ratio"] >= float(breadth_min)]
+    if score_min is not None and float(score_min) > 0 and "Score" in industry_summary.columns:
+        industry_filtered = industry_filtered[industry_filtered['Score'] >= float(score_min)]
+    if "Branche" in industry_filtered.columns:
+        industry_filtered = industry_filtered[
+            ~industry_filtered["Branche"].astype(str).str.strip().isin(["Unknown", "ETF"])
+        ]
+    if industry_filtered.empty:
+        return []
+    top_industries = set(industry_filtered.head(top_n_industries)['Branche'].tolist())
+    if not top_industries:
+        return []
+    top_clusters: Optional[set] = None
+    if CONFIG.get('cluster_enabled', True) and CONFIG.get('candidate_use_cluster_filter', True):
+        if isinstance(cluster_summary, pd.DataFrame) and not cluster_summary.empty and "Cluster" in cluster_summary.columns:
+            min_size = int(CONFIG.get('cluster_min_size', 0) or 0)
+            top_n = int(CONFIG.get('cluster_top_n', 5) or 5)
+            filtered = cluster_summary
+            if min_size > 0 and "Anzahl" in cluster_summary.columns:
+                filtered = cluster_summary[cluster_summary["Anzahl"] >= min_size]
+            top_clusters = set(filtered.head(top_n)["Cluster"].astype(str).tolist())
+    # 2. Kandidaten filtern und Momentum-Score berechnen (Multi-Horizon + optionales Risiko-Scaling)
+    use_momentum = bool(CONFIG.get('candidate_use_momentum_score', True))
+    use_vol_adjust = bool(CONFIG.get('candidate_use_vol_adjust', True))
+    use_industry_neutral = bool(CONFIG.get('candidate_use_industry_neutral', True))
+    use_accel = bool(CONFIG.get('candidate_use_accel', True))
+    accel_weight = float(CONFIG.get('candidate_accel_weight', 0.2) or 0.0)
+    min_avg_volume_usd = float(CONFIG.get('candidate_min_avg_volume_usd', 0.0) or 0.0)
+    min_trust_score = int(CONFIG.get('candidate_min_trust_score', 0) or 0)
+    score_min = float(CONFIG.get('candidate_score_min', 0.0) or 0.0)
+    require_top = bool(CONFIG.get('candidate_require_top_percent', False))
+    hold_rank = None
+    if require_top:
+        try:
+            thresh = float(CONFIG.get('candidate_top_percent_threshold', CONFIG.get('top_percent_threshold', 0.25)) or 0.25)
+            hold_rank, _ = _rank_thresholds(len(stock_results), thresh)
+        except Exception:
+            hold_rank = None
+
+    def _base_score(stock: StockData, allow_fallback: bool) -> Optional[float]:
+        if use_momentum:
+            val = stock.mom_score_adj if use_vol_adjust else stock.mom_score
+            if val is None:
+                return (float(stock.rsl) - 1.0) if allow_fallback else None
+            try:
+                return float(val)
+            except Exception:
+                return (float(stock.rsl) - 1.0) if allow_fallback else None
+        try:
+            return float(stock.rsl) - 1.0
+        except Exception:
+            return None
+
+    industry_avg_map: Dict[str, float] = {}
+    if use_industry_neutral:
+        industry_scores: Dict[str, List[float]] = defaultdict(list)
+        for s in stock_results:
+            base = _base_score(s, allow_fallback=False)
+            if base is None:
+                continue
+            ind = str(getattr(s, "industry", "") or "Unknown").strip() or "Unknown"
+            industry_scores[ind].append(base)
+        industry_avg_map = {k: (sum(v) / len(v)) for k, v in industry_scores.items() if v}
+
+    candidate_pool: List[StockData] = []
+    for s in stock_results:
+        if s.rsl <= 1.0:
+            continue
+        if min_trust_score > 0 and int(getattr(s, "trust_score", 0) or 0) < min_trust_score:
+            continue
+        if hold_rank is not None and int(getattr(s, "rsl_rang", 0) or 0) > hold_rank:
+            continue
+        if s.industry not in top_industries:
+            continue
+        if top_clusters is not None and s.mom_cluster not in top_clusters:
+            continue
+        if s.yahoo_symbol in portfolio_symbols:
+            continue
+        if min_avg_volume_usd > 0 and (s.avg_volume_usd or 0) < min_avg_volume_usd:
+            continue
+        candidate_pool.append(s)
+
+    scored_candidates: List[Tuple[float, StockData]] = []
+    for s in candidate_pool:
+        base_raw = _base_score(s, allow_fallback=False)
+        score = base_raw if base_raw is not None else _base_score(s, allow_fallback=True)
+        if score is None:
+            continue
+        if use_accel and s.mom_accel is not None:
+            try:
+                score += accel_weight * float(s.mom_accel)
+            except Exception:
+                pass
+        if use_industry_neutral and base_raw is not None:
+            ind = str(getattr(s, "industry", "") or "Unknown").strip() or "Unknown"
+            score -= float(industry_avg_map.get(ind, 0.0))
+        if score_min and score < score_min:
+            continue
+        scored_candidates.append((score, s))
+
+    scored_candidates.sort(key=lambda item: (item[0], item[1].rsl, item[1].rsl_rang), reverse=True)
+    candidate_pool = [s for _, s in scored_candidates]
+    # 3. Sektor-Zählung aus dem aktuellen Portfolio initialisieren (ohne Verkaufs-Kandidaten)
+    sector_counts = defaultdict(int)
+    keep_symbols = portfolio_symbols - sell_list_symbols
+    for symbol in keep_symbols:
+        stock = symbol_lookup.get(symbol)
+        if stock and stock.sector:
+            sector_counts[stock.sector] += 1
+    # 4. Top Aktien mit Diversifizierungsregel (max 2 pro Sektor) auswählen
+    suggested_portfolio: List[StockData] = []
+   
+    free_slots = portfolio_size - len(keep_symbols)
+    # Wenn Plätze frei sind, nur so viele vorschlagen, wie frei sind.
+    # Wenn das Portfolio voll ist, die Top 5 als reine Info anzeigen.
+    num_to_suggest = free_slots if free_slots > 0 else portfolio_size
+   
+    for stock in candidate_pool:
+        if len(suggested_portfolio) >= num_to_suggest:
+            break
+        
+        sector = stock.sector or "Unknown"
+        if sector_counts.get(sector, 0) < max_stocks_per_sector:
+            suggested_portfolio.append(stock)
+            sector_counts[sector] += 1
+    return suggested_portfolio
+
+### MarketDataManager._calculate_flags
+
+    def _calculate_flags(self, hist_close: pd.Series, curr_price: float, sma: float) -> Dict[str, Any]:
+        flags = {
+            'flag_gap': "OK", 'flag_liquidity': "OK", 'flag_stale': "OK",
+            'trend_sma50': "OK",
+            'trend_smoothness': 0.0, 'trend_quality': "N/A",
+            'trust_score': 0, 'stale_reason': "",
+            'twss_score': 0.0, 'twss_date': "", 'twss_days_ago': 0, 'twss_raw_pct': 0.0, 'twss_orientation': "NIEDRIG",
+            'rsl_change_1w': 0.0,
+            'mom_12m': None, 'mom_6m': None, 'mom_3m': None,
+            'mom_score': None, 'mom_vol': None, 'mom_score_adj': None, 'mom_accel': None
+        }
+       
+        sma50 = float(hist_close.rolling(CONFIG['sma_short_length']).mean().iloc[-1])
+        flags['trend_sma50'] = "OK" if curr_price >= sma50 else "WARN"
+        expected_days = CONFIG['annual_factor']
+        actual_days = len(hist_close.tail(expected_days))
+        density = actual_days / expected_days
+        if density < CONFIG['min_liquidity']:
+            flags['flag_liquidity'] = "WARN"
+        recent = hist_close.tail(CONFIG['stale_window'])
+        unique_ratio = recent.nunique() / len(recent)
+        price_changes = recent.diff().abs()
+        non_zero_ratio = (price_changes > 1e-6).mean()
+       
+        is_zero = (price_changes <= 1e-6).astype(int)
+        flat_runs = is_zero * (is_zero.groupby((is_zero != is_zero.shift()).cumsum()).cumcount() + 1)
+        max_flat_run = flat_runs.max()
+        if max_flat_run >= CONFIG['max_flat_days']:
+            flags['flag_stale'] = "CRITICAL"
+            flags['stale_reason'] = f"Flatline > {CONFIG['max_flat_days']} days"
+        elif unique_ratio < CONFIG['min_unique_ratio'] or non_zero_ratio < CONFIG['min_nonzero_ratio']:
+            flags['flag_stale'] = "WARN"
+            flags['stale_reason'] = "Low unique/nonzero ratio"
+        daily_ret = hist_close.pct_change().abs()
+        max_gap = daily_ret.tail(130).max()
+        if max_gap > CONFIG['max_gap_percent']:
+            flags['flag_gap'] = "WARN"
+        try:
+            sma_len = CONFIG['sma_length']
+            sma_series = hist_close.rolling(sma_len).mean()
+            rsl_now = curr_price / sma
+           
+            if len(hist_close) >= sma_len + 5:
+                prev_close_1w = hist_close.iloc[-6]
+                prev_sma_1w = sma_series.iloc[-6]
+                if prev_sma_1w > 0:
+                    rsl_prev_1w = prev_close_1w / prev_sma_1w
+                    flags['rsl_change_1w'] = rsl_now - rsl_prev_1w
+        except Exception:
+            flags['rsl_change_1w'] = 0.0
+
+        def _calc_momentum(series: pd.Series, lookback: int) -> Optional[float]:
+            try:
+                lb = int(lookback)
+            except Exception:
+                return None
+            if lb <= 0:
+                return None
+            if len(series) < lb:
+                return None
+            try:
+                past = float(series.iloc[-lb])
+            except Exception:
+                return None
+            if past <= 0:
+                return None
+            return (curr_price / past) - 1.0
+
+        mom_12m = _calc_momentum(hist_close, CONFIG.get('mom_lookback_12m', 252))
+        mom_6m = _calc_momentum(hist_close, CONFIG.get('mom_lookback_6m', 126))
+        mom_3m = _calc_momentum(hist_close, CONFIG.get('mom_lookback_3m', 63))
+        flags['mom_12m'] = mom_12m
+        flags['mom_6m'] = mom_6m
+        flags['mom_3m'] = mom_3m
+
+        weights = [
+            (mom_12m, float(CONFIG.get('mom_weight_12m', 0.5) or 0.0)),
+            (mom_6m, float(CONFIG.get('mom_weight_6m', 0.3) or 0.0)),
+            (mom_3m, float(CONFIG.get('mom_weight_3m', 0.2) or 0.0))
+        ]
+        weight_sum = sum(w for v, w in weights if v is not None and w > 0)
+        if weight_sum > 0:
+            flags['mom_score'] = sum(v * w for v, w in weights if v is not None and w > 0) / weight_sum
+
+        try:
+            daily_returns = hist_close.pct_change().dropna()
+            vol_lb = int(CONFIG.get('mom_vol_lookback', 63))
+            if vol_lb <= 0:
+                vol_lb = 1
+            if not daily_returns.empty:
+                windowed = daily_returns.tail(vol_lb)
+                vol = float(windowed.std()) * float(np.sqrt(CONFIG.get('annual_factor', 252)))
+                if not pd.isna(vol) and vol > 0:
+                    flags['mom_vol'] = vol
+        except Exception:
+            flags['mom_vol'] = None
+
+        if flags.get('mom_score') is not None:
+            if flags.get('mom_vol') is not None and flags.get('mom_vol') > 0:
+                flags['mom_score_adj'] = float(flags['mom_score']) / float(flags['mom_vol'])
+            else:
+                flags['mom_score_adj'] = float(flags['mom_score'])
+
+        mom_accel = None
+        if mom_3m is not None and mom_12m is not None:
+            mom_accel = mom_3m - mom_12m
+        elif mom_3m is not None and mom_6m is not None:
+            mom_accel = mom_3m - mom_6m
+        flags['mom_accel'] = mom_accel
+        window = 130
+        if len(hist_close) >= window:
+            subset = hist_close.tail(window)
+            start_p = float(subset.iloc[0])
+            end_p = float(subset.iloc[-1])
+            if start_p > 0 and end_p > start_p:
+                total_ret = (end_p / start_p) - 1
+                daily_rets = subset.pct_change().dropna()
+                pos_rets = daily_rets[daily_rets > 0].sum()
+                if pos_rets > 0.01:
+                    smoothness = total_ret / pos_rets
+                    flags['trend_smoothness'] = smoothness
+                    if smoothness > 0.6: flags['trend_quality'] = "STABIL"
+                    elif smoothness > 0.3: flags['trend_quality'] = "NORMAL"
+                    else: flags['trend_quality'] = "WACKLIG"
+                else: flags['trend_quality'] = "N/A"
+            else:
+                flags['trend_smoothness'] = 0.0
+                flags['trend_quality'] = "N/A"
+            daily_rets_pct = subset.pct_change().dropna() * 100
+           
+            if not daily_rets_pct.empty:
+                n = len(daily_rets_pct)
+                days_ago = np.arange(n-1, -1, -1)
+                decay = np.exp(-days_ago / CONFIG['twss_decay_days'])
+                twss_series = daily_rets_pct * decay
+               
+                max_idx = twss_series.argmax()
+                max_twss = float(twss_series.iloc[max_idx])
+               
+                spike_date = daily_rets_pct.index[max_idx].strftime('%Y-%m-%d')
+                days_since = int(days_ago[max_idx])
+                raw_return = float(daily_rets_pct.iloc[max_idx])
+               
+                flags['twss_score'] = max_twss
+                flags['twss_date'] = spike_date
+                flags['twss_days_ago'] = days_since
+                flags['twss_raw_pct'] = raw_return
+               
+                if max_twss < 25: flags['twss_orientation'] = "NIEDRIG"
+                elif max_twss < 60: flags['twss_orientation'] = "MITTEL"
+                else: flags['twss_orientation'] = "HOCH"
+        score = 0
+        if flags['flag_gap'] == "OK": score += 1
+        if flags['flag_liquidity'] == "OK": score += 1
+        if flags['flag_stale'] == "OK": score += 1
+        flags['trust_score'] = score
+        return flags
+
+## File: core/summaries.py
+
+
+### def build_etf_rsl_summary
+
+def build_etf_rsl_summary(
+    stock_results: List[Any],
+    selected_syms: List[str],
+    etf_options: Dict[str, Dict[str, Any]],
+    top_percent_threshold: float,
+) -> pd.DataFrame:
+    etf_syms = list(dict.fromkeys([str(s).strip() for s in selected_syms if str(s).strip()]))
+    etf_rsl_map: Dict[str, List[float]] = {sym: [] for sym in etf_syms}
+
+    for stock in stock_results:
+        memberships = set(_split_source_etfs(stock.source_etf))
+        if not memberships:
+            continue
+        for etf_sym in memberships:
+            if etf_sym in etf_rsl_map:
+                try:
+                    etf_rsl_map[etf_sym].append(float(stock.rsl))
+                except (TypeError, ValueError):
+                    pass
+
+    rows = []
+    for etf_sym in etf_syms:
+        rsl_values = sorted(etf_rsl_map.get(etf_sym, []), reverse=True)
+        n_values = len(rsl_values)
+
+        if n_values > 0:
+            threshold_rank = max(1, int(n_values * top_percent_threshold))
+            threshold_rsl = rsl_values[threshold_rank - 1]
+            avg_rsl = float(np.mean(rsl_values))
+            avg_rsl_out = f"{avg_rsl:.4f}".replace(".", ",")
+            threshold_rsl_out = f"{threshold_rsl:.4f}".replace(".", ",")
+        else:
+            threshold_rank = 0
+            avg_rsl_out = ""
+            threshold_rsl_out = ""
+
+        rows.append(
+            {
+                "ETF": etf_sym,
+                "ETF Name (voll)": etf_options.get(etf_sym, {}).get("name", etf_sym),
+                "Anzahl Werte (analysiert)": n_values,
+                "Top-% Schwelle": f"{int(top_percent_threshold * 100)}%",
+                "Grenzrang Top-%": threshold_rank,
+                "RSL am Grenzrang": threshold_rsl_out,
+                "Durchschnitt RSL": avg_rsl_out,
+            }
+        )
+
+    selected_set = set(etf_syms)
+    combined_values = []
+    for stock in stock_results:
+        memberships = set(_split_source_etfs(stock.source_etf))
+        if memberships & selected_set:
+            try:
+                combined_values.append(float(stock.rsl))
+            except (TypeError, ValueError):
+                pass
+
+    combined_values = sorted(combined_values, reverse=True)
+    combined_n = len(combined_values)
+    if combined_n > 0:
+        combined_rank = max(1, int(combined_n * top_percent_threshold))
+        combined_threshold_rsl = combined_values[combined_rank - 1]
+        combined_avg_rsl = float(np.mean(combined_values))
+        rows.append(
+            {
+                "ETF": "GESAMT",
+                "ETF Name (voll)": "Alle selektierten ETFs",
+                "Anzahl Werte (analysiert)": combined_n,
+                "Top-% Schwelle": f"{int(top_percent_threshold * 100)}%",
+                "Grenzrang Top-%": combined_rank,
+                "RSL am Grenzrang": f"{combined_threshold_rsl:.4f}".replace(".", ","),
+                "Durchschnitt RSL": f"{combined_avg_rsl:.4f}".replace(".", ","),
+            }
+        )
+
+    df_etf = pd.DataFrame(rows)
+    if df_etf.empty:
+        return df_etf
+
+    avg_col = "Durchschnitt RSL"
+    df_etf["_avg_sort"] = pd.to_numeric(
+        df_etf[avg_col].astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    is_total = df_etf["ETF"].astype(str).str.upper().eq("GESAMT")
+    df_sorted = df_etf.loc[~is_total].sort_values(
+        by=["_avg_sort", "ETF"], ascending=[False, True], na_position="last"
+    )
+    df_total = df_etf.loc[is_total]
+    df_etf = pd.concat([df_sorted, df_total], ignore_index=True)
+    df_etf = df_etf.drop(columns=["_avg_sort"], errors="ignore")
+
+    ordered_cols = [
+        "Durchschnitt RSL",
+        "ETF",
+        "ETF Name (voll)",
+        "Anzahl Werte (analysiert)",
+        "Top-% Schwelle",
+        "Grenzrang Top-%",
+        "RSL am Grenzrang",
+    ]
+    existing_cols = [c for c in ordered_cols if c in df_etf.columns]
+    rest_cols = [c for c in df_etf.columns if c not in existing_cols]
+    return df_etf[existing_cols + rest_cols]
+
+
+
+### def build_sector_rsl_summary
+
+def build_sector_rsl_summary(stock_results: List[Any], top_percent_threshold: float) -> pd.DataFrame:
+    sector_rsl_map: Dict[str, List[float]] = defaultdict(list)
+
+    for stock in stock_results:
+        sector_name = str(stock.sector).strip() if stock.sector is not None else ""
+        if not sector_name:
+            sector_name = "Unbekannt"
+        try:
+            sector_rsl_map[sector_name].append(float(stock.rsl))
+        except (TypeError, ValueError):
+            pass
+
+    rows = []
+    for sector_name, values in sector_rsl_map.items():
+        rsl_values = sorted(values, reverse=True)
+        n_values = len(rsl_values)
+
+        if n_values > 0:
+            threshold_rank = max(1, int(n_values * top_percent_threshold))
+            threshold_rsl = rsl_values[threshold_rank - 1]
+            avg_rsl = float(np.mean(rsl_values))
+            avg_rsl_out = f"{avg_rsl:.4f}".replace(".", ",")
+            threshold_rsl_out = f"{threshold_rsl:.4f}".replace(".", ",")
+        else:
+            threshold_rank = 0
+            avg_rsl_out = ""
+            threshold_rsl_out = ""
+
+        rows.append(
+            {
+                "Sektor": sector_name,
+                "Anzahl Werte (analysiert)": n_values,
+                "Top-% Schwelle": f"{int(top_percent_threshold * 100)}%",
+                "Grenzrang Top-%": threshold_rank,
+                "RSL am Grenzrang": threshold_rsl_out,
+                "Durchschnitt RSL": avg_rsl_out,
+            }
+        )
+
+    df_sector = pd.DataFrame(rows)
+
+    combined_values = []
+    for stock in stock_results:
+        try:
+            combined_values.append(float(stock.rsl))
+        except (TypeError, ValueError):
+            pass
+    combined_values = sorted(combined_values, reverse=True)
+    combined_n = len(combined_values)
+
+    if combined_n > 0:
+        combined_rank = max(1, int(combined_n * top_percent_threshold))
+        combined_threshold_rsl = combined_values[combined_rank - 1]
+        combined_avg_rsl = float(np.mean(combined_values))
+        total_row = pd.DataFrame(
+            [
+                {
+                    "Sektor": "GESAMT",
+                    "Anzahl Werte (analysiert)": combined_n,
+                    "Top-% Schwelle": f"{int(top_percent_threshold * 100)}%",
+                    "Grenzrang Top-%": combined_rank,
+                    "RSL am Grenzrang": f"{combined_threshold_rsl:.4f}".replace(".", ","),
+                    "Durchschnitt RSL": f"{combined_avg_rsl:.4f}".replace(".", ","),
+                }
+            ]
+        )
+        df_sector = pd.concat([df_sector, total_row], ignore_index=True)
+
+    if df_sector.empty:
+        return df_sector
+
+    avg_col = "Durchschnitt RSL"
+    df_sector["_avg_sort"] = pd.to_numeric(
+        df_sector[avg_col].astype(str).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+    is_total = df_sector["Sektor"].astype(str).str.upper().eq("GESAMT")
+    df_sorted = df_sector.loc[~is_total].sort_values(
+        by=["_avg_sort", "Sektor"], ascending=[False, True], na_position="last"
+    )
+    df_total = df_sector.loc[is_total]
+    df_sector = pd.concat([df_sorted, df_total], ignore_index=True)
+    df_sector = df_sector.drop(columns=["_avg_sort"], errors="ignore")
+
+    ordered_cols = [
+        "Durchschnitt RSL",
+        "Sektor",
+        "Anzahl Werte (analysiert)",
+        "Top-% Schwelle",
+        "Grenzrang Top-%",
+        "RSL am Grenzrang",
+    ]
+    existing_cols = [c for c in ordered_cols if c in df_sector.columns]
+    rest_cols = [c for c in df_sector.columns if c not in existing_cols]
+    return df_sector[existing_cols + rest_cols]
+
+
+## File: core/ranking.py
+
+
+### def rank_thresholds
+
+def rank_thresholds(universe_size: int, top_percent_threshold: float) -> Tuple[int, int]:
+    hold_rank = max(1, int(universe_size * top_percent_threshold))
+    warn_rank = max(1, int(hold_rank * 0.9))
+    return hold_rank, warn_rank
+
+
+
+### def evaluate_rank
+
+def evaluate_rank(rank: int, universe_size: int, top_percent_threshold: float) -> Dict[str, Any]:
+    hold_rank, warn_rank = rank_thresholds(universe_size, top_percent_threshold)
+    if rank > hold_rank:
+        status = "SELL"
+    elif rank >= warn_rank:
+        status = "WARN"
+    else:
+        status = "HOLD"
+    return {
+        "status": status,
+        "rank": rank,
+        "universe_size": universe_size,
+        "hold_rank": hold_rank,
+        "warn_rank": warn_rank,
+        "distance": hold_rank - rank,
+    }
+
+
