@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Set
 
 import pandas as pd
-import requests
+import requests # type: ignore
 
 from core import etf_processor as etf_processor_core
 from core.entity_matching import normalize_name_for_dedup

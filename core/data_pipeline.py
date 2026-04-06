@@ -2,9 +2,9 @@ import os
 import time
 import io
 import re
-import requests
+import requests # type: ignore
 from collections import defaultdict
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple, Optional
 
 import pandas as pd
 import numpy as np
@@ -53,10 +53,10 @@ def load_selected_etf_universe(
     etf_options: Dict[str, Dict[str, Any]],
     config: Dict[str, Any],
     logger: Any,
-    download_ishares_csv: Callable[[str], pd.DataFrame],
+    download_ishares_csv: Callable[..., pd.DataFrame],
     normalize_sector_name: Callable[[Any], str],
     print_fn: Callable[[str], None] = print,
-    progress_fn: Callable[..., Any] = None,
+    progress_fn: Any = None,
 ) -> Tuple[pd.DataFrame, int]:
     master_df = pd.DataFrame()
     etf_cache_file = str(config.get("etf_cache_file", "") or "")

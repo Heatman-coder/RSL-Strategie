@@ -155,16 +155,16 @@ def suggest_portfolio_candidates(
     # Verhindert Factor-Leakage durch saubere Trennung der Signale
     
     # 1. Accel gegen Momentum (Partial: dynamische Shrinkage)
-    accel_res = orthogonalize_multi(accel_vec, [mom_vec], shrinkage=shrink_accel_mom)
+    accel_res = orthogonalize_multi(accel_vec.tolist(), [mom_vec.tolist()], shrinkage=shrink_accel_mom)
     
     # 2. Peer gegen Momentum UND Accel (bereinigt)
     # FIX: Durchschnittliche Shrinkage statt Max, um Signalverlust zu vermeiden
     peer_shrink = float(np.mean([shrink_peer_mom, shrink_peer_accel]))
-    peer_res = orthogonalize_multi(peer_vec, [mom_vec, accel_res], shrinkage=peer_shrink)
+    peer_res = orthogonalize_multi(peer_vec.tolist(), [mom_vec.tolist(), accel_res], shrinkage=peer_shrink)
     
     # 3. Drawdown gegen Momentum, Accel UND Peer (alle bereinigt)
     dd_shrink = float(np.mean([shrink_dd_mom, shrink_dd_accel, shrink_dd_peer]))
-    dd_res = orthogonalize_multi(dd_vec, [mom_vec, accel_res, peer_res], shrinkage=dd_shrink)
+    dd_res = orthogonalize_multi(dd_vec.tolist(), [mom_vec.tolist(), accel_res, peer_res], shrinkage=dd_shrink)
     
     # 3. Sector-Neutral Z-Scoring (Within-Sector Standardization)
     # Wir berechnen Z-Scores pro Sektor. Fallback auf Global, wenn Sektor zu klein.
@@ -174,14 +174,14 @@ def suggest_portfolio_candidates(
 
     # Globale Stats als Fallback
     global_stats = {
-        'mom': _compute_robust_stats(mom_vec),
+        'mom': _compute_robust_stats(mom_vec.tolist()),
         'accel': _compute_robust_stats(accel_res),
         'peer': _compute_robust_stats(peer_res),
         'dd': _compute_robust_stats(dd_res),
-        'vol': _compute_robust_stats(vol_vec)
+        'vol': _compute_robust_stats(vol_vec.tolist())
     }
 
-    z_scores = [{} for _ in analysis_pool]
+    z_scores: List[Dict[str, float]] = [{} for _ in analysis_pool]
 
     for sector, indices in sector_map.items():
         # FIX 2: Sector Blending statt Hard Switch (Pro-Level Stabilitaet)
@@ -362,8 +362,8 @@ def suggest_portfolio_candidates(
     scored_candidates.sort(key=lambda x: (float(x[0]), str(x[1].yahoo_symbol)), reverse=True)
     
     # Sektor-Constraints
-    sector_counts = defaultdict(int)
-    industry_counts = defaultdict(int)
+    sector_counts: Dict[str, int] = defaultdict(int)
+    industry_counts: Dict[str, int] = defaultdict(int)
     
     # Bestand zaehlen (ohne Sell-List)
     for sym in (portfolio_symbols - sell_list_symbols):
@@ -374,7 +374,7 @@ def suggest_portfolio_candidates(
             sector_counts[s_obj.sector] += 1
             industry_counts[s_obj.industry] += 1
             
-    final_selection = []
+    final_selection: List[Any] = []
     raw_max_industry = int(config.get('candidate_max_stocks_per_industry', 1))
     max_industry = raw_max_industry if raw_max_industry > 0 else None
     

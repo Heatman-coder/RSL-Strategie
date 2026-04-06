@@ -1,8 +1,8 @@
 import os
-from typing import Dict
+from typing import Dict, Any
 
 
-def build_console_symbols(stdout_encoding: str, force_ascii: bool = False) -> Dict[str, str]:
+def build_console_symbols(stdout_encoding: str, force_ascii: bool = False) -> Dict[str, Any]:
     enc = str(stdout_encoding or "").lower()
     unicode_console = (not force_ascii) and ("utf" in enc)
     emoji_mode = unicode_console and os.environ.get("RSL_EMOJI", "").strip().lower() in ("1", "true", "yes", "y")

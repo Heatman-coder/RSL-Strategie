@@ -1,5 +1,5 @@
 import os
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple, cast
 
 from . import settings_catalog as settings_catalog_core
 
@@ -138,8 +138,8 @@ def configure_user_settings_interactive(
                     if not label:
                         print("Speichern abgebrochen: Name fehlt.")
                         continue
-                    summary = input("Kurzbeschreibung / Zweck [optional]: ").strip()
-                    why = input("Warum dieses Profil? [optional]: ").strip()
+                    summary: str = input("Kurzbeschreibung / Zweck [optional]: ").strip()
+                    why: str = input("Warum dieses Profil? [optional]: ").strip()
                     profile_key = settings_catalog_core.upsert_custom_profile(
                         file_path=profile_file,
                         label=label,

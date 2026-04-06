@@ -12,7 +12,7 @@ Refactoring based on User Request:
 import os
 import codecs
 
-def _fix_bom_in_file(file_path):
+def _fix_bom_in_file(file_path: str) -> None:
     """Checks for and removes the UTF-8 BOM from a file if present."""
     BOM = codecs.BOM_UTF8
     try:
@@ -31,7 +31,7 @@ _fix_bom_in_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core'
 
 import pandas as pd
 import yfinance as yf
-import requests
+import requests # type: ignore
 import io
 import os
 import sys
@@ -46,7 +46,7 @@ import concurrent.futures
 import hashlib
 import csv
 from urllib.parse import quote
-from typing import List, Tuple, Optional, Dict, Any, Callable, Union, Set
+from typing import List, Tuple, Optional, Dict, Any, Callable, Union, Set, cast
 from threading import Lock
 from dataclasses import dataclass, asdict, fields
 from collections import defaultdict
@@ -125,9 +125,10 @@ def configure_best_console_mode() -> Dict[str, Any]:
 CONSOLE_RUNTIME = configure_best_console_mode()
 # --- ROBUSTER LADEBALKEN ---
 try:
-    from tqdm import tqdm
+    from tqdm import tqdm as _tqdm
+    tqdm = _tqdm
 except ImportError:
-    class tqdm:
+    class tqdm_fallback:
         def __init__(self, iterable=None, total=None, **kwargs):
             self.iterable = iterable
             self.total = total
@@ -135,6 +136,7 @@ except ImportError:
         def __exit__(self, exc_type, exc_value, traceback): pass
         def update(self, n=1): pass
         def __iter__(self): return iter(self.iterable) if self.iterable else iter([])
+    tqdm = tqdm_fallback # type: ignore
     print("'tqdm' nicht gefunden. Ladebalken deaktiviert.")
 
 def get_last_performance_duration() -> Optional[str]:
@@ -185,7 +187,7 @@ warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in divide")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Degrees of freedom <= 0 for slice")
 # --- KONFIGURATION ---
-CONFIG = {
+CONFIG: Dict[str, Any] = {
     'batch_size': 50,
     'max_workers': 8,
     'batch_sleep_min_s': 0.5,
@@ -356,7 +358,7 @@ CONFIG = {
     'base_url_template': "https://www.ishares.com/us/products/{id}/{slug}/1467271812596.ajax?fileType=csv&fileName={symbol}_holdings&dataType=fund"
 }
 # --- HELPER FUNCTIONS ---
-def load_json_config(file_name: str, is_list: bool = False) -> Union[Dict, List]:
+def load_json_config(file_name: str, is_list: bool = False) -> Union[Dict[str, Any], List[Any]]:
     """Lädt eine JSON-Konfigurationsdatei.
     
     Args:
@@ -871,10 +873,10 @@ def generate_candidates(orig: str, land: str, exchange: str) -> List[str]:
         location_suffix_map=LOCATION_SUFFIX_MAP,
     )
 
-def download_ishares_csv(url: str, log_label: bool = True):
+def download_ishares_csv(url: str, log_label: bool = True) -> pd.DataFrame:
     return final_support_core.download_ishares_csv(url, logger=logger, log_label=log_label)
 
-def _log_info_fetch_summary(msg, mgr):
+def _log_info_fetch_summary(msg: str, mgr: Any) -> None:
     final_support_core.log_info_fetch_summary(msg, mgr, logger)
 
 def _parse_etf_selection_input(inp: str, opts: Dict) -> List[str]:
@@ -886,7 +888,7 @@ def parse_ishares_url(url: str):
 def _merge_tokens(series: pd.Series) -> str:
     return final_support_core.merge_tokens(series)
 
-def _parse_source_tokens(value: Any) -> set:
+def _parse_source_tokens(value: Any) -> Set[str]:
     """Zerlegt einen kommagetrennten String in ein Set von bereinigten Tokens."""
     if not value:
         return set()
@@ -1017,13 +1019,13 @@ def build_history_symbol_overrides(raw_df: pd.DataFrame, current_df: pd.DataFram
 
 # --- GLOBALE DATEN LADEN ---
 apply_user_settings(load_user_settings())
-UNSUPPORTED_EXCHANGES = load_json_config(CONFIG['unsupported_exchanges_file'], is_list=True)
-LOCATION_SUFFIX_MAP = load_json_config(CONFIG['location_suffix_map_file'])
-EXCHANGE_SUFFIX_MAP = load_json_config(CONFIG['exchange_suffix_map_file'])
+UNSUPPORTED_EXCHANGES = cast(List[str], load_json_config(CONFIG['unsupported_exchanges_file'], is_list=True))
+LOCATION_SUFFIX_MAP = cast(Dict[str, str], load_json_config(CONFIG['location_suffix_map_file']))
+EXCHANGE_SUFFIX_MAP = cast(Dict[str, str], load_json_config(CONFIG['exchange_suffix_map_file']))
 
 # Lade Währungsraten aus der JSON-Datei. Dies sind die Fallback-Werte, wenn Live-Update fehlschlägt.
 # Wenn die Datei leer ist oder nicht existiert, nutze minimale Standardwerte.
-CURRENCY_RATES = load_json_config(CONFIG['currency_rates_file'])
+CURRENCY_RATES = cast(Dict[str, Any], load_json_config(CONFIG['currency_rates_file']))
 if not CURRENCY_RATES:
     # Minimale Default-Werte, um einen initialen Start zu ermöglichen
     CURRENCY_RATES = {
@@ -1033,7 +1035,7 @@ if not CURRENCY_RATES:
     # Weitere wichtige Währungen sollten in currency_rates.json gepflegt werden
     # Die Live-Update-Funktion holt EURUSD, EURJPY, EURGBP
 }
-def get_user_input(prompt: str, default: str = None, valid_options: List[str] = None) -> str:
+def get_user_input(prompt: str, default: Optional[str] = None, valid_options: Optional[List[str]] = None) -> str:
     while True:
         user_in = input(prompt).strip().lower()
         if not user_in and default is not None:
@@ -1738,7 +1740,7 @@ def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
         'etf_options': snapshot.get('etf_options', {}),
         'stock_results': stocks
     }
-def select_etf_interactive():
+def select_etf_interactive() -> Tuple[List[str], Dict[str, Any]]:
     etf_config = load_json_config(CONFIG['etf_config_file'])
     if not etf_config or 'options' not in etf_config or 'selected_symbols' not in etf_config:
         etf_config = {'selected_symbols': [], 'options': {}}
@@ -1802,7 +1804,7 @@ def select_etf_interactive():
                 if 0 <= idx < len(opts):
                     symbol_to_remove = opts[idx]
             else:
-                if user_in.upper() in etf_config['options']:
+                if user_in.upper() in cast(Dict, etf_config['options']):
                     symbol_to_remove = user_in.upper()
             if symbol_to_remove:
                 del etf_config['options'][symbol_to_remove]
@@ -1903,8 +1905,10 @@ def rerender_last_analysis() -> bool:
     
     # --- NEU: Metadata-Repair fuer Snapshots ---
     # Wir laden die Caches, um leere Felder im Snapshot on-the-fly zu füllen
-    country_lookup = {str(k).strip().upper(): v for k, v in load_json_config(CONFIG['country_cache_file']).items()}
-    info_cache = load_json_config(CONFIG['ticker_info_cache_file'])
+    raw_countries = load_json_config(CONFIG['country_cache_file'])
+    country_lookup = {str(k).strip().upper(): v for k, v in cast(Dict, raw_countries).items()} if isinstance(raw_countries, dict) else {}
+    raw_info = load_json_config(CONFIG['ticker_info_cache_file'])
+    info_cache = cast(Dict[str, Any], raw_info) if isinstance(raw_info, dict) else {}
     
     repaired_count = 0
     for s in stock_results:
@@ -1924,7 +1928,7 @@ def rerender_last_analysis() -> bool:
                 s.industry = info_cache[y_sym].get('industry', 'Unknown')
                 s.sector = info_cache[y_sym].get('sector', 'Unknown')
         if _safe_positive_float(getattr(s, 'market_value', 0.0)) <= 0 and y_sym in info_cache:
-            repaired_market_cap = _resolve_market_cap_from_info(info_cache.get(y_sym))
+            repaired_market_cap = _resolve_market_cap_from_info(cast(Dict, info_cache.get(y_sym, {})))
             if repaired_market_cap > 0:
                 s.market_cap = repaired_market_cap
                 s.market_value = repaired_market_cap
@@ -1956,7 +1960,7 @@ def rerender_last_analysis() -> bool:
             sym = str(getattr(s, "yahoo_symbol", "")).strip().upper()
             s.mom_cluster = cluster_map.get(sym, "")
             
-    watchlist_symbols = load_watchlist_symbols(CONFIG.get('watchlist_file'))
+    watchlist_symbols = load_watchlist_symbols(str(CONFIG.get('watchlist_file', '')))
     save_home_market_rsl_audit(stock_results)
     render_analysis_output(
         stock_results=stock_results,
@@ -1974,7 +1978,7 @@ def rerender_last_analysis() -> bool:
     )
     return True
 
-def _auto_adjust_delays():
+def _auto_adjust_delays() -> None:
     """
     Passt die Request-Delays basierend auf den Rate-Limit-Hits des letzten Laufs an.
     """
@@ -2008,8 +2012,15 @@ def _auto_adjust_delays():
 
     except Exception:
         pass # Fails silently
+
 # --- MAIN EXECUTION ---
-def main():
+def run_analysis_pipeline(
+    data_mgr: MarketDataManager, 
+    portfolio_mgr: PortfolioManager, 
+    first_seen_mgr: FirstSeenManager,
+    mapper: TickerMapper
+) -> None:
+    """Zentrale Pipeline für den vollständigen Analyse-Workflow."""
     logger.info("\n--- GLOBAL RSL V68 (Dashboard Plus) ---")
     logger.info(f"Speicherort fuer Dateien: {SCRIPT_DIR}")
     logger.info(
@@ -2019,14 +2030,9 @@ def main():
 
     # NEU: Delays basierend auf letztem Lauf anpassen
     _auto_adjust_delays()
-   
     # NEU: Waehrungskurse vor Beginn live aktualisieren
     update_live_currency_rates()
 
-    mapper = final_support_core.TickerMapper(CONFIG['mapping_file'])
-    data_mgr = MarketDataManager(CONFIG, CURRENCY_RATES)
-    portfolio_mgr = PortfolioManager(CONFIG['portfolio_file'])
-    first_seen_mgr = FirstSeenManager(CONFIG['first_seen_cache_file'])
     manual_fix = load_json_config(CONFIG['manual_fix_file'])
    
     blacklist = set(load_json_config(CONFIG['blacklist_file'], is_list=True))
@@ -2038,10 +2044,10 @@ def main():
     use_last_settings = False
     selected_syms = []
     etf_options = {}
-    if last_run_cfg:
-        etf_config = load_json_config(CONFIG['etf_config_file'])
-        etf_options = etf_config.get('options', {})
-        selected_syms = etf_config.get('selected_symbols', [])
+    if isinstance(last_run_cfg, dict) and last_run_cfg:
+        etf_config = cast(Dict[str, Any], load_json_config(CONFIG['etf_config_file']))
+        etf_options = cast(Dict[str, Any], etf_config.get('options', {}))
+        selected_syms = cast(List[str], etf_config.get('selected_symbols', []))
        
         if selected_syms:
             all_etf_keys = list(etf_options.keys())
@@ -2401,8 +2407,8 @@ def main():
         
         with make_progress(total=len(complex_queue), desc="Fallback") as pbar:
             with concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG['max_workers']) as executor: # type: ignore
-                futures = [executor.submit(process_fallback, item) for item in complex_queue]
-                for future in concurrent.futures.as_completed(futures):
+                fallback_futures = [executor.submit(process_fallback, item) for item in complex_queue]
+                for future in concurrent.futures.as_completed(fallback_futures):
                     res = future.result()
                     if res:
                         u_key, orig, y_sym, row, (curr, sma, vol_eur, flags) = res
@@ -2597,7 +2603,7 @@ def main():
         report_file=CONFIG['strict_report_file']
     )
 
-    watchlist_symbols = load_watchlist_symbols(CONFIG.get('watchlist_file')) or set()
+    watchlist_symbols = load_watchlist_symbols(str(CONFIG.get('watchlist_file', ''))) or set()
     
     # Rate-Limit Statistik
     try:
@@ -2622,57 +2628,47 @@ def main():
         integrity_drops_df=integrity_drops_df,
         watchlist_symbols=watchlist_symbols
     )
-if __name__ == "__main__":
+
+def main() -> None:
+    """Haupteinstiegspunkt mit Menüführung."""
+    mapper = TickerMapper(CONFIG['mapping_file'])
+    data_mgr = MarketDataManager(CONFIG, CURRENCY_RATES)
+    portfolio_mgr = PortfolioManager(CONFIG['portfolio_file'])
+    first_seen_mgr = FirstSeenManager(CONFIG['first_seen_cache_file'])
+
     capture_file = CONFIG['last_console_output_file']
     snapshot_file = CONFIG['last_analysis_snapshot_file']
-    
-    while True:
-        run_snapshot = False
-        run_main = False
-        
-        # --- MENUE-SCHLEIFE ---
-        while True:
-            has_snapshot = os.path.exists(snapshot_file)
-            print(f"\n\033[96m\033[1m{'-'*20} HAUPTMENUE {'-'*20}\033[0m")
-            if has_snapshot:
-                print("\033[94m [1]\033[0m \U0001F4C4 Letzten Datenstand neu anzeigen (Snapshot)")
-            else:
-                print(" [1] \033[90mLetzten Datenstand neu anzeigen (nicht verfuegbar)\033[0m")
-            print("\033[92m [2]\033[0m \U0001F504 Neuen Lauf starten (Download & Analyse)")
-            print("\033[93m [3]\033[0m \u2699\ufe0f  Einstellungen / Strategie-Anpassung")
-            print("\033[91m [0]\033[0m \u2716  Beenden")
-            
-            startup_choice = input("Auswahl [2]: ").strip()
-            
-            if startup_choice == "0":
-                sys.exit(0)
-            elif startup_choice in ("", "2"):
-                run_main = True
-                break
-            
-            if startup_choice == "1":
-                if has_snapshot:
-                    run_snapshot = True
-                    break
-                print("Kein Snapshot vorhanden. Bitte zuerst einen neuen Lauf starten.")
-                continue
-            
-            if startup_choice == "3":
-                configure_user_settings_interactive()
-                continue
-            
-            print("Ungueltige Auswahl.")
 
-        # --- PROGRAMM-AUSFUEHRUNG ---
+    while True:
+        has_snapshot = os.path.exists(snapshot_file)
+        print(f"\n\033[96m\033[1m{'-'*20} HAUPTMENUE {'-'*20}\033[0m")
+        if has_snapshot:
+            print("\033[94m [1]\033[0m \U0001F4C4 Letzten Datenstand neu anzeigen (Snapshot)")
+        else:
+            print(" [1] \033[90mLetzten Datenstand neu anzeigen (nicht verfuegbar)\033[0m")
+        print("\033[92m [2]\033[0m \U0001F504 Neuen Lauf starten (Download & Analyse)")
+        print("\033[93m [3]\033[0m \u2699\ufe0f  Einstellungen / Strategie-Anpassung")
+        print("\033[91m [0]\033[0m \u2716  Beenden")
+        
+        choice = input("Auswahl [2]: ").strip()
+        
         try:
-            if run_snapshot:
+            if choice == "0":
+                break
+            elif choice in ("", "2"):
+                with ConsoleCapture(capture_file):
+                    run_analysis_pipeline(data_mgr, portfolio_mgr, first_seen_mgr, mapper)
+            elif choice == "1" and has_snapshot:
                 with ConsoleCapture(capture_file):
                     rerender_last_analysis()
-            elif run_main:
-                with ConsoleCapture(capture_file):
-                    main()
+            elif choice == "3":
+                configure_user_settings_interactive()
+            else:
+                print("Ungueltige Auswahl.")
         except KeyboardInterrupt:
-            print("\n\nAbbruch durch Benutzer (Ctrl+C).")
+            print("\nAbbruch durch Benutzer.")
         except Exception as e:
-            logger.error(f"Kritischer Fehler im Hauptablauf: {e}")
-            print(f"Fehler: {e}")
+            logger.exception(f"Kritischer Fehler im Hauptablauf: {e}")
+
+if __name__ == "__main__":
+    main()

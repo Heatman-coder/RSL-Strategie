@@ -4,7 +4,7 @@ import os
 import sys
 import webbrowser
 from collections import Counter, defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, cast
 
 import pandas as pd
 import numpy as np
@@ -386,7 +386,7 @@ def render_analysis_output(
     build_sector_rsl_summary: Callable[..., pd.DataFrame],
     industry_summary_df: Optional[pd.DataFrame],
     cluster_summary_df: Optional[pd.DataFrame],
-    save_excel_report_safely: Callable[[Dict[str, pd.DataFrame], str], bool],
+    save_excel_report_safely: Callable[..., bool],
     save_dataframe_safely: Callable[..., None],
     save_json_config: Callable[[str, Any], None],
     build_console_symbols: Callable[..., Dict[str, str]],
@@ -596,7 +596,7 @@ def render_analysis_output(
         f"| unicode={str(symbols.get('unicode_console', False)).lower()}"
     )
     if isinstance(cluster_summary_df, pd.DataFrame) and not cluster_summary_df.empty:
-        top_clusters = []
+        top_clusters_display = []
         for _, row in cluster_summary_df.head(3).iterrows():
             cluster_id = str(row.get("Cluster", "")).strip()
             count = int(row.get("Anzahl", 0) or 0)
@@ -606,9 +606,9 @@ def render_analysis_output(
             except Exception:
                 score_txt = "-"
             if cluster_id:
-                top_clusters.append(f"{cluster_id} ({count}, {score_txt})")
-        if top_clusters:
-            print(f"   - Momentum-Cluster: {', '.join(top_clusters)}")
+                top_clusters_display.append(f"{cluster_id} ({count}, {score_txt})")
+        if top_clusters_display:
+            print(f"   - Momentum-Cluster: {', '.join(top_clusters_display)}")
             print("     Legende: 2=stark, 1=neutral, 0=schwach | Reihenfolge: 12M/6M/3M/Accel")
     print("\033[95m" + sym_divider * table_width + "\033[0m\n")
 
@@ -662,13 +662,13 @@ def render_analysis_output(
         print("-" * table_width)
 
         def _worst_pct(eval_data: Dict[str, Any]) -> float:
-            vals = [
-                eval_data.get('pct_global'),
-                eval_data.get('pct_sector'),
-                eval_data.get('pct_industry')
+            vals: List[Optional[float]] = [
+                cast(Optional[float], eval_data.get('pct_global')),
+                cast(Optional[float], eval_data.get('pct_sector')),
+                cast(Optional[float], eval_data.get('pct_industry'))
             ]
-            vals = [float(v) for v in vals if v is not None]
-            return max(vals) if vals else -1.0
+            clean_vals: List[float] = [float(v) for v in vals if v is not None]
+            return float(max(clean_vals)) if clean_vals else -1.0
 
         heat_list = sorted(
             portfolio_list,
@@ -951,7 +951,7 @@ def render_analysis_output(
 
             cluster_enabled = bool(config.get('cluster_enabled', True))
             cluster_filter = bool(config.get('candidate_use_cluster_filter', True))
-            top_clusters = None
+            top_clusters: Optional[Set[str]] = None
             if cluster_enabled and cluster_filter and isinstance(cluster_summary_df, pd.DataFrame) and not cluster_summary_df.empty and "Cluster" in cluster_summary_df.columns:
                 min_size = int(config.get('cluster_min_size', 0) or 0)
                 top_n = int(config.get('cluster_top_n', 5) or 5)
