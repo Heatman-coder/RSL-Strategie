@@ -2125,6 +2125,7 @@ def show_main_menu(has_snapshot: bool) -> str:
         print(" [1] \033[90mLetzten Datenstand neu anzeigen (nicht verfuegbar)\033[0m")
     print("\033[92m [2]\033[0m \U0001F504 Neuen Lauf starten (Download & Analyse)")
     print("\033[93m [3]\033[0m \u2699\ufe0f  Einstellungen / Strategie-Anpassung")
+    print("\033[95m [4]\033[0m \U0001F4C8 Historische Kursdaten anzeigen")
     print("\033[91m [0]\033[0m \u2716  Beenden")
     return input("Auswahl [2]: ").strip()
 
@@ -2813,6 +2814,8 @@ def main() -> None:
                         logger.warning("Re-Render fehlgeschlagen.")
             elif choice == "3":
                 configure_user_settings_interactive()
+            elif choice == "4":
+                show_ticker_history_interactive()
             else:
                 print("Ungueltige Auswahl.")
         except KeyboardInterrupt:
