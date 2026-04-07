@@ -736,7 +736,9 @@ def build_rsl_price_series(
                     if isinstance(loc, slice) or isinstance(loc, np.ndarray):
                         continue
 
-                    start = max(0, loc - int(cfg["dividend_window_before"]))
+                    # FIX: Bei fehlerhafter Adjustierung die gesamte Historie davor korrigieren,
+                    # da Yahoo oft den globalen Floor vor der Dividende falsch verschiebt.
+                    start = 0 
                     end = min(len(df), loc + int(cfg["dividend_window_after"]) + 1)
 
                     fallback_idx = df.index[start:end]
@@ -1011,11 +1013,15 @@ class IntegrityAssessment:
     hard_fail_reasons: List[str] = field(default_factory=list)
     warning_reasons: List[str] = field(default_factory=list)
     review_reasons: List[str] = field(default_factory=list)
+    rsl_eligible: bool = True
+    ranking_integrity_status: str = "eligible_original"
+    ranking_exclude_reason: str = ""
 
     def add_hard_fail(self, reason: str) -> None:
         if reason not in self.hard_fail_reasons:
             self.hard_fail_reasons.append(reason)
         self.is_valid = False
+        self.rsl_eligible = False
 
     def add_warning(self, reason: str) -> None:
         if reason not in self.warning_reasons:
@@ -1121,28 +1127,51 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     assessment = IntegrityAssessment()
     reasons = get_rsl_integrity_reasons(item, location_suffix_map, config)
     history_status = get_history_status(item, location_suffix_map)
+    used_repair = getattr(item, 'used_close_fallback', False)
     
-    # Ursachenbasierte harte Ausschlusskriterien für das Ranking
-    hard_fail_criteria = {
-        "no_valid_rsl_data", 
-        "critical_history_length", 
-        "critical_price_series_unreliable", 
-        "critical_dividend_adjustment_issue", 
-        "critical_scale_break"
+    # 1. UNREPARIERBARE SHOWSTOPPER (Immer Ausschluss)
+    showstoppers = {
+        "no_valid_rsl_data",
+        "critical_history_length",
+        "critical_price_series_unreliable",
+        "critical_stale_secondary_history"
     }
+    
+    # 2. REPARIERBARE FEHLER (Ausschluss nur, wenn Reparatur nicht erfolgte)
+    repairable_issues = {
+        "critical_dividend_adjustment_issue",
+        "critical_scale_break",
+        "bad_dividend_adjustment",
+        "extreme_adjclose_close_gap_in_dividend_window"
+    }
+
     review_criteria = {"suspicious_price_scale", "low_trust_score"}
 
     for r in reasons:
-        if r in hard_fail_criteria: 
+        if r in showstoppers:
             assessment.add_hard_fail(r)
+        elif r in repairable_issues:
+            if used_repair:
+                assessment.add_warning(f"repaired_{r}")
+            else:
+                assessment.add_hard_fail(r)
         elif r == "critical_stale_data":
-            # Stale Data auf Sekundärmärkten führt zum Ranking-Ausschluss
             if history_status == "SECONDARY_HISTORY_ACTIVE":
                 assessment.add_hard_fail("critical_stale_secondary_history")
             else:
                 assessment.add_warning(r)
         elif r in review_criteria: assessment.add_review(r)
         else: assessment.add_warning(r)
+
+    # Finale Status-Klassifizierung
+    if not assessment.rsl_eligible:
+        assessment.ranking_integrity_status = "not_eligible_unreliable"
+        assessment.ranking_exclude_reason = "; ".join(assessment.hard_fail_reasons)
+    elif used_repair:
+        assessment.ranking_integrity_status = "eligible_repaired"
+    else:
+        assessment.ranking_integrity_status = "eligible_original"
+        
     return assessment
 
 def filter_stock_results_for_rsl_integrity(
@@ -1158,19 +1187,23 @@ def filter_stock_results_for_rsl_integrity(
         
         # Metadaten am Objekt setzen
         all_reasons = assessment.all_reasons
+        try:
+            setattr(stock, "rsl_eligible", assessment.rsl_eligible)
+            setattr(stock, "ranking_integrity_status", assessment.ranking_integrity_status)
+        except AttributeError: pass
+
         if assessment.all_reasons:
             try:
                 setattr(stock, "integrity_warnings", all_reasons)
                 setattr(stock, "excluded_from_ranking", not assessment.is_valid)
-                if not assessment.is_valid:
-                    setattr(stock, "ranking_exclude_reason", "; ".join(assessment.hard_fail_reasons))
+                setattr(stock, "ranking_exclude_reason", assessment.ranking_exclude_reason)
             except AttributeError: pass
 
-        if assessment.is_valid:
+        if assessment.rsl_eligible:
             valid_results.append(stock)
         
         # Im Issue-DF landen alle Auffälligkeiten zur Dokumentation
-        if not assessment.is_valid or all_reasons:
+        if not assessment.rsl_eligible or all_reasons:
             issue_rows.append({
                 "original_ticker": _get_row_value(stock, ["original_ticker"], ""),
                 "yahoo_symbol": _get_row_value(stock, ["yahoo_symbol"], ""),
@@ -1178,9 +1211,11 @@ def filter_stock_results_for_rsl_integrity(
                 "land": _get_row_value(stock, ["land"], ""),
                 "history_status": get_history_status(stock, location_suffix_map),
                 "integrity_reasons": ", ".join(all_reasons),
-                "is_valid": assessment.is_valid,
-                "excluded_from_ranking": not assessment.is_valid,
-                "ranking_exclude_reason": "; ".join(assessment.hard_fail_reasons),
+                "is_valid": assessment.is_valid, # Legacy kompatibel
+                "rsl_eligible": assessment.rsl_eligible,
+                "ranking_integrity_status": assessment.ranking_integrity_status,
+                "excluded_from_ranking": not assessment.rsl_eligible,
+                "ranking_exclude_reason": assessment.ranking_exclude_reason,
                 "needs_review": assessment.needs_review,
                 "hard_fail_reasons": "; ".join(assessment.hard_fail_reasons),
                 "warning_reasons": "; ".join(assessment.warning_reasons),
