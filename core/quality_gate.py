@@ -2,6 +2,7 @@ import datetime
 from typing import Any, Callable, Dict, List
 
 import numpy as np
+import pandas as pd
 
 
 def safe_ratio(numerator: int, denominator: int) -> float:
