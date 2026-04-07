@@ -1069,13 +1069,15 @@ def get_rsl_integrity_reasons(
     Sammelt Integritätsgründe. Unterstützt sowohl history_df als auch StockData Objekte.
     """
     if isinstance(item, pd.DataFrame):
-        return get_rsl_integrity_drop_reasons(
+        # Direkte Analyse für DataFrames, um Rekursion mit dem Alias zu vermeiden
+        analysis = analyze_history_for_rsl_integrity(
             history_df=item,
             ticker=None,
             country=None,
-            cfg=config
+            cfg=config,
         )
-    
+        return analysis.get("drop_reasons", [])
+
     reasons: List[str] = []
     trust_score = int(_get_row_value(item, ["trust_score"], 3))
     flag_stale = str(_get_row_value(item, ["flag_stale"], "OK")).upper()
@@ -1194,24 +1196,22 @@ def build_home_market_rsl_review_shortlist(audit_df: pd.DataFrame, top_rank: int
     return work
 
 def get_rsl_integrity_drop_reasons(
-    history_df: pd.DataFrame,
-    ticker: Optional[str] = None,
-    country: Optional[str] = None,
-    cfg: Optional[Dict[str, Any]] = None,
+    item: Any,
+    location_suffix_map: Dict[str, str],
+    config: Dict[str, Any],
+    raw_rsl: Any = None,
 ) -> List[str]:
     """
-    Legacy-Alias:
-    gibt weiterhin 'drop_reasons' zurück.
-    Wichtig: Das sind ALLE identifizierten Reasons,
-    nicht nur echte Hard-Fails.
+    Legacy-Alias für get_rsl_integrity_reasons.
+    Stellt sicher, dass die Signatur exakt zu den Aufrufen in final.py passt,
+    um Positions-Fehler bei den Parametern zu vermeiden.
     """
-    analysis = analyze_history_for_rsl_integrity(
-        history_df=history_df,
-        ticker=ticker,
-        country=country,
-        cfg=cfg,
+    return get_rsl_integrity_reasons(
+        item=item,
+        location_suffix_map=location_suffix_map,
+        config=config,
+        raw_rsl=raw_rsl,
     )
-    return analysis.get("drop_reasons", [])
 
 
 def enrich_with_rsl_integrity(
