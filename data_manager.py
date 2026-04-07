@@ -106,6 +106,9 @@ class StockData:
     ranking_integrity_status: str = "eligible_original"
     used_close_fallback: bool = False
     rsl_price_source: str = "adj_close"
+    repair_applied: bool = False
+    repair_method: str = ""
+    repair_reason: str = ""
 
     def to_dict(self):
         return asdict(self)
@@ -481,18 +484,20 @@ class MarketDataManager:
                 # Reparierte Serie als Basis fuer Flags setzen
                 used_fallback = bool(analysis.get('used_close_fallback', False))
                 
-                # Reparierte Serie als Basis fuer Flags setzen
-                hist_adj['Adj Close'] = clean_series
                 is_young_history = len(clean_series.dropna()) < sma_len
                 if is_young_history:
                     self.young_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
 
                 vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-                flags = self._calculate_flags(hist_adj, curr, sma, is_young_history)
+                
+                # Flags auf der reparierten Serie berechnen, ohne das DataFrame zu mutieren
+                flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
+                
                 # Integritaets-Gründe in Flags einmischen
                 flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
                 flags['used_close_fallback'] = used_fallback
-                flags['rsl_price_source'] = "close_fallback" if used_fallback else "adj_close"
+                # Detaillierten Modus aus Diagnostics übernehmen
+                flags['rsl_price_source'] = analysis.get('diagnostics', {}).get('rsl_price_source_mode', 'adj_close')
                     
                 results[t] = (curr, sma, vol_eur, flags)
                 with self.lock:

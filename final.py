@@ -2079,7 +2079,8 @@ def show_ticker_history_interactive():
         # Zeitraum dynamisch wählen, um genug Daten für die Trading-Tage zu haben
         period = "2y" if days > 250 else "1y"
         t = yf.Ticker(ticker)
-        df = t.history(period=period, actions=True)
+        # auto_adjust=False, um sowohl den rohen Close als auch den bereinigten Adj Close zu erhalten
+        df = t.history(period=period, actions=True, auto_adjust=False)
         
         if df.empty:
             print(f"\033[91mFehler: Keine Daten fuer {ticker} gefunden.\033[0m")
@@ -2088,12 +2089,12 @@ def show_ticker_history_interactive():
         df = df.tail(days)
         
         # Header formatting
-        print("\n" + "="*100)
+        print("\n" + "="*115)
         print(f" HISTORIE: {ticker} (letzte {len(df)} Handelstage)")
-        print("="*100)
-        header = f"{'Datum':<12} | {'Open':>9} | {'High':>9} | {'Low':>9} | {'Close':>9} | {'Volume':>12} | {'Dividende'}"
+        print("="*115)
+        header = f"{'Datum':<12} | {'Open':>9} | {'High':>9} | {'Low':>9} | {'Close':>9} | {'Adj Close':>9} | {'Volume':>12} | {'Dividende'}"
         print(header)
-        print("-" * 100)
+        print("-" * 115)
         
         for dt, row in df.iterrows():
             div = row.get('Dividends', 0.0)
@@ -2104,9 +2105,10 @@ def show_ticker_history_interactive():
             color = "\033[93m" if div > 0 else ""
             reset = "\033[0m" if div > 0 else ""
             
-            print(f"{color}{dt.strftime('%Y-%m-%d'):<12} | {row['Open']:>9.2f} | {row['High']:>9.2f} | {row['Low']:>9.2f} | {row['Close']:>9.2f} | {int(row['Volume']):>12,d} | {div_str}{reset}")
+            adj_c = row.get('Adj Close', row['Close'])
+            print(f"{color}{dt.strftime('%Y-%m-%d'):<12} | {row['Open']:>9.2f} | {row['High']:>9.2f} | {row['Low']:>9.2f} | {row['Close']:>9.2f} | {adj_c:>9.2f} | {int(row['Volume']):>12,d} | {div_str}{reset}")
         
-        print("="*100)
+        print("="*115)
         print(f"Info: {len(df)} Zeilen angezeigt. Dividenden-Tage sind markiert.")
         
     except Exception as e:
