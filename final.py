@@ -937,8 +937,8 @@ def _history_priority_score(item: Any) -> int:
 def _stock_history_priority_score(s: StockData) -> int:
     return final_support_core.stock_history_priority_score(s, LOCATION_SUFFIX_MAP)
 
-def get_rsl_integrity_drop_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
-    return rsl_integrity_core.get_rsl_integrity_drop_reasons(item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl)
+def get_rsl_integrity_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
+    return rsl_integrity_core.get_rsl_integrity_reasons(item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl)
 
 def filter_stock_results_for_rsl_integrity(results):
     return rsl_integrity_core.filter_stock_results_for_rsl_integrity(results, LOCATION_SUFFIX_MAP, CONFIG)
@@ -1963,11 +1963,11 @@ def rerender_last_analysis() -> bool:
     all_candidates = main_stocks # In einer vollen Implementierung wuerden hier auch die Drops geladen
 
     # Dynamische Neu-Filterung mit aktuellen CONFIG-Werten
-    stock_results, integrity_drops_df = filter_stock_results_for_rsl_integrity(all_candidates)
+    stock_results, integrity_issues_df = filter_stock_results_for_rsl_integrity(all_candidates)
     
     selected_syms = snapshot.get('selected_syms', [])
     etf_options = snapshot.get('etf_options', {})
-    integrity_drops_df = snapshot.get('integrity_drops_df', pd.DataFrame())
+    integrity_issues_df = snapshot.get('integrity_drops_df', pd.DataFrame())
 
     saved_at = snapshot.get('saved_at', '')
     logger.info(f"Nutze letzten Analysesnapshot ohne neuen Download. Stand: {saved_at or 'unbekannt'}")
@@ -1977,9 +1977,9 @@ def rerender_last_analysis() -> bool:
     print(f"Analyse wird ohne neuen Download mit {len(stock_results)} gespeicherten Werten neu aufgebaut.")
 
     # NEU: Dynamische Re-Filterung ermöglicht CONFIG-Anpassungen (z.B. sma_length) ohne Download
-    stock_results, re_drops_df = filter_stock_results_for_rsl_integrity(stock_results)
-    if not re_drops_df.empty:
-        integrity_drops_df = pd.concat([integrity_drops_df, re_drops_df], ignore_index=True).drop_duplicates(subset=['yahoo_symbol'])
+    stock_results, re_issues_df = filter_stock_results_for_rsl_integrity(stock_results)
+    if not re_issues_df.empty:
+        integrity_issues_df = pd.concat([integrity_issues_df, re_issues_df], ignore_index=True).drop_duplicates(subset=['yahoo_symbol'])
     
     # --- NEU: Metadata-Repair fuer Snapshots ---
     # Wir laden die Caches, um leere Felder im Snapshot on-the-fly zu füllen
@@ -2051,7 +2051,7 @@ def rerender_last_analysis() -> bool:
         industry_summary_df=industry_summary_df,
         cluster_summary_df=cluster_summary_df,
         market_regime=market_regime,
-        integrity_drops_df=integrity_drops_df,
+        integrity_drops_df=integrity_issues_df,
         watchlist_symbols=watchlist_symbols
     )
     return True
@@ -2567,32 +2567,32 @@ def run_analysis_pipeline(
                         ))
                         mapper.set(u_key, y_sym)
                     pbar.update(1)
-    stock_results, integrity_drops_df = filter_stock_results_for_rsl_integrity(stock_results)
+    stock_results, integrity_issues_df = filter_stock_results_for_rsl_integrity(stock_results)
     save_dataframe_safely(
-        integrity_drops_df,
+        integrity_issues_df,
         CONFIG['rsl_integrity_drop_file'],
         sep=';',
         index=False,
         encoding='utf-8-sig',
     )
-    if not integrity_drops_df.empty:
-        for _, row in integrity_drops_df.iterrows():
+    if not integrity_issues_df.empty:
+        for _, row in integrity_issues_df.iterrows():
             dropped_critical.append(
-                f"{row.get('yahoo_symbol', '')} ({row.get('original_ticker', '')}): RSL-Integritaet -> {row.get('drop_reasons', '')}"
+                f"{row.get('yahoo_symbol', '')} ({row.get('original_ticker', '')}): RSL-Integritaet -> {row.get('integrity_reasons', '')}"
             )
         
         # NEU: Zusammenfassung der Integritäts-Flags ausgeben
-        integrity_summary = quality_core.summarize_integrity_flags(integrity_drops_df)
+        integrity_summary = quality_core.summarize_integrity_flags(integrity_issues_df)
         print(f"\nIntegritaets-Check Ergebnis: {quality_core.quality_gate_status(integrity_summary)}")
         
-        if "is_valid" in integrity_drops_df.columns:
+        if "is_valid" in integrity_issues_df.columns:
             print(f" - Hard fails: {integrity_summary['hard_fail_count']}")
-        if "needs_review" in integrity_drops_df.columns:
+        if "needs_review" in integrity_issues_df.columns:
             print(f" - Needs review: {integrity_summary['review_count']}")
-        if "warning_reasons" in integrity_drops_df.columns:
+        if "warning_reasons" in integrity_issues_df.columns:
             print(f" - Warnings: {integrity_summary['warning_count']}")
 
-        logger.info(f"[WARN] {len(integrity_drops_df)} Ticker weisen unzuverlaessige RSL-Historie auf (werden im Report markiert).")
+        logger.info(f"[WARN] {len(integrity_issues_df)} Ticker weisen unzuverlaessige RSL-Historie auf (werden im Report markiert).")
     apply_primary_liquidity_context(stock_results)
     refresh_market_caps_for_relevant_exchange_stocks(stock_results, data_mgr)
     mapper.save_if_dirty()
@@ -2646,7 +2646,7 @@ def run_analysis_pipeline(
             sym = str(getattr(s, "yahoo_symbol", "")).strip().upper()
             s.mom_cluster = cluster_map.get(sym, "")
     
-    save_analysis_snapshot(stock_results, selected_syms, etf_options, integrity_drops_df=integrity_drops_df)
+    save_analysis_snapshot(stock_results, selected_syms, etf_options, integrity_drops_df=integrity_issues_df)
     logger.info("Snapshot vor Quality-Gate gesichert.")
 
     portfolio_symbols = [str(p.get('Yahoo_Symbol', '')).strip().upper() for p in portfolio_mgr.current_portfolio if p.get('Yahoo_Symbol')]
@@ -2723,7 +2723,7 @@ def run_analysis_pipeline(
         industry_summary_df=industry_summary_df,
         cluster_summary_df=cluster_summary_df,
         market_regime=market_regime,
-        integrity_drops_df=integrity_drops_df,
+        integrity_drops_df=integrity_issues_df,
         watchlist_symbols=watchlist_symbols
     )
 
