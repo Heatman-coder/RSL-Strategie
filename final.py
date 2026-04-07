@@ -965,15 +965,6 @@ def build_home_market_rsl_review_shortlist(
         audit_df, top_rank=top_rank
     )
 
-
-def build_home_market_rsl_audit(results):
-    return rsl_integrity_core.build_home_market_rsl_audit(results, LOCATION_SUFFIX_MAP)
-
-
-def build_home_market_rsl_review_shortlist(audit_df: pd.DataFrame, top_rank: int = 300) -> pd.DataFrame:
-    return rsl_integrity_core.build_home_market_rsl_review_shortlist(audit_df, top_rank=top_rank)
-
-
 def save_home_market_rsl_audit(results):
     audit_df = build_home_market_rsl_audit(results)
     shortlist_df = build_home_market_rsl_review_shortlist(
