@@ -20,7 +20,7 @@ import numpy as np
 import yfinance as yf
 from typing import Dict, Any, Optional, List, Tuple, Union, cast
 from threading import Lock
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 logger = logging.getLogger(__name__)
 
