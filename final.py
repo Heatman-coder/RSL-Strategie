@@ -2247,7 +2247,58 @@ def run_analysis_pipeline(
     if df.empty:
         logger.error("Ticker-Universum konnte nicht vorbereitet werden.")
         return
+
+    # --- TICKER / ISIN FILTER (USER REQUEST) ---
+    print("\n" + "-" * 50)
+    print(" AD-HOC FILTER / TEST-MODUS")
+    print(" (Ticker/ISINs kopieren oder eingeben. ENTER auf leerer Zeile zum Starten.)")
+    
+    collected_lines = []
+    while True:
+        line = input(" > ").strip()
+        if not line:
+            break
+        collected_lines.append(line)
+    
+    filter_input = " ".join(collected_lines)
+    if filter_input:
+        filter_tokens = {t.strip().upper() for t in filter_input.replace(",", " ").split() if t.strip()}
+        if filter_tokens:
+            # Suche in Ticker und ISIN Spalten
+            mask = df['Ticker'].str.upper().str.strip().isin(filter_tokens)
+            if 'ISIN' in df.columns:
+                mask |= df['ISIN'].str.upper().str.strip().isin(filter_tokens).fillna(False)
+            
+            df_filtered = df[mask].copy()
+            
+            # Checke auf Ticker, die nicht in den Quellen waren (Yahoo-Direkt-Eingabe)
+            found_tokens = set(df_filtered['Ticker'].str.upper().str.strip())
+            if 'ISIN' in df.columns:
+                found_tokens.update(df_filtered['ISIN'].str.upper().str.strip().dropna())
+            
+            missing_tokens = filter_tokens - found_tokens
+            if missing_tokens:
+                ad_hoc_rows = []
+                for token in missing_tokens:
+                    if re.match(r'^[A-Z]{2}[A-Z0-9]{9}\d$', token):
+                        logger.warning(f"ISIN '{token}' nicht im Universum gefunden. Ueberspringe.")
+                        continue
+                    ad_hoc_rows.append({
+                        'Ticker': token, 'Name': f"Ad-hoc: {token}", 'ISIN': '',
+                        'Sector': 'Unknown', 'Industry': 'Unknown', 'Land': 'Unknown',
+                        'Market Value': 0.0, 'Source_ETF': 'MANUAL', 'Listing_Source': 'MANUAL'
+                    })
+                if ad_hoc_rows:
+                    df_filtered = pd.concat([df_filtered, pd.DataFrame(ad_hoc_rows)], ignore_index=True)
+            
+            if not df_filtered.empty:
+                df = df_filtered
+                logger.info(f"Filter aktiv: Download auf {len(df)} Ticker beschraenkt.")
+            else:
+                logger.warning("Filter ergab keine Treffer. Nutze komplettes Universum.")
+
     final_rows = len(df)
+
     history_symbol_overrides = final_support_core.build_history_symbol_overrides(
         df, df, LOCATION_SUFFIX_MAP, UNSUPPORTED_EXCHANGES, EXCHANGE_SUFFIX_MAP
     )
