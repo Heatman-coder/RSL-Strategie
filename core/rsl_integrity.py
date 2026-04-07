@@ -130,7 +130,7 @@ def get_history_status(item: Any, location_suffix_map: Dict[str, str]) -> str:
     return "UNKNOWN"
 
 
-def get_rsl_integrity_drop_reasons(
+def get_rsl_integrity_reasons(
     item: Any,
     location_suffix_map: Dict[str, str],
     config: Dict[str, Any],
@@ -177,7 +177,7 @@ def get_rsl_integrity_drop_reasons(
 def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dict[str, Any]) -> IntegrityAssessment:
     """Nutzt die bestehende Logik, um ein IntegrityAssessment Objekt zu befüllen."""
     assessment = IntegrityAssessment()
-    reasons = get_rsl_integrity_drop_reasons(item, location_suffix_map, config)
+    reasons = get_rsl_integrity_reasons(item, location_suffix_map, config)
     
     # Definition Hard Fail (identisch zu deiner bestehenden Logik)
     hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
@@ -207,7 +207,8 @@ def filter_stock_results_for_rsl_integrity(
     config: Dict[str, Any],
 ) -> Tuple[List[Any], pd.DataFrame]:
     valid_results: List[Any] = []
-    dropped_rows: List[Dict[str, Any]] = []
+    dropped_rows: List[Dict[str, Any]] = [] # Nur echte Hard Fails (Ausschluss)
+    issue_rows: List[Dict[str, Any]] = []   # Warnings und Review-Fälle (bleiben im Ranking)
 
     for stock in stock_results or []:
         assessment = assess_integrity(stock, location_suffix_map, config)
@@ -219,17 +220,16 @@ def filter_stock_results_for_rsl_integrity(
                 stock.integrity_warnings = list(dict.fromkeys(assessment.warning_reasons + assessment.review_reasons))
             valid_results.append(stock)
 
-        # Audit Trail: Jede Form von Auffälligkeit (Fail, Warning, Review) landet im Audit-Bericht
         if not assessment.is_valid or assessment.warning_reasons or assessment.review_reasons:
-            # Diese Aktien landen NICHT in valid_results, werden aber im dropped_df erfasst
-            dropped_rows.append(
-                {
+            # Audit Trail: Alle Auffälligkeiten landen im Integrity-Bericht.
+            # Nur Hard Fails fliegen wirklich aus den valid_results.
+            row_data = {
                     "original_ticker": _context_value(stock, "original_ticker", ""),
                     "yahoo_symbol": _context_value(stock, "yahoo_symbol", ""),
                     "name": _context_value(stock, "name", ""),
                     "land": _context_value(stock, "land", ""),
                     "history_status": get_history_status(stock, location_suffix_map),
-                    "drop_reasons": ", ".join(assessment.hard_fail_reasons + assessment.warning_reasons + assessment.review_reasons),
+                    "integrity_reasons": ", ".join(assessment.hard_fail_reasons + assessment.warning_reasons + assessment.review_reasons),
                     "is_valid": assessment.is_valid,
                     "needs_review": assessment.needs_review,
                     "hard_fail_reasons": "; ".join(assessment.hard_fail_reasons),
@@ -250,7 +250,11 @@ def filter_stock_results_for_rsl_integrity(
                     "history_length_reason": _context_value(stock, "history_length_reason", None),
                     "flag_gap": _context_value(stock, "flag_gap", None),
                 }
-            )
+
+            if not assessment.is_valid:
+                dropped_rows.append(row_data)
+            else:
+                issue_rows.append(row_data)
 
     columns = [
         "original_ticker",
@@ -258,7 +262,7 @@ def filter_stock_results_for_rsl_integrity(
         "name",
         "land",
         "history_status",
-        "drop_reasons",
+        "integrity_reasons",
         "is_valid",
         "needs_review",
         "hard_fail_reasons",
@@ -279,8 +283,8 @@ def filter_stock_results_for_rsl_integrity(
         "history_length_reason",
         "flag_gap",
     ]
-    dropped_df = pd.DataFrame(dropped_rows, columns=columns)
-    return valid_results, dropped_df
+    integrity_issue_df = pd.DataFrame(dropped_rows + issue_rows, columns=columns)
+    return valid_results, integrity_issue_df
 
 
 def build_home_market_rsl_audit(
