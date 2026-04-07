@@ -1004,6 +1004,195 @@ def apply_rsl_integrity_to_universe(
 # Rückwärtskompatible API
 # ============================================================================
 
+@dataclass
+class IntegrityAssessment:
+    is_valid: bool = True
+    needs_review: bool = False
+    hard_fail_reasons: List[str] = field(default_factory=list)
+    warning_reasons: List[str] = field(default_factory=list)
+    review_reasons: List[str] = field(default_factory=list)
+
+    def add_hard_fail(self, reason: str) -> None:
+        if reason not in self.hard_fail_reasons:
+            self.hard_fail_reasons.append(reason)
+        self.is_valid = False
+
+    def add_warning(self, reason: str) -> None:
+        if reason not in self.warning_reasons:
+            self.warning_reasons.append(reason)
+
+    def add_review(self, reason: str) -> None:
+        if reason not in self.review_reasons:
+            self.review_reasons.append(reason)
+        self.needs_review = True
+
+    @property
+    def all_reasons(self) -> List[str]:
+        return list(dict.fromkeys(self.hard_fail_reasons + self.warning_reasons + self.review_reasons))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "is_valid": self.is_valid,
+            "needs_review": self.needs_review,
+            "hard_fail_reasons": list(self.hard_fail_reasons),
+            "warning_reasons": list(self.warning_reasons),
+            "review_reasons": list(self.review_reasons),
+            "all_reasons": self.all_reasons,
+        }
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+SECONDARY_LISTING_SUFFIXES = {".BE", ".DE", ".DU", ".F", ".HM", ".MU", ".SG"}
+
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+def get_rsl_integrity_reasons(
+    item: Any,
+    location_suffix_map: Dict[str, str],
+    config: Dict[str, Any],
+    raw_rsl: Any = None,
+) -> List[str]:
+    """
+    Sammelt Integritätsgründe. Unterstützt sowohl history_df als auch StockData Objekte.
+    """
+    if isinstance(item, pd.DataFrame):
+        return get_rsl_integrity_drop_reasons(
+            history_df=item,
+            ticker=None,
+            country=None,
+            cfg=config
+        )
+    
+    reasons: List[str] = []
+    trust_score = int(_get_row_value(item, ["trust_score"], 3))
+    flag_stale = str(_get_row_value(item, ["flag_stale"], "OK")).upper()
+    flag_hist = str(_get_row_value(item, ["flag_history_length"], "OK")).upper()
+    flag_scale = str(_get_row_value(item, ["flag_scale"], "OK")).upper()
+
+    if flag_stale == "CRITICAL":
+        reasons.append("critical_stale_data")
+    if flag_hist == "CRITICAL":
+        reasons.append("critical_history_length")
+    if flag_scale == "CRITICAL":
+        reasons.append("critical_price_scale")
+    elif flag_scale == "WARN":
+        reasons.append("suspicious_price_scale")
+    if trust_score < 1:
+        reasons.append("low_trust_score")
+
+    rsl_val = _coerce_float(_get_row_value(item, ["rsl"], 0.0))
+    if rsl_val <= 0:
+        reasons.append("no_valid_rsl_data")
+
+    return list(dict.fromkeys(reasons))
+
+def get_history_status(item: Any, location_suffix_map: Dict[str, str]) -> str:
+    orig = str(_get_row_value(item, ["original_ticker"], "")).upper().strip()
+    hist_sym = str(_get_row_value(item, ["yahoo_symbol"], orig)).upper().strip()
+    land = str(_get_row_value(item, ["land"], "")).strip()
+    home_suffix = str(location_suffix_map.get(land, "")).strip().upper()
+    if home_suffix and not home_suffix.startswith("."): home_suffix = f".{home_suffix}"
+
+    if home_suffix and hist_sym.endswith(home_suffix):
+        return "OVERRIDDEN_TO_HOME" if orig != hist_sym else "HOME_HISTORY_ACTIVE"
+    
+    hist_sfx = f".{hist_sym.rsplit('.', 1)[-1]}" if "." in hist_sym else ""
+    if hist_sfx in SECONDARY_LISTING_SUFFIXES:
+        return "SECONDARY_HISTORY_ACTIVE"
+    
+    return "PRIMARY_WITHOUT_SUFFIX" if "." not in hist_sym else "UNKNOWN"
+
+def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dict[str, Any]) -> IntegrityAssessment:
+    assessment = IntegrityAssessment()
+    reasons = get_rsl_integrity_reasons(item, location_suffix_map, config)
+    
+    hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
+    review_criteria = {"suspicious_price_scale", "low_trust_score"}
+    warning_criteria = {"critical_stale_data", "critical_price_scale"}
+
+    for r in reasons:
+        if r in hard_fail_criteria: assessment.add_hard_fail(r)
+        elif r in review_criteria: assessment.add_review(r)
+        else: assessment.add_warning(r)
+    return assessment
+
+def filter_stock_results_for_rsl_integrity(
+    stock_results: List[Any],
+    location_suffix_map: Dict[str, str],
+    config: Dict[str, Any],
+) -> Tuple[List[Any], pd.DataFrame]:
+    valid_results: List[Any] = []
+    issue_rows: List[Dict[str, Any]] = []
+
+    for stock in stock_results or []:
+        assessment = assess_integrity(stock, location_suffix_map, config)
+        if assessment.all_reasons:
+            try:
+                setattr(stock, "integrity_warnings", assessment.all_reasons)
+            except AttributeError: pass
+
+        if assessment.is_valid:
+            valid_results.append(stock)
+        
+        if not assessment.is_valid or assessment.all_reasons:
+            issue_rows.append({
+                "original_ticker": _get_row_value(stock, ["original_ticker"], ""),
+                "yahoo_symbol": _get_row_value(stock, ["yahoo_symbol"], ""),
+                "name": _get_row_value(stock, ["name"], ""),
+                "land": _get_row_value(stock, ["land"], ""),
+                "history_status": get_history_status(stock, location_suffix_map),
+                "integrity_reasons": ", ".join(assessment.all_reasons),
+                "is_valid": assessment.is_valid,
+                "needs_review": assessment.needs_review,
+                "hard_fail_reasons": "; ".join(assessment.hard_fail_reasons),
+                "warning_reasons": "; ".join(assessment.warning_reasons),
+                "review_reasons": "; ".join(assessment.review_reasons),
+                "rsl": _get_row_value(stock, ["rsl"], None),
+            })
+
+    dropped_df = pd.DataFrame(issue_rows)
+    return valid_results, dropped_df
+
+def build_home_market_rsl_audit(results: List[Any], location_suffix_map: Dict[str, str]) -> pd.DataFrame:
+    rows = []
+    for stock in results or []:
+        status = get_history_status(stock, location_suffix_map)
+        rows.append({
+            "history_status": status,
+            "original_ticker": _get_row_value(stock, ["original_ticker"], ""),
+            "history_symbol": _get_row_value(stock, ["yahoo_symbol"], ""),
+            "name": _get_row_value(stock, ["name"], ""),
+            "land": _get_row_value(stock, ["land"], ""),
+            "rsl_rank": _get_row_value(stock, ["rsl_rang"], None),
+            "needs_review": status == "SECONDARY_HISTORY_ACTIVE"
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["needs_review", "rsl_rank"], ascending=[False, True])
+    return df
+
+def build_home_market_rsl_review_shortlist(audit_df: pd.DataFrame, top_rank: int = 300) -> pd.DataFrame:
+    if audit_df.empty: return audit_df
+    work = audit_df.copy()
+    if "rsl_rank" in work.columns:
+        work = work[pd.to_numeric(work["rsl_rank"], errors='coerce') <= top_rank]
+    if "needs_review" in work.columns:
+        work = work[work["needs_review"] == True]
+    return work
+
 def get_rsl_integrity_drop_reasons(
     history_df: pd.DataFrame,
     ticker: Optional[str] = None,
