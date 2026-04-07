@@ -104,32 +104,36 @@ def get_rsl_integrity_drop_reasons(
     config: Dict[str, Any],
     raw_rsl: Any = None,
 ) -> List[str]:
+    """
+    Sammelt Integritätswarnungen. 
+    WICHTIG: Gründe, die hier landen, führen im Standard-Modus nur zur Markierung, 
+    nicht zum Ausschluss aus dem Ranking (außer bei mathematischer Unmöglichkeit).
+    """
     reasons: List[str] = []
     
-    # 0. Harte Flags aus dem DataManager (Sicherheitsnetz)
-    flag_stale = str(_context_value(item, "flag_stale", "") or "").strip().upper()
-    flag_hist = str(_context_value(item, "flag_history_length", "") or "").strip().upper()
-    stale_msg = str(_context_value(item, "stale_reason", "") or "").lower()
-    hist_msg = str(_context_value(item, "history_length_reason", "") or "").lower()
+    # Extraktion der Zustands-Flags (numerisch/enum-basiert bevorzugt)
+    trust_score = int(_context_value(item, "trust_score", 3))
+    flag_stale = str(_context_value(item, "flag_stale", "OK")).upper()
+    flag_hist = str(_context_value(item, "flag_history_length", "OK")).upper()
+    flag_scale = str(_context_value(item, "flag_scale", "OK")).upper()
 
+    # 1. Kritische Hardware-Fehler (Daten unvollständig)
     if flag_stale == "CRITICAL":
         reasons.append("critical_stale_data")
     if flag_hist == "CRITICAL":
         reasons.append("critical_history_length")
+    
+    # 2. Skalierungsfehler (Split-Glitches etc.)
+    if flag_scale == "CRITICAL":
+        reasons.append("critical_price_scale")
+    elif flag_scale == "WARN":
+        reasons.append("suspicious_price_scale")
 
-    if "historie zu kurz" in hist_msg:
-        reasons.append("history_too_short")
+    # 3. Vertrauenswürdigkeit (Aggregation)
+    if trust_score < 1:
+        reasons.append("low_trust_score")
 
-    if "eingefrorener kurs" in stale_msg or "kaum preisbewegung" in stale_msg:
-        reasons.append("stale_frozen_data")
-
-    if "flash-spike" in stale_msg:
-        reasons.append("flash_spike_glitch")
-
-    if "dividenden-korrektur" in stale_msg:
-        reasons.append("bad_dividend_adjustment")
-
-    # 7. RSL Validitaet
+    # 4. Mathematische Validität (Absolutes Minimum)
     raw_rsl_value = _optional_float(raw_rsl) or _optional_float(_context_value(item, "rsl", None))
     rsl_val = _safe_float(raw_rsl_value, 0.0)
     if rsl_val <= 0:
@@ -149,9 +153,19 @@ def filter_stock_results_for_rsl_integrity(
     for stock in stock_results or []:
         reasons = get_rsl_integrity_drop_reasons(stock, location_suffix_map, config, raw_rsl=_context_value(stock, "rsl", None))
         
-        if not reasons:
+        # DEFINITION: Was ist ein "Hard Fail"?
+        # Nur wenn RSL <= 0 oder die Historie kritisch fehlt, schließen wir aus.
+        # Alles andere bleibt drin, bekommt aber das "Reasons" Paket mit.
+        hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
+        has_hard_fail = any(r in hard_fail_criteria for r in reasons)
+
+        if not has_hard_fail:
             valid_results.append(stock)
-        else:
+            # Falls es Warnungen gab, hängen wir sie als Metadaten an das Objekt
+            if reasons:
+                setattr(stock, "integrity_warnings", reasons)
+        
+        if reasons:
             # Diese Aktien landen NICHT in valid_results, werden aber im dropped_df erfasst
             dropped_rows.append(
                 {
