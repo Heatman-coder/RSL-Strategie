@@ -736,11 +736,23 @@ def build_rsl_price_series(
                     if isinstance(loc, slice) or isinstance(loc, np.ndarray):
                         continue
 
-                    # FIX: Bei fehlerhafter Adjustierung die gesamte Historie davor korrigieren,
-                    # da Yahoo oft den globalen Floor vor der Dividende falsch verschiebt.
-                    start = 0 
-                    end = min(len(df), loc + int(cfg["dividend_window_after"]) + 1)
+                    # Unterscheidung: Globaler Floor-Bug vs. lokaler Glitch
+                    # Wir prüfen die mediane Ratio im Fenster
+                    ratio_series = (w_close / w_adj.replace(0, np.nan)).dropna()
+                    median_ratio = float(ratio_series.median()) if not ratio_series.empty else 1.0
+                    
+                    # Wenn die Ratio massiv abweicht (> 2.0 oder < 0.5), 
+                    # liegt wahrscheinlich ein globaler Scale-Fehler vor.
+                    is_global_bug = median_ratio > 2.0 or median_ratio < 0.5
+                    
+                    if is_global_bug:
+                        start = 0 # Gesamte Historie davor korrigieren
+                        repair_mode = "global_pre_ex_fallback"
+                    else:
+                        start = max(0, loc - int(cfg["dividend_window_before"]))
+                        repair_mode = "local_window_fallback"
 
+                    end = min(len(df), loc + int(cfg["dividend_window_after"]) + 1)
                     fallback_idx = df.index[start:end]
 
                     # Nur dort ersetzen, wo Close plausibel > 0 ist
@@ -750,7 +762,7 @@ def build_rsl_price_series(
                     if valid_mask.any():
                         idx_to_replace = close_slice.index[valid_mask]
                         df.loc[idx_to_replace, "rsl_price"] = close_slice.loc[idx_to_replace]
-                        df.loc[idx_to_replace, "rsl_price_source"] = "close_fallback_dividend_window"
+                        df.loc[idx_to_replace, "rsl_price_source"] = f"close_{repair_mode}"
                         used_close_fallback = True
 
                 if used_close_fallback:
@@ -783,12 +795,19 @@ def build_rsl_price_series(
         elif fallback_frac >= cfg["fallback_fraction_warn"]:
             reasons.add("substantial_close_fallback_in_rsl_series", "warning")
 
+    # Ermittle den dominanten Modus der Preisquelle
+    source_counts = df["rsl_price_source"].value_counts()
+    primary_source = str(source_counts.idxmax()) if not source_counts.empty else "unknown"
+
     return PriceSeriesBuildResult(
         history=df,
         rsl_price_column="rsl_price",
         used_close_fallback=used_close_fallback,
         reasons=reasons,
-        diagnostics=diagnostics,
+        diagnostics={
+            **diagnostics,
+            "rsl_price_source_mode": primary_source
+        },
     )
 
 
@@ -1016,6 +1035,9 @@ class IntegrityAssessment:
     rsl_eligible: bool = True
     ranking_integrity_status: str = "eligible_original"
     ranking_exclude_reason: str = ""
+    repair_applied: bool = False
+    repair_method: str = ""
+    repair_reason: str = ""
 
     def add_hard_fail(self, reason: str) -> None:
         if reason not in self.hard_fail_reasons:
@@ -1127,7 +1149,12 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     assessment = IntegrityAssessment()
     reasons = get_rsl_integrity_reasons(item, location_suffix_map, config)
     history_status = get_history_status(item, location_suffix_map)
-    used_repair = getattr(item, 'used_close_fallback', False)
+    
+    # Metadaten vom MarketDataManager / StockData abrufen
+    used_repair = bool(_get_row_value(item, ["used_close_fallback"], False))
+    final_flag_scale = str(_get_row_value(item, ["flag_scale"], "OK")).upper()
+    final_trust = int(_get_row_value(item, ["trust_score"], 3))
+    source_mode = str(_get_row_value(item, ["rsl_price_source"], "adj_close"))
     
     # 1. UNREPARIERBARE SHOWSTOPPER (Immer Ausschluss)
     showstoppers = {
@@ -1151,8 +1178,12 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
         if r in showstoppers:
             assessment.add_hard_fail(r)
         elif r in repairable_issues:
-            if used_repair:
-                assessment.add_warning(f"repaired_{r}")
+            # Entscheidend ist nicht der Fehler, sondern die Qualität danach
+            if used_repair and final_flag_scale == "OK" and final_trust >= 2:
+                assessment.add_warning(f"fixed_{r}")
+                assessment.repair_applied = True
+                assessment.repair_reason = r
+                assessment.repair_method = source_mode
             else:
                 assessment.add_hard_fail(r)
         elif r == "critical_stale_data":
@@ -1167,7 +1198,7 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     if not assessment.rsl_eligible:
         assessment.ranking_integrity_status = "not_eligible_unreliable"
         assessment.ranking_exclude_reason = "; ".join(assessment.hard_fail_reasons)
-    elif used_repair:
+    elif assessment.repair_applied:
         assessment.ranking_integrity_status = "eligible_repaired"
     else:
         assessment.ranking_integrity_status = "eligible_original"
