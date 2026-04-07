@@ -177,22 +177,27 @@ def get_rsl_integrity_drop_reasons(
 def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dict[str, Any]) -> IntegrityAssessment:
     """Nutzt die bestehende Logik, um ein IntegrityAssessment Objekt zu befüllen."""
     assessment = IntegrityAssessment()
-    all_reasons = get_rsl_integrity_drop_reasons(item, location_suffix_map, config)
+    reasons = get_rsl_integrity_drop_reasons(item, location_suffix_map, config)
     
-    # 1. HARD FAILS: Führen zum sofortigen Ausschluss (Aktion: DROP)
-    hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length", "critical_stale_data"}
-    
-    # 2. REVIEWS: Erfordern manuelle Prüfung (Aktion: MARK + AUDIT)
+    # Definition Hard Fail (identisch zu deiner bestehenden Logik)
+    hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
+    # Definition Review (Verdacht auf Skalierungsfehler oder niedriges Vertrauen)
     review_criteria = {"suspicious_price_scale", "low_trust_score"}
 
-    for r in all_reasons:
+    for r in reasons:
         if r in hard_fail_criteria:
             assessment.add_hard_fail(r)
         elif r in review_criteria:
             assessment.add_review(r)
         else:
-            # 3. WARNINGS: Informationell (Aktion: MARK)
+            # Alles andere (z.B. stale data, price scale critical) sind Warnings
+            # Hinweis: critical_price_scale ist bei dir kein Hard Fail für den Ausschluss,
+            # daher landet es hier in den Warnings.
             assessment.add_warning(r)
+            
+    # Falls wir Hard Fails haben, setzen wir is_valid auf False (passiert automatisch in add_hard_fail)
+    if any(r in hard_fail_criteria for r in reasons):
+        assessment.is_valid = False
         
     return assessment
 
@@ -208,13 +213,13 @@ def filter_stock_results_for_rsl_integrity(
         assessment = assess_integrity(stock, location_suffix_map, config)
 
         if assessment.is_valid:
-            # Aktie bleibt im System
+            # Aktie bleibt im System (Hard Fail liegt NICHT vor)
             if assessment.warning_reasons or assessment.review_reasons:
-                # Wir speichern die kombinierten Warnungen am Objekt für UI/Reports
+                # Markierung direkt am Objekt für spätere Dashboard-Anzeige/Excel
                 stock.integrity_warnings = list(dict.fromkeys(assessment.warning_reasons + assessment.review_reasons))
             valid_results.append(stock)
 
-        # Jede Form von Auffälligkeit (Fail, Warning, Review) landet im Audit-Trail
+        # Audit Trail: Jede Form von Auffälligkeit (Fail, Warning, Review) landet im Audit-Bericht
         if not assessment.is_valid or assessment.warning_reasons or assessment.review_reasons:
             # Diese Aktien landen NICHT in valid_results, werden aber im dropped_df erfasst
             dropped_rows.append(
