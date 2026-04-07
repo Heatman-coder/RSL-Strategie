@@ -194,10 +194,6 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
                 "Mom Accel",
                 "SMA50",
                 "Trust-Details",
-                "Trend-Exzess",
-                "Exzess-Datum",
-                "Tage seit Exzess",
-                "Exzess-Max %",
             }
             main_df = sheets.get("main")
             held_symbols: set = set()

@@ -47,6 +47,7 @@ MAIN_EXPORT_COLUMN_ORDER = [
     "Mom Accel",
     "SMA50",
     "Trust-Details",
+    "Scale-Status",
     "Trend-Exzess",
     "Exzess-Datum",
     "Tage seit Exzess",
@@ -109,6 +110,8 @@ RAW_EXPORT_COLUMN_ORDER = [
     "flag_liquidity",
     "flag_stale",
     "flag_scale",
+    "flag_history_length",
+    "history_length_reason",
     "scale_reason",
     "price_scale_ratio",
     "stale_days",
@@ -153,7 +156,7 @@ def _build_main_export_dataframe(
         for k in [
             'rsl', 'kurs', 'sma', 'trend_smoothness', 'twss_score', 'twss_raw_pct',
             'rsl_change_1w', 'mom_12m', 'mom_6m', 'mom_3m', 'mom_score', 'mom_vol',
-            'mom_score_adj', 'mom_accel', 'atr_sell_limit', 'peer_spread', 'distance_52w_high_pct'
+            'mom_score_adj', 'mom_accel', 'atr_limit', 'atr_sell_limit', 'peer_spread', 'distance_52w_high_pct'
         ]:
             if d.get(k) is not None:
                 try:
@@ -213,8 +216,15 @@ def _build_main_export_dataframe(
             except (ValueError, TypeError):
                 pass
 
+        atr_limit_value = d['atr_limit']
+        if (pd.isna(atr_limit_value) or atr_limit_value == 0.0) and s.atr and s.kurs:
+            try:
+                atr_limit_value = float(s.kurs) - (1.0 * float(s.atr))
+            except Exception:
+                atr_limit_value = np.nan
+
         atr_sell_limit_value = d['atr_sell_limit']
-        if pd.isna(atr_sell_limit_value) and s.atr and s.kurs:
+        if (pd.isna(atr_sell_limit_value) or atr_sell_limit_value == 0.0) and s.atr and s.kurs:
             try:
                 atr_sell_limit_value = float(s.kurs) + (settings_catalog_core.USER_SETTINGS_DEFAULTS['atr_multiplier_exit'] * float(s.atr))
             except Exception:
@@ -250,7 +260,7 @@ def _build_main_export_dataframe(
             'Mom Score': d['mom_score'], 'Mom Vol 3M': d['mom_vol'],
             'Mom Score adj': d['mom_score_adj'], 'Mom Accel': d['mom_accel'],
             'Kurs': d['kurs'],
-            'ATR Buy': s.atr_limit if s.atr_limit else np.nan,
+            'ATR Buy': atr_limit_value,
             'ATR Sell': atr_sell_limit_value,
             'Listing Umsatz 20T (Mio EUR)': avg_vol_display,
             'Primary Liquidity 20T (Mio EUR)': primary_liquidity_display,
@@ -260,6 +270,7 @@ def _build_main_export_dataframe(
             'Trend-Exzess': twss_display, 'Exzess-Datum': s.twss_date,
             'Tage seit Exzess': s.twss_days_ago, 'Exzess-Max %': d['twss_raw_pct'],
             'Trust': s.trust_score, 'Trust-Details': trust_details,
+            'Scale-Status': s.flag_scale,
             'Neu?': "JA" if s.is_new else "NEIN",
             'Erfasst seit': s.first_seen_date
         }

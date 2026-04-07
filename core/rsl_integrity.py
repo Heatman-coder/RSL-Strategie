@@ -6,7 +6,7 @@ anstatt den Wert zu löschen. Die Integritätsprüfung dient der Markierung und 
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import pandas as pd
 
@@ -101,29 +101,39 @@ def get_history_status(item: Any, location_suffix_map: Dict[str, str]) -> str:
 def get_rsl_integrity_drop_reasons(
     item: Any,
     location_suffix_map: Dict[str, str],
+    config: Dict[str, Any],
     raw_rsl: Any = None,
 ) -> List[str]:
     reasons: List[str] = []
-    history_status = get_history_status(item, location_suffix_map)
-    raw_rsl_value = _optional_float(raw_rsl)
-    if raw_rsl_value is None:
-        raw_rsl_value = _optional_float(_context_value(item, "rsl", None))
-
-    mom_6m = _optional_float(_context_value(item, "mom_6m", None))
-    mom_3m = _optional_float(_context_value(item, "mom_3m", None))
-    rsl_change_1w = _optional_float(_context_value(item, "rsl_change_1w", None))
-    trend_smoothness = _optional_float(_context_value(item, "trend_smoothness", None))
-    flag_scale = str(_context_value(item, "flag_scale", "") or "").strip().upper()
+    
+    # 0. Harte Flags aus dem DataManager (Sicherheitsnetz)
     flag_stale = str(_context_value(item, "flag_stale", "") or "").strip().upper()
-
-    if history_status == "SECONDARY_HISTORY_ACTIVE":
-        reasons.append("secondary_history_not_allowed")
-
-    if flag_scale == "CRITICAL":
-        reasons.append("critical_price_scale_error")
+    flag_hist = str(_context_value(item, "flag_history_length", "") or "").strip().upper()
+    stale_msg = str(_context_value(item, "stale_reason", "") or "").lower()
+    hist_msg = str(_context_value(item, "history_length_reason", "") or "").lower()
 
     if flag_stale == "CRITICAL":
         reasons.append("critical_stale_data")
+    if flag_hist == "CRITICAL":
+        reasons.append("critical_history_length")
+
+    if "historie zu kurz" in hist_msg:
+        reasons.append("history_too_short")
+
+    if "eingefrorener kurs" in stale_msg or "kaum preisbewegung" in stale_msg:
+        reasons.append("stale_frozen_data")
+
+    if "flash-spike" in stale_msg:
+        reasons.append("flash_spike_glitch")
+
+    if "dividenden-korrektur" in stale_msg:
+        reasons.append("bad_dividend_adjustment")
+
+    # 7. RSL Validitaet
+    raw_rsl_value = _optional_float(raw_rsl) or _optional_float(_context_value(item, "rsl", None))
+    rsl_val = _safe_float(raw_rsl_value, 0.0)
+    if rsl_val <= 0:
+        reasons.append("no_valid_rsl_data")
 
     return list(dict.fromkeys(reasons))
 
@@ -131,15 +141,15 @@ def get_rsl_integrity_drop_reasons(
 def filter_stock_results_for_rsl_integrity(
     stock_results: List[Any],
     location_suffix_map: Dict[str, str],
+    config: Dict[str, Any],
 ) -> Tuple[List[Any], pd.DataFrame]:
     valid_results: List[Any] = []
     dropped_rows: List[Dict[str, Any]] = []
 
     for stock in stock_results or []:
-        reasons = get_rsl_integrity_drop_reasons(stock, location_suffix_map)
-        rsl = _safe_float(_context_value(stock, "rsl", 0.0))
+        reasons = get_rsl_integrity_drop_reasons(stock, location_suffix_map, config, raw_rsl=_context_value(stock, "rsl", None))
         
-        if rsl > 0 and not reasons:
+        if not reasons:
             valid_results.append(stock)
         else:
             # Diese Aktien landen NICHT in valid_results, werden aber im dropped_df erfasst
@@ -161,6 +171,9 @@ def filter_stock_results_for_rsl_integrity(
                     "trend_quality": _context_value(stock, "trend_quality", None),
                     "flag_scale": _context_value(stock, "flag_scale", None),
                     "flag_stale": _context_value(stock, "flag_stale", None),
+                    "stale_reason": _context_value(stock, "stale_reason", None),
+                    "flag_history_length": _context_value(stock, "flag_history_length", None),
+                    "history_length_reason": _context_value(stock, "history_length_reason", None),
                     "flag_gap": _context_value(stock, "flag_gap", None),
                 }
             )
@@ -182,6 +195,9 @@ def filter_stock_results_for_rsl_integrity(
         "trend_quality",
         "flag_scale",
         "flag_stale",
+        "stale_reason",
+        "flag_history_length",
+        "history_length_reason",
         "flag_gap",
     ]
     dropped_df = pd.DataFrame(dropped_rows, columns=columns)
