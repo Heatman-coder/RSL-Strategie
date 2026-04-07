@@ -939,11 +939,9 @@ def _stock_history_priority_score(s: StockData) -> int:
 
 def get_rsl_integrity_drop_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
     return rsl_integrity_core.get_rsl_integrity_drop_reasons(item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl)
-    return rsl_integrity_core.get_rsl_integrity_drop_reasons(item, LOCATION_SUFFIX_MAP, raw_rsl=raw_rsl)
 
 def filter_stock_results_for_rsl_integrity(results):
     return rsl_integrity_core.filter_stock_results_for_rsl_integrity(results, LOCATION_SUFFIX_MAP, CONFIG)
-    return rsl_integrity_core.filter_stock_results_for_rsl_integrity(results, LOCATION_SUFFIX_MAP)
 
 def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results):
     try:
@@ -2582,6 +2580,18 @@ def run_analysis_pipeline(
             dropped_critical.append(
                 f"{row.get('yahoo_symbol', '')} ({row.get('original_ticker', '')}): RSL-Integritaet -> {row.get('drop_reasons', '')}"
             )
+        
+        # NEU: Zusammenfassung der Integritäts-Flags ausgeben
+        integrity_summary = quality_core.summarize_integrity_flags(integrity_drops_df)
+        print(f"\nIntegritaets-Check Ergebnis: {quality_core.quality_gate_status(integrity_summary)}")
+        
+        if "is_valid" in integrity_drops_df.columns:
+            print(f" - Hard fails: {integrity_summary['hard_fail_count']}")
+        if "needs_review" in integrity_drops_df.columns:
+            print(f" - Needs review: {integrity_summary['review_count']}")
+        if "warning_reasons" in integrity_drops_df.columns:
+            print(f" - Warnings: {integrity_summary['warning_count']}")
+
         logger.info(f"[WARN] {len(integrity_drops_df)} Ticker weisen unzuverlaessige RSL-Historie auf (werden im Report markiert).")
     apply_primary_liquidity_context(stock_results)
     refresh_market_caps_for_relevant_exchange_stocks(stock_results, data_mgr)
