@@ -6,10 +6,42 @@ anstatt den Wert zu löschen. Die Integritätsprüfung dient der Markierung und 
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 import pandas as pd
 
+
+@dataclass
+class IntegrityAssessment:
+    is_valid: bool = True
+    needs_review: bool = False
+    hard_fail_reasons: List[str] = field(default_factory=list)
+    warning_reasons: List[str] = field(default_factory=list)
+    review_reasons: List[str] = field(default_factory=list)
+
+    def add_hard_fail(self, reason: str) -> None:
+        if reason not in self.hard_fail_reasons:
+            self.hard_fail_reasons.append(reason)
+        self.is_valid = False
+
+    def add_warning(self, reason: str) -> None:
+        if reason not in self.warning_reasons:
+            self.warning_reasons.append(reason)
+
+    def add_review(self, reason: str) -> None:
+        if reason not in self.review_reasons:
+            self.review_reasons.append(reason)
+        self.needs_review = True
+
+    def to_dict(self) -> dict:
+        return {
+            "is_valid": self.is_valid,
+            "needs_review": self.needs_review,
+            "hard_fail_reasons": self.hard_fail_reasons,
+            "warning_reasons": self.warning_reasons,
+            "review_reasons": self.review_reasons,
+        }
 
 SECONDARY_LISTING_SUFFIXES = {
     ".BE",
@@ -142,6 +174,33 @@ def get_rsl_integrity_drop_reasons(
     return list(dict.fromkeys(reasons))
 
 
+def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dict[str, Any]) -> IntegrityAssessment:
+    """Nutzt die bestehende Logik, um ein IntegrityAssessment Objekt zu befüllen."""
+    assessment = IntegrityAssessment()
+    reasons = get_rsl_integrity_drop_reasons(item, location_suffix_map, config)
+    
+    # Definition Hard Fail (identisch zu deiner bestehenden Logik)
+    hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
+    # Definition Review (Verdacht auf Skalierungsfehler oder niedriges Vertrauen)
+    review_criteria = {"suspicious_price_scale", "low_trust_score"}
+
+    for r in reasons:
+        if r in hard_fail_criteria:
+            assessment.add_hard_fail(r)
+        elif r in review_criteria:
+            assessment.add_review(r)
+        else:
+            # Alles andere (z.B. stale data, price scale critical) sind Warnings
+            # Hinweis: critical_price_scale ist bei dir kein Hard Fail für den Ausschluss,
+            # daher landet es hier in den Warnings.
+            assessment.add_warning(r)
+            
+    # Falls wir Hard Fails haben, setzen wir is_valid auf False (passiert automatisch in add_hard_fail)
+    if any(r in hard_fail_criteria for r in reasons):
+        assessment.is_valid = False
+        
+    return assessment
+
 def filter_stock_results_for_rsl_integrity(
     stock_results: List[Any],
     location_suffix_map: Dict[str, str],
@@ -151,19 +210,20 @@ def filter_stock_results_for_rsl_integrity(
     dropped_rows: List[Dict[str, Any]] = []
 
     for stock in stock_results or []:
-        reasons = get_rsl_integrity_drop_reasons(stock, location_suffix_map, config, raw_rsl=_context_value(stock, "rsl", None))
+        assessment = assess_integrity(stock, location_suffix_map, config)
+        reasons = get_rsl_integrity_drop_reasons(stock, location_suffix_map, config)
         
-        # DEFINITION: Was ist ein "Hard Fail"?
-        # Nur wenn RSL <= 0 oder die Historie kritisch fehlt, schließen wir aus.
-        # Alles andere bleibt drin, bekommt aber das "Reasons" Paket mit.
-        hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
-        has_hard_fail = any(r in hard_fail_criteria for r in reasons)
+        has_hard_fail = not assessment.is_valid
 
         if not has_hard_fail:
             valid_results.append(stock)
             # Falls es Warnungen gab, hängen wir sie als Metadaten an das Objekt
+            # HINWEIS: Wir fangen AttributeError ab, falls StockData __slots__ nutzt
             if reasons:
-                setattr(stock, "integrity_warnings", reasons)
+                try:
+                    setattr(stock, "integrity_warnings", reasons)
+                except AttributeError:
+                    pass
         
         if reasons:
             # Diese Aktien landen NICHT in valid_results, werden aber im dropped_df erfasst
@@ -175,6 +235,11 @@ def filter_stock_results_for_rsl_integrity(
                     "land": _context_value(stock, "land", ""),
                     "history_status": get_history_status(stock, location_suffix_map),
                     "drop_reasons": ", ".join(reasons),
+                    "is_valid": assessment.is_valid,
+                    "needs_review": assessment.needs_review,
+                    "hard_fail_reasons": "; ".join(assessment.hard_fail_reasons),
+                    "warning_reasons": "; ".join(assessment.warning_reasons),
+                    "review_reasons": "; ".join(assessment.review_reasons),
                     "rsl": _context_value(stock, "rsl", None),
                     "mom_12m": _context_value(stock, "mom_12m", None),
                     "mom_6m": _context_value(stock, "mom_6m", None),
@@ -199,6 +264,11 @@ def filter_stock_results_for_rsl_integrity(
         "land",
         "history_status",
         "drop_reasons",
+        "is_valid",
+        "needs_review",
+        "hard_fail_reasons",
+        "warning_reasons",
+        "review_reasons",
         "rsl",
         "mom_12m",
         "mom_6m",

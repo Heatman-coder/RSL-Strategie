@@ -266,3 +266,29 @@ def run_quality_gate(
         logger.info("[STRICT] Alle Qualitaetschecks bestanden.")
     return report
 
+
+def summarize_integrity_flags(df: pd.DataFrame) -> dict:
+    """Erstellt eine Statistik über die neuen Integritäts-Flags im DataFrame."""
+    return {
+        "total_rows": int(len(df)),
+        "hard_fail_count": int((df["is_valid"] == False).sum()) if "is_valid" in df.columns else 0,
+        "review_count": int((df["needs_review"] == True).sum()) if "needs_review" in df.columns else 0,
+        "warning_count": int(
+            df["warning_reasons"].fillna("").astype(str).str.len().gt(0).sum()
+        ) if "warning_reasons" in df.columns else 0,
+    }
+
+
+def quality_gate_status(summary: dict) -> str:
+    """Bewertet den Status basierend auf der Integritäts-Zusammenfassung."""
+    if summary["total_rows"] == 0:
+        return "FAIL"
+
+    hard_fail_ratio = summary["hard_fail_count"] / summary["total_rows"]
+
+    if hard_fail_ratio > 0.25:
+        return "FAIL"
+    if hard_fail_ratio > 0.10 or summary["review_count"] > 0:
+        return "REVIEW"
+
+    return "PASS"
