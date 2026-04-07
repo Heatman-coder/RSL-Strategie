@@ -937,18 +937,33 @@ def _history_priority_score(item: Any) -> int:
 def _stock_history_priority_score(s: StockData) -> int:
     return final_support_core.stock_history_priority_score(s, LOCATION_SUFFIX_MAP)
 
+def get_rsl_integrity_drop_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
+    return rsl_integrity_core.get_rsl_integrity_drop_reasons(
+        item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl
+    )
+
 def get_rsl_integrity_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
-    return rsl_integrity_core.get_rsl_integrity_reasons(item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl)
+    return rsl_integrity_core.get_rsl_integrity_reasons(
+        item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl
+    )
 
 def filter_stock_results_for_rsl_integrity(results):
-    return rsl_integrity_core.filter_stock_results_for_rsl_integrity(results, LOCATION_SUFFIX_MAP, CONFIG)
+    return rsl_integrity_core.filter_stock_results_for_rsl_integrity(
+        results, LOCATION_SUFFIX_MAP, CONFIG
+    )
 
 def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results):
-    try:
-        return final_support_core.synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results)
-    except Exception as exc:
-        logger.warning(f"Portfolio-Symbol-Sync fehlgeschlagen: {exc}")
-        return 0
+    return final_support_core.synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results)
+
+def build_home_market_rsl_audit(results):
+    return rsl_integrity_core.build_home_market_rsl_audit(results, LOCATION_SUFFIX_MAP)
+
+def build_home_market_rsl_review_shortlist(
+    audit_df: pd.DataFrame, top_rank: int = 300
+) -> pd.DataFrame:
+    return rsl_integrity_core.build_home_market_rsl_review_shortlist(
+        audit_df, top_rank=top_rank
+    )
 
 
 def build_home_market_rsl_audit(results):
