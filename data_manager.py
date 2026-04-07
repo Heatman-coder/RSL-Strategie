@@ -21,6 +21,7 @@ import yfinance as yf
 from typing import Dict, Any, Optional, List, Tuple, Union, cast
 from threading import Lock
 from dataclasses import dataclass, asdict, field
+from core import rsl_integrity as rsl_integrity_core
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,10 @@ class StockData:
     integrity_warnings: List[str] = field(default_factory=list)
     excluded_from_ranking: bool = False
     ranking_exclude_reason: str = ""
+    rsl_eligible: bool = True
+    ranking_integrity_status: str = "eligible_original"
+    used_close_fallback: bool = False
+    rsl_price_source: str = "adj_close"
 
     def to_dict(self):
         return asdict(self)
@@ -446,7 +451,8 @@ class MarketDataManager:
 
         self.last_history_batch_used_network = True
         try:
-            data = yf.download(to_fetch, period=self.config.get('history_period', '18mo'), group_by='ticker', auto_adjust=True, threads=True, progress=False)
+            # WICHTIG: auto_adjust=False, damit wir Close vs Adj Close vergleichen koennen
+            data = yf.download(to_fetch, period=self.config.get('history_period', '18mo'), group_by='ticker', auto_adjust=False, threads=True, progress=False)
             for t in to_fetch:
                 hist = data[t] if len(to_fetch) > 1 else data
                 if hist.empty or len(hist) < 10:
@@ -457,20 +463,36 @@ class MarketDataManager:
                 hist_adj = hist.copy()
                 for col in ['Open', 'High', 'Low', 'Close']:
                     if col in hist_adj.columns: hist_adj[col] *= f
+                if 'Adj Close' in hist_adj.columns: hist_adj['Adj Close'] *= f
                 
-                # Simpler Weg: Lücken füllen (wichtig für Frankfurt/Xetra)
-                close_series = hist_adj['Close'].ffill()
-                curr = float(close_series.iloc[-1])
                 sma_len = int(self.config.get('sma_length', 130))
-                is_young_history = False
-                if len(close_series.dropna()) < sma_len:
-                    is_young_history = True
-                    self.young_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
+
+                # --- INTEGRITAETS-PRUEFUNG (Core Logik) ---
+                core_cfg = {**self.config, "rsl_sma_window": sma_len, "min_history_rows_for_rsl": sma_len}
+                analysis = rsl_integrity_core.analyze_history_for_rsl_integrity(hist_adj, ticker=t, cfg=core_cfg)
                 
-                sma_series = close_series.rolling(sma_len).mean()
-                sma = float(sma_series.iloc[-1]) if not sma_series.empty and not pd.isna(sma_series.iloc[-1]) else curr
+                repaired_df = analysis['history']
+                clean_col = analysis['rsl_price_column']
+                clean_series = repaired_df[clean_col].ffill()
+                
+                curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
+                sma = analysis.get('rsl_sma', curr)
+                
+                # Reparierte Serie als Basis fuer Flags setzen
+                used_fallback = bool(analysis.get('used_close_fallback', False))
+                
+                # Reparierte Serie als Basis fuer Flags setzen
+                hist_adj['Adj Close'] = clean_series
+                is_young_history = len(clean_series.dropna()) < sma_len
+                if is_young_history:
+                    self.young_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
+
                 vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
                 flags = self._calculate_flags(hist_adj, curr, sma, is_young_history)
+                # Integritaets-Gründe in Flags einmischen
+                flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
+                flags['used_close_fallback'] = used_fallback
+                flags['rsl_price_source'] = "close_fallback" if used_fallback else "adj_close"
                     
                 results[t] = (curr, sma, vol_eur, flags)
                 with self.lock:
@@ -488,23 +510,33 @@ class MarketDataManager:
             return (c['curr'], c['sma'], c.get('vol_eur', 0.0), c['flags'])
         
         try:
-            hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=True)
+            # auto_adjust=False fuer manuelle Pruefung
+            hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=False)
             if hist.empty: return None
             f = self._get_currency_factor(ticker)
             hist_adj = hist.copy()
             for col in ['Open', 'High', 'Low', 'Close']:
                 if col in hist_adj.columns: hist_adj[col] *= f
             
-            close_series = hist_adj['Close'].ffill()
-            curr = float(close_series.iloc[-1])
             sma_len = int(self.config.get('sma_length', 130))
-            is_young_history = False
-            if len(close_series.dropna()) < sma_len: # This is the 130/130 rule
-                is_young_history = True
+
+            core_cfg = {**self.config, "rsl_sma_window": sma_len, "min_history_rows_for_rsl": sma_len}
+            analysis = rsl_integrity_core.analyze_history_for_rsl_integrity(hist_adj, ticker=ticker, cfg=core_cfg)
+            
+            repaired_df = analysis['history']
+            clean_col = analysis['rsl_price_column']
+            clean_series = repaired_df[clean_col].ffill()
+            
+            curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
+            sma = analysis.get('rsl_sma', curr)
+            hist_adj['Adj Close'] = clean_series
+            is_young_history = len(clean_series.dropna()) < sma_len
+            if is_young_history:
                 self.young_tickers[ticker] = {'ticker': ticker, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
-            sma = float(close_series.rolling(sma_len).mean().iloc[-1])
+
             vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
             flags = self._calculate_flags(hist_adj, curr, sma, is_young_history)
+            flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
