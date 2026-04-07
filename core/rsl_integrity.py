@@ -1120,13 +1120,27 @@ def get_history_status(item: Any, location_suffix_map: Dict[str, str]) -> str:
 def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dict[str, Any]) -> IntegrityAssessment:
     assessment = IntegrityAssessment()
     reasons = get_rsl_integrity_reasons(item, location_suffix_map, config)
+    history_status = get_history_status(item, location_suffix_map)
     
-    hard_fail_criteria = {"no_valid_rsl_data", "critical_history_length"}
+    # Ursachenbasierte harte Ausschlusskriterien für das Ranking
+    hard_fail_criteria = {
+        "no_valid_rsl_data", 
+        "critical_history_length", 
+        "critical_price_series_unreliable", 
+        "critical_dividend_adjustment_issue", 
+        "critical_scale_break"
+    }
     review_criteria = {"suspicious_price_scale", "low_trust_score"}
-    warning_criteria = {"critical_stale_data", "critical_price_scale"}
 
     for r in reasons:
-        if r in hard_fail_criteria: assessment.add_hard_fail(r)
+        if r in hard_fail_criteria: 
+            assessment.add_hard_fail(r)
+        elif r == "critical_stale_data":
+            # Stale Data auf Sekundärmärkten führt zum Ranking-Ausschluss
+            if history_status == "SECONDARY_HISTORY_ACTIVE":
+                assessment.add_hard_fail("critical_stale_secondary_history")
+            else:
+                assessment.add_warning(r)
         elif r in review_criteria: assessment.add_review(r)
         else: assessment.add_warning(r)
     return assessment
@@ -1141,23 +1155,32 @@ def filter_stock_results_for_rsl_integrity(
 
     for stock in stock_results or []:
         assessment = assess_integrity(stock, location_suffix_map, config)
+        
+        # Metadaten am Objekt setzen
+        all_reasons = assessment.all_reasons
         if assessment.all_reasons:
             try:
-                setattr(stock, "integrity_warnings", assessment.all_reasons)
+                setattr(stock, "integrity_warnings", all_reasons)
+                setattr(stock, "excluded_from_ranking", not assessment.is_valid)
+                if not assessment.is_valid:
+                    setattr(stock, "ranking_exclude_reason", "; ".join(assessment.hard_fail_reasons))
             except AttributeError: pass
 
         if assessment.is_valid:
             valid_results.append(stock)
         
-        if not assessment.is_valid or assessment.all_reasons:
+        # Im Issue-DF landen alle Auffälligkeiten zur Dokumentation
+        if not assessment.is_valid or all_reasons:
             issue_rows.append({
                 "original_ticker": _get_row_value(stock, ["original_ticker"], ""),
                 "yahoo_symbol": _get_row_value(stock, ["yahoo_symbol"], ""),
                 "name": _get_row_value(stock, ["name"], ""),
                 "land": _get_row_value(stock, ["land"], ""),
                 "history_status": get_history_status(stock, location_suffix_map),
-                "integrity_reasons": ", ".join(assessment.all_reasons),
+                "integrity_reasons": ", ".join(all_reasons),
                 "is_valid": assessment.is_valid,
+                "excluded_from_ranking": not assessment.is_valid,
+                "ranking_exclude_reason": "; ".join(assessment.hard_fail_reasons),
                 "needs_review": assessment.needs_review,
                 "hard_fail_reasons": "; ".join(assessment.hard_fail_reasons),
                 "warning_reasons": "; ".join(assessment.warning_reasons),
