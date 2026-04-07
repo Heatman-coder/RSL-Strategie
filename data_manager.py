@@ -25,7 +25,7 @@ from dataclasses import dataclass, asdict
 logger = logging.getLogger(__name__)
 
 # --- DATENSTRUKTUR ---
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class StockData:
     original_ticker: str
     yahoo_symbol: str
@@ -98,6 +98,7 @@ class StockData:
    
     first_seen_date: str = ""
     is_new: bool = False
+    integrity_warnings: List[str] = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
