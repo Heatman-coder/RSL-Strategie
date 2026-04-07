@@ -52,10 +52,13 @@ class StockData:
     flag_liquidity: str = "OK"
     flag_stale: str = "OK"
     flag_scale: str = "OK"
+    flag_history_length: str = "OK"
+    history_length_reason: str = ""
     scale_reason: str = ""
+    stale_reason: str = ""
     price_scale_ratio: float = 1.0
     stale_days: int = 0
-   
+
     # MARKET TREND INDICATORS
     trend_sma50: str = "OK"
     trend_smoothness: float = 0.0
@@ -160,8 +163,14 @@ class MarketDataManager:
             "sma_short_length": 50,
             "stale_window": 60,
             "max_flat_days": 15,
-            "price_scale_warn_ratio": 6.0,
-            "price_scale_critical_ratio": 10.0,
+            "max_consecutive_flat": 20,
+            "max_std_rel": 0.005,
+            "min_total_range": 0.02,
+            "max_total_return": 20.0,
+            "price_scale_warn_ratio": 8.0,
+            "price_scale_critical_ratio": 15.0,
+            "price_scale_warn_jump": 0.8,
+            "price_scale_critical_jump": 1.5,
             "mom_lookback_12m": 252,
             "mom_lookback_6m": 126,
             "mom_lookback_3m": 63,
@@ -240,7 +249,7 @@ class MarketDataManager:
             if ticker.endswith(suffix): return rate
         return self.currency_rates.get("DEFAULT", 1.0)
 
-    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float) -> Dict[str, Any]:
+    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float, is_young_history: bool) -> Dict[str, Any]:
         flags: Dict[str, Any] = {
             'flag_gap': "OK", 'flag_liquidity': "OK", 'flag_stale': "OK", 'flag_scale': "OK",
             'scale_reason': "", 'price_scale_ratio': 1.0, 'stale_days': 0, 'trend_sma50': "OK",
@@ -249,10 +258,15 @@ class MarketDataManager:
             'rsl_change_1w': 0.0, 'rsl_past': None, 'atr': 0.0, 'atr_limit': 0.0, 'atr_sell_limit': 0.0,
             'high_52w': 0.0, 'distance_52w_high_pct': None, 'mom_12m': None, 'mom_6m': None,
             'mom_3m': None, 'max_drawdown_6m': 0.0, 'mom_score': None, 'mom_vol': None,
-            'mom_score_adj': None, 'mom_accel': None
+            'flag_history_length': "OK",
+            'history_length_reason': "",
+            'mom_score_adj': None, 'mom_accel': None,
+            'stale_days_max': 0
         }
-        if 'Close' not in hist_data.columns or hist_data.empty: return flags
-        hist_close = hist_data['Close'].dropna()
+        # Identifiziere die Berechnungsspalte (Adj Close hat Vorrang)
+        calc_col = 'Adj Close' if 'Adj Close' in hist_data.columns else 'Close'
+        if calc_col not in hist_data.columns or hist_data.empty: return flags
+        hist_close = hist_data[calc_col].dropna()
         if len(hist_close) < 20: return flags
 
         try:
@@ -267,12 +281,15 @@ class MarketDataManager:
             max_close = float(cast(Any, hist_close.max()))
             if min_close > 0:
                 flags['price_scale_ratio'] = max_close / min_close
-                warn_ratio = float(self.config.get('price_scale_warn_ratio', 6.0))
-                critical_ratio = float(self.config.get('price_scale_critical_ratio', 10.0))
-                if flags['price_scale_ratio'] >= critical_ratio or max_jump >= 1.0:
+                warn_ratio = float(self.config.get('price_scale_warn_ratio', 8.0))
+                critical_ratio = float(self.config.get('price_scale_critical_ratio', 15.0))
+                warn_jump = float(self.config.get('price_scale_warn_jump', 0.8))
+                critical_jump = float(self.config.get('price_scale_critical_jump', 1.5))
+
+                if flags['price_scale_ratio'] >= critical_ratio or max_jump >= critical_jump:
                     flags['flag_scale'] = "CRITICAL"
                     flags['scale_reason'] = f"Preis-Skala kritisch (Ratio {flags['price_scale_ratio']:.1f})"
-                elif flags['price_scale_ratio'] >= warn_ratio or max_jump >= 0.5:
+                elif flags['price_scale_ratio'] >= warn_ratio or max_jump >= warn_jump:
                     flags['flag_scale'] = "WARN"
                     flags['scale_reason'] = f"Preis-Skala auffaellig (Ratio {flags['price_scale_ratio']:.1f})"
         except Exception:
@@ -290,11 +307,16 @@ class MarketDataManager:
         is_zero = (recent.diff().abs() <= 1e-6).astype(int)
         max_flat_run = (is_zero * (is_zero.groupby((is_zero != is_zero.shift()).cumsum()).cumcount() + 1)).max()
         flags['stale_days'] = int(max_flat_run) if not pd.isna(max_flat_run) else 0
-        
+        flags['stale_days_max'] = flags['stale_days']
+
         # Inaktivität ist in Frankfurt normal. Markieren, aber nicht blockieren.
         if flags['stale_days'] >= int(self.config.get('max_flat_days', 15)):
             flags['flag_stale'] = "WARN"
             flags['stale_reason'] = f"Geringe Liquiditaet ({flags['stale_days']} Tage flach)"
+
+        if (hist_close <= 0).any():
+            flags['flag_stale'] = "CRITICAL"
+            flags['stale_reason'] = "Ungültige Daten: Null- oder Negativpreise"
 
         # 3. R2 Trend Smoothness
         window_r2 = 130
@@ -321,9 +343,16 @@ class MarketDataManager:
             rets = hist_close.pct_change().dropna() * 100
             decay = np.exp(-np.arange(len(rets)-1, -1, -1) / float(self.config.get('twss_decay_days', 60.0)))
             twss_series = rets * decay
-            flags['twss_score'] = float(cast(Any, twss_series.abs().max()))
-            if flags['twss_score'] > 60: flags['twss_orientation'] = "HOCH"
-            elif flags['twss_score'] > 25: flags['twss_orientation'] = "MITTEL"
+
+            abs_twss = twss_series.abs()
+            if not abs_twss.empty:
+                max_idx = abs_twss.idxmax()
+                flags['twss_score'] = float(abs_twss[max_idx])
+                flags['twss_date'] = str(max_idx.date())
+                flags['twss_days_ago'] = (datetime.date.today() - max_idx.date()).days
+                flags['twss_raw_pct'] = float(rets[max_idx])
+                if flags['twss_score'] > 60: flags['twss_orientation'] = "HOCH"
+                elif flags['twss_score'] > 25: flags['twss_orientation'] = "MITTEL"
 
         # 5. Momentum
         flags['mom_12m'] = _calc_momentum(hist_close, curr_price, int(self.config.get('mom_lookback_12m', 252)))
@@ -374,12 +403,18 @@ class MarketDataManager:
                 flags['atr_sell_limit'] = curr_price + (float(self.config.get('atr_multiplier_exit', 0.15)) * atr)
             except: pass
 
+        # 8. History Length Check (130/130 rule)
+        if is_young_history:
+            flags['flag_history_length'] = "CRITICAL"
+            flags['history_length_reason'] = f"Historie zu kurz (<{self.config.get('sma_length', 130)} Tage)"
+
         # 7. Trust Score
         t_score = 3
         if flags['flag_stale'] != "OK": t_score -= 1
         if flags['flag_gap'] != "OK": t_score -= 1
         if flags['flag_liquidity'] != "OK": t_score -= 1
-        if flags['flag_scale'] == "CRITICAL":
+        
+        if flags['flag_scale'] == "CRITICAL" or flags['flag_history_length'] == "CRITICAL":
             flags['trust_score'] = 0
         else:
             if flags['flag_scale'] != "OK":
@@ -393,6 +428,7 @@ class MarketDataManager:
         results = {}
         to_fetch = []
         
+        sma_len = int(self.config.get('sma_length', 130))
         for t in tickers:
             key = f"{t}_{version}"
             if key in self.cache:
@@ -423,18 +459,19 @@ class MarketDataManager:
                 close_series = hist_adj['Close'].ffill()
                 curr = float(close_series.iloc[-1])
                 sma_len = int(self.config.get('sma_length', 130))
+                is_young_history = False
                 if len(close_series.dropna()) < sma_len:
+                    is_young_history = True
                     self.young_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
-                    continue
-                if True:
-                    sma_series = close_series.rolling(sma_len).mean()
-                    sma = float(sma_series.iloc[-1])
-                    vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-                    flags = self._calculate_flags(hist_adj, curr, sma)
+                
+                sma_series = close_series.rolling(sma_len).mean()
+                sma = float(sma_series.iloc[-1]) if not sma_series.empty and not pd.isna(sma_series.iloc[-1]) else curr
+                vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
+                flags = self._calculate_flags(hist_adj, curr, sma, is_young_history)
                     
-                    results[t] = (curr, sma, vol_eur, flags)
-                    with self.lock:
-                        self.cache[f"{t}_{version}"] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
+                results[t] = (curr, sma, vol_eur, flags)
+                with self.lock:
+                    self.cache[f"{t}_{version}"] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
         except Exception as e:
             logger.error(f"Fehler im Batch-Download: {e}")
             
@@ -458,12 +495,13 @@ class MarketDataManager:
             close_series = hist_adj['Close'].ffill()
             curr = float(close_series.iloc[-1])
             sma_len = int(self.config.get('sma_length', 130))
-            if len(close_series.dropna()) < sma_len:
+            is_young_history = False
+            if len(close_series.dropna()) < sma_len: # This is the 130/130 rule
+                is_young_history = True
                 self.young_tickers[ticker] = {'ticker': ticker, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
-                return None
             sma = float(close_series.rolling(sma_len).mean().iloc[-1])
             vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-            flags = self._calculate_flags(hist_adj, curr, sma)
+            flags = self._calculate_flags(hist_adj, curr, sma, is_young_history)
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}

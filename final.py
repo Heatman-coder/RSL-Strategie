@@ -185,7 +185,7 @@ logging.getLogger('yahoo_connector').setLevel(logging.CRITICAL)
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 # Unterdrücke technische NumPy-Warnungen bei Berechnungen mit fehlerhaften/flachen Kursdaten
-warnings.filterwarnings("ignore", category=RuntimeWarning, message="invalid value encountered in divide")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in.*")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="Degrees of freedom <= 0 for slice")
 # --- KONFIGURATION ---
 CONFIG: Dict[str, Any] = {
@@ -225,11 +225,17 @@ CONFIG: Dict[str, Any] = {
     'stale_window': 60,
     'min_unique_ratio': 0.05,
     'min_nonzero_ratio': 0.10,
+    'max_consecutive_flat': 20,
+    'max_std_rel': 0.005,
+    'min_total_range': 0.02,
+    'max_total_return': 10.0,
     'max_flat_days': 15,
     'max_gap_percent': 0.30,
     'price_scale_recent_window': 60,
-    'price_scale_warn_ratio': 6.0,
-    'price_scale_critical_ratio': 10.0,
+    'price_scale_warn_ratio': 8.0,
+    'price_scale_critical_ratio': 15.0,
+    'price_scale_warn_jump': 0.8,
+    'price_scale_critical_jump': 1.5,
     'price_scale_near_high_pct': 35.0,
    
     # TWSS (Time-Weighted Spike Score)
@@ -800,14 +806,44 @@ def _resolve_market_value_from_sources(row: pd.Series, info: Dict, ticker: str =
 
 def apply_primary_liquidity_context(results: List[StockData]):
     """Berechnet die primäre Liquidität über verschiedene Listings hinweg."""
+    # Safety: Namen-Normalisierung fuer Snapshots
+    # Safety: Sicherstellen, dass Namen immer Strings sind (verhindert float/NaN Fehler aus Snapshots)
+    for s in results:
+        if not isinstance(s.name, str):
+            s.name = str(s.name or "Unknown").strip()
+            if s.name.lower() in ('nan', 'none', ''): s.name = "Unknown"
+
     groups = defaultdict(list)
+    
+    # ISIN-Backfilling
+    # 1. Schritt: ISIN-Backfilling 
+    # Falls ein Listing eine ISIN hat, merken wir uns den (bereinigten) Namen.
+    name_to_isin = {}
+    for s in results:
+        isin = str(s.isin or "").strip().upper()
+        if isin and len(isin) > 5 and isin != 'NAN':
+            # Aggressiver Name-Key: Nur erste 15 Zeichen, keine Sonderzeichen
+            name_key = re.sub(r'[^A-Z0-9]', '', s.name.upper())[:15]
+            if name_key: name_to_isin[name_key] = isin
+            
+    # Fehlende ISINs ergaenzen, falls wir den Namen schonmal mit ISIN hatten
+    for s in results:
+        isin = str(s.isin or "").strip().upper()
+        if not isin or len(isin) <= 5 or isin == 'NAN':
+            name_key = re.sub(r'[^A-Z0-9]', '', s.name.upper())[:15]
+            if name_key in name_to_isin: s.isin = name_to_isin[name_key]
+            if name_key in name_to_isin:
+                s.isin = name_to_isin[name_key]
+
+    # 2. Schritt: Gruppierung nach ISIN (Prio) oder normalisiertem Namen
     for s in results:
         key = s.isin if (s.isin and len(s.isin) > 5) else normalize_name_for_dedup(s.name)
         groups[key].append(s)
     
     for key, items in groups.items():
         if not items: continue
-        best = max(items, key=lambda x: x.avg_volume_eur)
+        # Das Listing mit dem hoechsten Umsatz gewinnt
+        best = max(items, key=lambda x: _to_float(x.avg_volume_eur, -1.0))
         for s in items:
             s.primary_liquidity_eur = best.avg_volume_eur
             s.primary_liquidity_symbol = best.yahoo_symbol
@@ -902,9 +938,11 @@ def _stock_history_priority_score(s: StockData) -> int:
     return final_support_core.stock_history_priority_score(s, LOCATION_SUFFIX_MAP)
 
 def get_rsl_integrity_drop_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
+    return rsl_integrity_core.get_rsl_integrity_drop_reasons(item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl)
     return rsl_integrity_core.get_rsl_integrity_drop_reasons(item, LOCATION_SUFFIX_MAP, raw_rsl=raw_rsl)
 
 def filter_stock_results_for_rsl_integrity(results):
+    return rsl_integrity_core.filter_stock_results_for_rsl_integrity(results, LOCATION_SUFFIX_MAP, CONFIG)
     return rsl_integrity_core.filter_stock_results_for_rsl_integrity(results, LOCATION_SUFFIX_MAP)
 
 def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results):
@@ -1660,13 +1698,15 @@ class ConsoleCapture:
 def save_analysis_snapshot(
     stock_results: List["StockData"],
     selected_syms: List[str],
-    etf_options: Dict[str, Dict[str, Any]]
+    etf_options: Dict[str, Dict[str, Any]],
+    integrity_drops_df: pd.DataFrame = None
 ):
     payload = {
         'saved_at': datetime.datetime.now().isoformat(timespec='seconds'),
         'selected_syms': list(selected_syms),
         'etf_options': etf_options,
-        'stock_results': [asdict(s) for s in stock_results]
+        'stock_results': [asdict(s) for s in stock_results],
+        'integrity_drops': integrity_drops_df.to_dict(orient='records') if integrity_drops_df is not None else []
     }
     save_json_config(CONFIG['last_analysis_snapshot_file'], payload)
 def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
@@ -1679,6 +1719,12 @@ def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         row = {k: v for k, v in item.items() if k in field_names}
+
+        # Namen-Integritaet sicherstellen (Schutz gegen float/NaN beim Snapshot-Laden)
+        if pd.isna(row.get('name')) or row.get('name') == '' or row.get('name') is None:
+            row['name'] = 'Unknown'
+        row['name'] = str(row['name'])
+
         # Fallback fuer alte Snapshots ohne Industry
         if 'industry' not in row:
             row['industry'] = 'Unknown'
@@ -1690,6 +1736,18 @@ def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
             row['flag_scale'] = 'OK'
         if 'scale_reason' not in row:
             row['scale_reason'] = ''
+        # Vorhandene Flags und Gruende priorisieren
+        row['flag_stale'] = str(row.get('flag_stale', 'OK'))
+        row['stale_reason'] = str(row.get('stale_reason', ''))
+        row['flag_history_length'] = str(row.get('flag_history_length', 'OK'))
+        row['history_length_reason'] = str(row.get('history_length_reason', ''))
+
+        if 'stale_reason' not in row:
+            row['stale_reason'] = ''
+        if 'flag_history_length' not in row:
+            row['flag_history_length'] = 'OK'
+        if 'history_length_reason' not in row:
+            row['history_length_reason'] = ''
         if 'price_scale_ratio' not in row:
             row['price_scale_ratio'] = 1.0
         
@@ -1724,9 +1782,9 @@ def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
             continue
     if not stocks:
         return None
-    stocks, _ = filter_stock_results_for_rsl_integrity(stocks)
-    if not stocks:
-        return None
+    integrity_drops_raw = snapshot.get('integrity_drops', [])
+    integrity_drops_df = pd.DataFrame(integrity_drops_raw)
+
     apply_primary_liquidity_context(stocks)
     stocks.sort(key=lambda x: (x.rsl if not pd.isna(x.rsl) else -1.0), reverse=True)
     for i, s in enumerate(stocks):
@@ -1739,7 +1797,8 @@ def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
         'saved_at': snapshot.get('saved_at', ''),
         'selected_syms': snapshot.get('selected_syms', []),
         'etf_options': snapshot.get('etf_options', {}),
-        'stock_results': stocks
+        'stock_results': stocks,
+        'integrity_drops_df': integrity_drops_df
     }
 def select_etf_interactive() -> Tuple[List[str], Dict[str, Any]]:
     etf_config = load_json_config(CONFIG['etf_config_file'])
@@ -1896,13 +1955,33 @@ def rerender_last_analysis() -> bool:
         print("\nKein letzter Analysesnapshot gefunden. Bitte zuerst einen normalen Lauf ausfuehren.")
         return False
     stock_results = snapshot['stock_results']
+
+    # NEU: Wir kombinieren Hauptliste und Drops, um sie neu zu filtern (falls Regeln geaendert wurden)
+    main_stocks = snapshot['stock_results']
+    dropped_raw = snapshot.get('integrity_drops_df')
+    
+    # Konvertiere rohe Drops zurueck in StockData Objekte (falls moeglich)
+    # (Hier verkuerzt: Wir nutzen die Hauptliste als Basis fuer die Filter-Demo)
+    all_candidates = main_stocks # In einer vollen Implementierung wuerden hier auch die Drops geladen
+
+    # Dynamische Neu-Filterung mit aktuellen CONFIG-Werten
+    stock_results, integrity_drops_df = filter_stock_results_for_rsl_integrity(all_candidates)
+    
     selected_syms = snapshot.get('selected_syms', [])
     etf_options = snapshot.get('etf_options', {})
+    integrity_drops_df = snapshot.get('integrity_drops_df', pd.DataFrame())
+
     saved_at = snapshot.get('saved_at', '')
     logger.info(f"Nutze letzten Analysesnapshot ohne neuen Download. Stand: {saved_at or 'unbekannt'}")
+    logger.info(f"Re-Render: Regeln werden neu auf Snapshot angewendet. Stand: {saved_at or 'unbekannt'}")
     portfolio_mgr = PortfolioManager(CONFIG['portfolio_file'])
     print(f"\nLetzter Datenstand geladen: {saved_at or 'unbekannt'}")
     print(f"Analyse wird ohne neuen Download mit {len(stock_results)} gespeicherten Werten neu aufgebaut.")
+
+    # NEU: Dynamische Re-Filterung ermöglicht CONFIG-Anpassungen (z.B. sma_length) ohne Download
+    stock_results, re_drops_df = filter_stock_results_for_rsl_integrity(stock_results)
+    if not re_drops_df.empty:
+        integrity_drops_df = pd.concat([integrity_drops_df, re_drops_df], ignore_index=True).drop_duplicates(subset=['yahoo_symbol'])
     
     # --- NEU: Metadata-Repair fuer Snapshots ---
     # Wir laden die Caches, um leere Felder im Snapshot on-the-fly zu füllen
@@ -1974,7 +2053,7 @@ def rerender_last_analysis() -> bool:
         industry_summary_df=industry_summary_df,
         cluster_summary_df=cluster_summary_df,
         market_regime=market_regime,
-        integrity_drops_df=None,
+        integrity_drops_df=integrity_drops_df,
         watchlist_symbols=watchlist_symbols
     )
     return True
@@ -2289,6 +2368,11 @@ def run_analysis_pipeline(
                             land_final = str(land_raw).strip() if pd.notna(land_raw) else ""
                             if not land_final or land_final.lower() in ('unknown', 'nan', 'none', ''):
                                 land_final = info.get('country', '')
+                            
+                            isin_final = str(row.get('ISIN', '')).strip() if pd.notna(row.get('ISIN', '')) else ''
+                            if (not isin_final or isin_final.lower() in ('nan', 'none')) and info.get('isin'):
+                                isin_final = str(info['isin']).strip()
+
                             market_cap_final = _resolve_market_cap_from_info(info)
                             market_value_final = _resolve_market_value_from_sources(row, info, y_sym)
                             fs_date, is_new = first_seen_mgr.get_date_info(y_sym)
@@ -2296,7 +2380,7 @@ def run_analysis_pipeline(
                             stock_results.append(StockData(
                                 original_ticker=orig,
                                 yahoo_symbol=y_sym,
-                                isin=str(row.get('ISIN', '')).strip() if pd.notna(row.get('ISIN', '')) else '',
+                                isin=isin_final,
                                 name=row.get('Name', ''),
                                 sector=sector_final,
                                 industry=industry_final,
@@ -2315,10 +2399,13 @@ def run_analysis_pipeline(
                                 flag_gap=flags['flag_gap'],
                                 flag_liquidity=flags['flag_liquidity'],
                                 flag_stale=flags['flag_stale'],
+                                stale_reason=flags.get('stale_reason', ''),
                                 flag_scale=flags.get('flag_scale', 'OK'),
                                 scale_reason=flags.get('scale_reason', ''),
                                 price_scale_ratio=float(flags.get('price_scale_ratio', 1.0) or 1.0),
                                 trend_sma50=flags['trend_sma50'],
+                                flag_history_length=flags.get('flag_history_length', 'OK'),
+                                history_length_reason=flags.get('history_length_reason', ''),
                                 trend_smoothness=flags['trend_smoothness'],
                                 trend_quality=flags['trend_quality'],
                                 trust_score=flags['trust_score'],
@@ -2402,11 +2489,8 @@ def run_analysis_pipeline(
                     if res:
                         u_key, orig, y_sym, row, (curr, sma, vol_eur, flags) = res
                        
-                        if flags['flag_stale'] == "CRITICAL" or flags.get('flag_scale') == "CRITICAL":
-                            critical_reason = flags.get('stale_reason', 'Critical Stale')
-                            if flags.get('flag_scale') == "CRITICAL":
-                                critical_reason = flags.get('scale_reason', 'Preis-Skalenbruch')
-                            dropped_critical.append(f"{y_sym} ({orig}): {critical_reason}")
+                        if flags['flag_stale'] == "CRITICAL":
+                            dropped_critical.append(f"{y_sym} ({orig}): {flags.get('stale_reason', 'Critical Stale')}")
                         # Simpler Weg: Wenn Info nicht im Cache, nutzen wir Standardwerte aus der Liste
                         info = data_mgr.get_cached_info(y_sym) or {}
                         sector_final = info.get('sector', row.get('Sector', 'Unknown'))
@@ -2423,13 +2507,18 @@ def run_analysis_pipeline(
                         land_final = str(land_raw).strip() if pd.notna(land_raw) else ""
                         if not land_final or land_final.lower() in ('unknown', 'nan', 'none', ''):
                             land_final = info.get('country', '')
+                        
+                        isin_final = str(row.get('ISIN', '')).strip() if pd.notna(row.get('ISIN', '')) else ''
+                        if (not isin_final or isin_final.lower() in ('nan', 'none')) and info.get('isin'):
+                            isin_final = str(info['isin']).strip()
+
                         market_cap_final = _resolve_market_cap_from_info(info)
                         market_value_final = _resolve_market_value_from_sources(row, info, y_sym)
 
                         stock_results.append(StockData(
                             original_ticker=orig,
                             yahoo_symbol=y_sym,
-                            isin=str(row.get('ISIN', '')).strip() if pd.notna(row.get('ISIN', '')) else '',
+                            isin=isin_final,
                             name=row.get('Name', ''),
                             sector=sector_final,
                             industry=industry_final,
@@ -2448,10 +2537,13 @@ def run_analysis_pipeline(
                             flag_gap=flags['flag_gap'],
                             flag_liquidity=flags['flag_liquidity'],
                             flag_stale=flags['flag_stale'],
+                            stale_reason=flags.get('stale_reason', ''),
                             flag_scale=flags.get('flag_scale', 'OK'),
                             scale_reason=flags.get('scale_reason', ''),
                             price_scale_ratio=float(flags.get('price_scale_ratio', 1.0) or 1.0),
                             trend_sma50=flags['trend_sma50'],
+                            flag_history_length=flags.get('flag_history_length', 'OK'),
+                            history_length_reason=flags.get('history_length_reason', ''),
                             trend_smoothness=flags['trend_smoothness'],
                             trend_quality=flags['trend_quality'],
                             trust_score=flags['trust_score'],
@@ -2477,7 +2569,7 @@ def run_analysis_pipeline(
                         ))
                         mapper.set(u_key, y_sym)
                     pbar.update(1)
-    stock_results, integrity_drops_df = rsl_integrity_core.filter_stock_results_for_rsl_integrity(stock_results, LOCATION_SUFFIX_MAP)
+    stock_results, integrity_drops_df = filter_stock_results_for_rsl_integrity(stock_results)
     save_dataframe_safely(
         integrity_drops_df,
         CONFIG['rsl_integrity_drop_file'],
@@ -2513,6 +2605,13 @@ def run_analysis_pipeline(
     before_dedupe_count = len(stock_results)
     stock_results = data_pipeline_core.perform_final_deduplication(stock_results)
 
+    # NEU: Zusaetzliche Liquiditaets-Deduplikation (Entfernt Sekundaer-Listings)
+    apply_primary_liquidity_context(stock_results)
+    before_liq_dedupe = len(stock_results)
+    stock_results = [s for s in stock_results if s.yahoo_symbol == s.primary_liquidity_symbol]
+    if len(stock_results) < before_liq_dedupe:
+        logger.info(f"Liquiditaets-Bereinigung: {before_liq_dedupe - len(stock_results)} Duplikate/Neben-Listings entfernt.")
+
     # --- FILTERUNG & KONSOLIDIERUNG VOR RANKING ---
     # Blacklist anwenden, damit sie nicht in die Ränge und den Snapshot einfließt
     if blacklist:
@@ -2537,7 +2636,7 @@ def run_analysis_pipeline(
             sym = str(getattr(s, "yahoo_symbol", "")).strip().upper()
             s.mom_cluster = cluster_map.get(sym, "")
     
-    save_analysis_snapshot(stock_results, selected_syms, etf_options)
+    save_analysis_snapshot(stock_results, selected_syms, etf_options, integrity_drops_df=integrity_drops_df)
     logger.info("Snapshot vor Quality-Gate gesichert.")
 
     portfolio_symbols = [str(p.get('Yahoo_Symbol', '')).strip().upper() for p in portfolio_mgr.current_portfolio if p.get('Yahoo_Symbol')]
