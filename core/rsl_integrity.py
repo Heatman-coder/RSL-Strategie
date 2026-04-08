@@ -417,9 +417,17 @@ def validate_basic_history_integrity(
     diagnostics["max_flat_run"] = max_flat_run
 
     if max_flat_run >= cfg["flat_run_hard"]:
-        reasons.add("stale_price_series_extreme_flat_run", "hard_fail")
+        reasons.add("flatline_price_series", "hard_fail")
+        reasons.add("critical_stale_data", "hard_fail")
     elif max_flat_run >= cfg["flat_run_warn"]:
         reasons.add("stale_price_series_flat_run", "warning")
+
+    # Illiquid check: unique prices ratio (marktstrukturelle Prüfung)
+    if len(valid_price) > 30:
+        unique_ratio = float(valid_price.nunique() / len(valid_price))
+        diagnostics["unique_price_ratio"] = unique_ratio
+        if unique_ratio < 0.05: # Weniger als 1 neuer Preis pro Monat im Schnitt
+            reasons.add("illiquid_price_series", "hard_fail")
 
     returns = valid_price.pct_change().replace([np.inf, -np.inf], np.nan)
     if len(returns.dropna()) > 0:
@@ -428,6 +436,17 @@ def validate_basic_history_integrity(
 
         if max_abs_ret >= cfg["daily_return_hard_threshold"]:
             reasons.add("extreme_price_discontinuity", "hard_fail")
+            
+            # Jump after flatline: Prüfung auf Sprünge nach Stagnationsphasen
+            if len(returns) > 15:
+                jump_indices = returns[returns.abs() > 0.15].index
+                for jump_dt in jump_indices:
+                    loc = returns.index.get_loc(jump_dt)
+                    if loc >= 10:
+                        prev_prices = valid_price.iloc[loc-10 : loc]
+                        if _max_consecutive_equal(prev_prices) >= 7:
+                            reasons.add("jump_after_flatline", "hard_fail")
+                            break
         elif max_abs_ret >= cfg["daily_return_warn_threshold"]:
             reasons.add("large_price_discontinuity", "warning")
 
@@ -1107,6 +1126,12 @@ def get_rsl_integrity_reasons(
         return analysis.get("drop_reasons", [])
 
     reasons: List[str] = []
+    
+    # Übernehme bereits bei der Analyse/Download gefundene Gründe vom Objekt
+    existing_reasons = _get_row_value(item, ["integrity_warnings", "integrity_reasons"], [])
+    if isinstance(existing_reasons, list):
+        reasons.extend([str(r) for r in existing_reasons])
+
     trust_score = int(_get_row_value(item, ["trust_score"], 3))
     flag_stale = str(_get_row_value(item, ["flag_stale"], "OK")).upper()
     flag_hist = str(_get_row_value(item, ["flag_history_length"], "OK")).upper()
@@ -1161,7 +1186,11 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
         "no_valid_rsl_data",
         "critical_history_length",
         "critical_price_series_unreliable",
-        "critical_stale_secondary_history"
+        "critical_stale_secondary_history",
+        "flatline_price_series",
+        "critical_stale_data",
+        "jump_after_flatline",
+        "illiquid_price_series"
     }
     
     # 2. REPARIERBARE FEHLER (Ausschluss nur, wenn Reparatur nicht erfolgte)
