@@ -106,6 +106,7 @@ class StockData:
     ranking_integrity_status: str = "eligible_original"
     used_close_fallback: bool = False
     rsl_price_source: str = "adj_close"
+    fallback_fraction: float = 0.0
     fallback_fraction: Optional[float] = None
     repair_applied: bool = False
     repair_method: str = ""
@@ -501,8 +502,12 @@ class MarketDataManager:
                 flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
                 
                 # Integritaets-Gründe in Flags einmischen
+                diagnostics = analysis.get('diagnostics', {}) or {}
                 flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
                 flags['used_close_fallback'] = used_fallback
+                # Detaillierte Diagnostics aus dem Core übernehmen
+                flags['rsl_price_source'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
+                flags['fallback_fraction'] = float(diagnostics.get('fallback_fraction', 0.0) or 0.0)
                 # Reparatur-Details konsistent übernehmen
                 flags['repair_applied'] = diag.get('repair_applied', False)
                 flags['repair_method'] = diag.get('repair_method', '')
