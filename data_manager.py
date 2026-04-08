@@ -486,8 +486,9 @@ class MarketDataManager:
                 curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
                 sma = analysis.get('rsl_sma', curr)
                 
-                # Reparierte Serie als Basis fuer Flags setzen
+                # Metadaten aus Core-Analyse extrahieren
                 used_fallback = bool(analysis.get('used_close_fallback', False))
+                diag = analysis.get('diagnostics', {})
                 
                 is_young_history = len(clean_series.dropna()) < sma_len
                 if is_young_history:
@@ -501,8 +502,12 @@ class MarketDataManager:
                 # Integritaets-Gründe in Flags einmischen
                 flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
                 flags['used_close_fallback'] = used_fallback
-                # Detaillierten Modus aus Diagnostics übernehmen
-                flags['rsl_price_source'] = analysis.get('diagnostics', {}).get('rsl_price_source_mode', 'adj_close')
+                # Reparatur-Details konsistent übernehmen
+                flags['repair_applied'] = diag.get('repair_applied', False)
+                flags['repair_method'] = diag.get('repair_method', '')
+                flags['repair_reason'] = diag.get('repair_reason', '')
+                flags['fallback_fraction'] = diag.get('fallback_fraction', 0.0)
+                flags['rsl_price_source'] = diag.get('rsl_price_source_mode', 'adj_close')
                     
                 results[t] = (curr, sma, vol_eur, flags)
                 with self.lock:
@@ -537,6 +542,7 @@ class MarketDataManager:
             clean_col = analysis['rsl_price_column']
             clean_series = repaired_df[clean_col].ffill()
             used_fallback = bool(analysis.get('used_close_fallback', False))
+            diag = analysis.get('diagnostics', {})
             
             curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
             sma = analysis.get('rsl_sma', curr)
@@ -549,7 +555,12 @@ class MarketDataManager:
             
             flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
             flags['used_close_fallback'] = used_fallback
-            flags['rsl_price_source'] = analysis.get('diagnostics', {}).get('rsl_price_source_mode', 'adj_close')
+            # Reparatur-Details konsistent übernehmen
+            flags['repair_applied'] = diag.get('repair_applied', False)
+            flags['repair_method'] = diag.get('repair_method', '')
+            flags['repair_reason'] = diag.get('repair_reason', '')
+            flags['fallback_fraction'] = diag.get('fallback_fraction', 0.0)
+            flags['rsl_price_source'] = diag.get('rsl_price_source_mode', 'adj_close')
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
