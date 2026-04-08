@@ -724,9 +724,27 @@ def build_rsl_price_series(
         reasons.add("adjclose_missing_close_used", "review")
 
     used_close_fallback = False
+    
+    # --- NEU: GLOBALER SCALE-CHECK (Event-unabhängig) ---
+    # Wenn Adj Close massiv von Close abweicht (Yahoo-Bug), umschalten bevor wir Fenster prüfen
+    if close_col is not None and adj_col is not None:
+        c_vals = pd.to_numeric(df[close_col], errors="coerce")
+        a_vals = pd.to_numeric(df[adj_col], errors="coerce")
+        
+        # Prüfe das Median-Verhältnis über die gesamte Historie
+        # (Ratio > 2.0 oder < 0.5 deutet auf globalen Floor-Fehler hin)
+        ratio_series = (c_vals / a_vals.replace(0, np.nan)).dropna()
+        global_median_ratio = float(ratio_series.median()) if not ratio_series.empty else 1.0
+        
+        if global_median_ratio > 2.0 or global_median_ratio < 0.5:
+            df["rsl_price"] = c_vals
+            df["rsl_price_source"] = "close_global_scale_fallback"
+            used_close_fallback = True
+            reasons.add("extreme_adjclose_close_gap", "warning")
+            # In diesem Fall brauchen wir keine Fenster-Reparatur mehr
 
     # Wenn beide vorhanden sind, Dividenden-/Adjustierungsprüfung
-    if close_col is not None and adj_col is not None:
+    if not used_close_fallback and close_col is not None and adj_col is not None:
         div_reasons, div_diag, event_df = detect_dividend_adjustment_issues(df, cfg)
 
         for r in div_reasons.hard_fail_reasons:
@@ -755,13 +773,16 @@ def build_rsl_price_series(
                     if isinstance(loc, slice) or isinstance(loc, np.ndarray):
                         continue
 
-                    # Unterscheidung: Globaler Floor-Bug vs. lokaler Glitch
-                    # Wir prüfen die mediane Ratio im Fenster
+                    # Lokale Ratio-Prüfung im Fenster
+                    w_start = max(0, loc - 5)
+                    w_end = min(len(df), loc + 5)
+                    w_close = pd.to_numeric(df[close_col].iloc[w_start:w_end], errors="coerce")
+                    w_adj = pd.to_numeric(df[adj_col].iloc[w_start:w_end], errors="coerce")
+                    
                     ratio_series = (w_close / w_adj.replace(0, np.nan)).dropna()
                     median_ratio = float(ratio_series.median()) if not ratio_series.empty else 1.0
                     
-                    # Wenn die Ratio massiv abweicht (> 2.0 oder < 0.5), 
-                    # liegt wahrscheinlich ein globaler Scale-Fehler vor.
+                    # Wenn die lokale Ratio massiv abweicht, korrigieren wir den globalen Floor davor
                     is_global_bug = median_ratio > 2.0 or median_ratio < 0.5
                     
                     if is_global_bug:
