@@ -107,7 +107,6 @@ class StockData:
     used_close_fallback: bool = False
     rsl_price_source: str = "adj_close"
     fallback_fraction: float = 0.0
-    fallback_fraction: Optional[float] = None
     repair_applied: bool = False
     repair_method: str = ""
     repair_reason: str = ""
@@ -505,13 +504,10 @@ class MarketDataManager:
                 flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
                 flags['used_close_fallback'] = used_fallback
 
+                # Detaillierten Modus aus Diagnostics übernehmen
                 diagnostics = analysis.get('diagnostics', {}) or {}
                 flags['rsl_price_source'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
                 flags['fallback_fraction'] = float(diagnostics.get('fallback_fraction', 0.0) or 0.0)
-                flags['repair_applied'] = diagnostics.get('repair_applied', False)
-                flags['repair_method'] = diagnostics.get('repair_method', '')
-                flags['repair_reason'] = diagnostics.get('repair_reason', '')
-                flags['rsl_price_source_mode'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
                     
                 results[t] = (curr, sma, vol_eur, flags)
                 with self.lock:
@@ -561,15 +557,11 @@ class MarketDataManager:
             flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
             
             flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
+            flags['used_close_fallback'] = bool(analysis.get('used_close_fallback', False))
 
             diagnostics = analysis.get('diagnostics', {}) or {}
-            flags['used_close_fallback'] = bool(analysis.get('used_close_fallback', False))
             flags['rsl_price_source'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
             flags['fallback_fraction'] = float(diagnostics.get('fallback_fraction', 0.0) or 0.0)
-            flags['repair_applied'] = diagnostics.get('repair_applied', False)
-            flags['repair_method'] = diagnostics.get('repair_method', '')
-            flags['repair_reason'] = diagnostics.get('repair_reason', '')
-            flags['rsl_price_source_mode'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
