@@ -1016,14 +1016,22 @@ def apply_rsl_integrity_to_universe(
 
 
 def _extract_item_meta(item: Any) -> Tuple[Optional[str], Optional[str], Optional[pd.DataFrame]]:
-    ticker = _get_row_value(item, ["yahoo_symbol", "ticker", "Ticker", "Symbol", "symbol", "original_ticker"], None)
-    country = _get_row_value(item, ["land", "Land", "country", "Country"], None)
+    ticker = _get_row_value(
+        item,
+        ["yahoo_symbol", "ticker", "Ticker", "Symbol", "symbol", "original_ticker"],
+        None,
+    )
+    country = _get_row_value(
+        item,
+        ["land", "Land", "country", "Country"],
+        None,
+    )
     history = _extract_history_object(item)
     return (
         _normalize_string(ticker) or None,
         _normalize_string(country) or None,
         history,
-    ]
+    )
 
 
 def get_rsl_integrity_reasons(
@@ -1037,7 +1045,6 @@ def get_rsl_integrity_reasons(
     Liefert ALLE Integritäts-Reasons für ein Item.
     """
     ticker, country, history = _extract_item_meta(item)
-
     if history is None or not isinstance(history, pd.DataFrame) or history.empty:
         return []
 
@@ -1058,11 +1065,9 @@ def get_rsl_integrity_drop_reasons(
 ) -> List[str]:
     """
     Legacy-/Kompatibilitätsfunktion.
-    Wichtig: Nur echte Hard-Fails zurückgeben.
-    Kein RSL-Symptom darf alleiniger Ausschlussgrund sein.
+    Wichtig: Nur echte Hard-Fails zurückgeben. Kein RSL-Symptom darf alleiniger Ausschlussgrund sein.
     """
     ticker, country, history = _extract_item_meta(item)
-
     if history is None or not isinstance(history, pd.DataFrame) or history.empty:
         return []
 
@@ -1102,7 +1107,7 @@ def filter_stock_results_for_rsl_integrity(
     results: List[Any],
     location_suffix_map: Optional[Dict[str, Any]] = None,
     config: Optional[Dict[str, Any]] = None,
-) -> List[Any]:
+) -> Tuple[List[Any], pd.DataFrame]:
     """
     Legacy-/Kompatibilitätsfunktion für final.py.
 
@@ -1113,7 +1118,9 @@ def filter_stock_results_for_rsl_integrity(
       -> eligible_repaired
     """
     if not results:
-        return results
+        return results, pd.DataFrame()
+
+    dropped_results: List[Dict[str, Any]] = []
 
     for stock in results:
         ticker, country, history = _extract_item_meta(stock)
@@ -1139,7 +1146,6 @@ def filter_stock_results_for_rsl_integrity(
         hard_fail_reasons = _clean_hard_fail_reasons(list(analysis.get("hard_fail_reasons", [])))
         warning_reasons = list(analysis.get("warning_reasons", []))
         review_reasons = list(analysis.get("review_reasons", []))
-
         used_close_fallback = bool(analysis.get("used_close_fallback", False))
         rsl_price_source = diagnostics.get("rsl_price_source_mode", "adj_close")
         fallback_fraction = diagnostics.get("fallback_fraction")
@@ -1158,6 +1164,19 @@ def filter_stock_results_for_rsl_integrity(
             _set_if_attr(stock, "repair_applied", False)
             _set_if_attr(stock, "repair_method", "")
             _set_if_attr(stock, "repair_reason", "")
+
+            dropped_results.append(
+                {
+                    "ticker": ticker or _get_row_value(stock, ["name"], ""),
+                    "reason": "; ".join(hard_fail_reasons),
+                    "hard_fail_reasons": hard_fail_reasons,
+                    "warning_reasons": warning_reasons,
+                    "review_reasons": review_reasons,
+                    "used_close_fallback": used_close_fallback,
+                    "rsl_price_source": rsl_price_source,
+                    "fallback_fraction": fallback_fraction,
+                }
+            )
         else:
             if used_close_fallback:
                 _set_if_attr(stock, "ranking_integrity_status", "eligible_repaired")
@@ -1185,7 +1204,8 @@ def filter_stock_results_for_rsl_integrity(
         except Exception:
             pass
 
-    return results
+    re_issues_df = pd.DataFrame(dropped_results)
+    return results, re_issues_df
 
 
 def build_home_market_rsl_audit(
@@ -1199,24 +1219,26 @@ def build_home_market_rsl_audit(
     rows: List[Dict[str, Any]] = []
 
     for stock in results or []:
-        rows.append({
-            "ticker": _get_row_value(stock, ["yahoo_symbol", "ticker", "original_ticker"], ""),
-            "name": _get_row_value(stock, ["name"], ""),
-            "country": _get_row_value(stock, ["land", "country"], ""),
-            "rsl": _get_row_value(stock, ["rsl"], np.nan),
-            "sma": _get_row_value(stock, ["sma"], np.nan),
-            "rsl_rank": _get_row_value(stock, ["rsl_rang"], 0),
-            "ranking_integrity_status": _get_row_value(stock, ["ranking_integrity_status"], ""),
-            "excluded_from_ranking": _get_row_value(stock, ["excluded_from_ranking"], False),
-            "ranking_exclude_reason": _get_row_value(stock, ["ranking_exclude_reason"], ""),
-            "used_close_fallback": _get_row_value(stock, ["used_close_fallback"], False),
-            "rsl_price_source": _get_row_value(stock, ["rsl_price_source"], ""),
-            "fallback_fraction": _get_row_value(stock, ["fallback_fraction"], None),
-            "repair_applied": _get_row_value(stock, ["repair_applied"], False),
-            "repair_method": _get_row_value(stock, ["repair_method"], ""),
-            "repair_reason": _get_row_value(stock, ["repair_reason"], ""),
-            "integrity_warnings": ", ".join(_safe_list(_get_row_value(stock, ["integrity_warnings"], []))),
-        })
+        rows.append(
+            {
+                "ticker": _get_row_value(stock, ["yahoo_symbol", "ticker", "original_ticker"], ""),
+                "name": _get_row_value(stock, ["name"], ""),
+                "country": _get_row_value(stock, ["land", "country"], ""),
+                "rsl": _get_row_value(stock, ["rsl"], np.nan),
+                "sma": _get_row_value(stock, ["sma"], np.nan),
+                "rsl_rank": _get_row_value(stock, ["rsl_rang"], 0),
+                "ranking_integrity_status": _get_row_value(stock, ["ranking_integrity_status"], ""),
+                "excluded_from_ranking": _get_row_value(stock, ["excluded_from_ranking"], False),
+                "ranking_exclude_reason": _get_row_value(stock, ["ranking_exclude_reason"], ""),
+                "used_close_fallback": _get_row_value(stock, ["used_close_fallback"], False),
+                "rsl_price_source": _get_row_value(stock, ["rsl_price_source"], ""),
+                "fallback_fraction": _get_row_value(stock, ["fallback_fraction"], None),
+                "repair_applied": _get_row_value(stock, ["repair_applied"], False),
+                "repair_method": _get_row_value(stock, ["repair_method"], ""),
+                "repair_reason": _get_row_value(stock, ["repair_reason"], ""),
+                "integrity_warnings": ", ".join(_safe_list(_get_row_value(stock, ["integrity_warnings"], []))),
+            }
+        )
 
     return pd.DataFrame(rows)
 
@@ -1248,228 +1270,15 @@ def build_home_market_rsl_review_shortlist(
 
     shortlist = df.loc[mask].copy()
 
-    sort_cols = [c for c in ["excluded_from_ranking", "repair_applied", "used_close_fallback", "rsl_rank"] if c in shortlist.columns]
+    sort_cols = [
+        c for c in ["excluded_from_ranking", "repair_applied", "used_close_fallback", "rsl_rank"]
+        if c in shortlist.columns
+    ]
     if sort_cols:
-        shortlist = shortlist.sort_values(sort_cols, ascending=[False] * len(sort_cols), na_position="last")
+        shortlist = shortlist.sort_values(
+            sort_cols,
+            ascending=[False] * len(sort_cols),
+            na_position="last",
+        )
 
     return shortlist.reset_index(drop=True)
-
-# ============================================================================
-# Legacy-/Bridge-APIs für final.py
-# ============================================================================
-
-def _coerce_item_history_ticker_country(
-    item: Any,
-    location_suffix_map: Optional[Dict[str, str]] = None,
-) -> Tuple[Optional[pd.DataFrame], str, str]:
-    history_df = _extract_history_object(item)
-    ticker = _normalize_string(_get_row_value(
-        item,
-        ["yahoo_symbol", "ticker", "Ticker", "symbol", "Symbol", "original_ticker"],
-        default="",
-    ))
-    country = _normalize_string(_get_row_value(
-        item,
-        ["country", "Country", "land", "Land", "exchange_country", "market_country"],
-        default="",
-    ))
-    return history_df, ticker, country
-
-
-def get_rsl_integrity_drop_reasons(
-    item: Any,
-    location_suffix_map: Optional[Dict[str, str]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-    raw_rsl: Any = None,
-) -> List[str]:
-    """
-    Legacy-API: liefert weiterhin drop_reasons zurück.
-    """
-    history_df, ticker, country = _coerce_item_history_ticker_country(item, location_suffix_map)
-    if history_df is None or not isinstance(history_df, pd.DataFrame) or history_df.empty:
-        return ["missing_history_for_symbol"]
-
-    analysis = analyze_history_for_rsl_integrity(
-        history_df=history_df,
-        ticker=ticker or None,
-        country=country or None,
-        cfg=cfg,
-    )
-    return _unique_keep_order(_safe_list(analysis.get("drop_reasons", [])))
-
-
-def get_rsl_integrity_reasons(
-    item: Any,
-    location_suffix_map: Optional[Dict[str, str]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-    raw_rsl: Any = None,
-) -> List[str]:
-    """
-    Legacy-/Kompatibilitäts-API: liefert alle strukturierten Integrity-Reasons.
-    """
-    history_df, ticker, country = _coerce_item_history_ticker_country(item, location_suffix_map)
-    if history_df is None or not isinstance(history_df, pd.DataFrame) or history_df.empty:
-        return ["missing_history_for_symbol"]
-
-    analysis = analyze_history_for_rsl_integrity(
-        history_df=history_df,
-        ticker=ticker or None,
-        country=country or None,
-        cfg=cfg,
-    )
-    return _unique_keep_order(_safe_list(analysis.get("integrity_reasons", [])))
-
-
-def filter_stock_results_for_rsl_integrity(
-    results: List[Any],
-    location_suffix_map: Optional[Dict[str, str]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Any], pd.DataFrame]:
-    """
-    Legacy-API für final.py:
-    - valid_results: Objekte ohne Hard-Fail
-    - re_issues_df: Audit-DataFrame für Objekte mit Hard-Fail
-    """
-    if not results:
-        return [], pd.DataFrame()
-
-    valid_results: List[Any] = []
-    dropped_rows: List[Dict[str, Any]] = []
-
-    for item in results:
-        history_df, ticker, country = _coerce_item_history_ticker_country(item, location_suffix_map)
-
-        if history_df is None or not isinstance(history_df, pd.DataFrame) or history_df.empty:
-            dropped_rows.append({
-                "yahoo_symbol": ticker or "",
-                "ticker": ticker or "",
-                "Land": country or "",
-                "country": country or "",
-                "RSL": np.nan,
-                "drop_reasons": ["missing_history_for_symbol"],
-                "hard_fail_reasons": ["missing_history_for_symbol"],
-                "warning_reasons": [],
-                "review_reasons": [],
-                "used_close_fallback": False,
-                "rsl_price_source": "unknown",
-                "fallback_fraction": np.nan,
-            })
-            continue
-
-        analysis = analyze_history_for_rsl_integrity(
-            history_df=history_df,
-            ticker=ticker or None,
-            country=country or None,
-            cfg=cfg,
-        )
-
-        if bool(analysis.get("has_hard_fail", False)):
-            diagnostics = analysis.get("diagnostics", {}) or {}
-            dropped_rows.append({
-                "yahoo_symbol": ticker or "",
-                "ticker": ticker or "",
-                "Land": country or "",
-                "country": country or "",
-                "RSL": analysis.get("rsl_value", np.nan),
-                "drop_reasons": _safe_list(analysis.get("drop_reasons", [])),
-                "hard_fail_reasons": _safe_list(analysis.get("hard_fail_reasons", [])),
-                "warning_reasons": _safe_list(analysis.get("warning_reasons", [])),
-                "review_reasons": _safe_list(analysis.get("review_reasons", [])),
-                "used_close_fallback": bool(analysis.get("used_close_fallback", False)),
-                "rsl_price_source": diagnostics.get("rsl_price_source_mode", "unknown"),
-                "fallback_fraction": float(diagnostics.get("fallback_fraction", 0.0) or 0.0),
-            })
-        else:
-            valid_results.append(item)
-
-    re_issues_df = pd.DataFrame(dropped_rows)
-    return valid_results, re_issues_df
-
-
-def build_home_market_rsl_audit(
-    results: List[Any],
-    location_suffix_map: Optional[Dict[str, str]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> pd.DataFrame:
-    """
-    Baut ein Audit-DataFrame für spätere Prüfung/Export.
-    """
-    rows: List[Dict[str, Any]] = []
-    for rank, item in enumerate(results or [], start=1):
-        history_df, ticker, country = _coerce_item_history_ticker_country(item, location_suffix_map)
-        base_row = {
-            "rank": rank,
-            "yahoo_symbol": ticker or "",
-            "ticker": ticker or "",
-            "name": _normalize_string(_get_row_value(item, ["name", "Name"], default="")),
-            "isin": _normalize_string(_get_row_value(item, ["isin", "ISIN"], default="")),
-            "Land": country or "",
-            "country": country or "",
-        }
-        if history_df is None or not isinstance(history_df, pd.DataFrame) or history_df.empty:
-            base_row.update({
-                "integrity_reasons": ["missing_history_for_symbol"],
-                "hard_fail_reasons": ["missing_history_for_symbol"],
-                "warning_reasons": [],
-                "review_reasons": [],
-                "drop_reasons": ["missing_history_for_symbol"],
-                "has_hard_fail": True,
-                "used_close_fallback": False,
-                "rsl": np.nan,
-                "fallback_fraction": np.nan,
-                "rsl_price_source": "unknown",
-            })
-            rows.append(base_row)
-            continue
-        analysis = analyze_history_for_rsl_integrity(
-            history_df=history_df,
-            ticker=ticker or None,
-            country=country or None,
-            cfg=cfg,
-        )
-        diagnostics = analysis.get("diagnostics", {}) or {}
-        base_row.update({
-            "integrity_reasons": _safe_list(analysis.get("integrity_reasons", [])),
-            "hard_fail_reasons": _safe_list(analysis.get("hard_fail_reasons", [])),
-            "warning_reasons": _safe_list(analysis.get("warning_reasons", [])),
-            "review_reasons": _safe_list(analysis.get("review_reasons", [])),
-            "drop_reasons": _safe_list(analysis.get("drop_reasons", [])),
-            "has_hard_fail": bool(analysis.get("has_hard_fail", False)),
-            "used_close_fallback": bool(analysis.get("used_close_fallback", False)),
-            "rsl": analysis.get("rsl_value", np.nan),
-            "fallback_fraction": float(diagnostics.get("fallback_fraction", 0.0) or 0.0),
-            "rsl_price_source": diagnostics.get("rsl_price_source_mode", "unknown"),
-        })
-        rows.append(base_row)
-    return pd.DataFrame(rows)
-
-
-def build_home_market_rsl_review_shortlist(
-    audit_df: pd.DataFrame,
-    top_rank: int = 300,
-) -> pd.DataFrame:
-    """
-    Selektiert die Titel, die man manuell prüfen sollte.
-    Minimal-Regel:
-    - nur bis top_rank
-    - nur mit Warnings/Reviews/Hard-Fails oder Fallback-Nutzung
-    """
-    if audit_df is None or len(audit_df) == 0:
-        return pd.DataFrame(columns=list(audit_df.columns) if isinstance(audit_df, pd.DataFrame) else [])
-
-    df = audit_df.copy()
-
-    if "rank" in df.columns:
-        df = df[df["rank"].fillna(10**9) <= int(top_rank)]
-
-    def _nonempty_list(v: Any) -> bool:
-        return isinstance(v, list) and len(v) > 0
-
-    mask = (
-        df.get("has_hard_fail", False).astype(bool)
-        | df.get("used_close_fallback", False).astype(bool)
-        | df.get("warning_reasons", pd.Series([[]] * len(df))).apply(_nonempty_list)
-        | df.get("review_reasons", pd.Series([[]] * len(df))).apply(_nonempty_list)
-    )
-
-    return df.loc[mask].copy()
