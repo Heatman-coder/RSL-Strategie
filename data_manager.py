@@ -109,6 +109,8 @@ class StockData:
     repair_applied: bool = False
     repair_method: str = ""
     repair_reason: str = ""
+    fallback_fraction: float = 0.0
+    rsl_price_source_mode: str = ""
 
     def to_dict(self):
         return asdict(self)
@@ -508,6 +510,7 @@ class MarketDataManager:
                 flags['repair_reason'] = diag.get('repair_reason', '')
                 flags['fallback_fraction'] = diag.get('fallback_fraction', 0.0)
                 flags['rsl_price_source'] = diag.get('rsl_price_source_mode', 'adj_close')
+                flags['rsl_price_source_mode'] = diag.get('rsl_price_source_mode', 'adj_close')
                     
                 results[t] = (curr, sma, vol_eur, flags)
                 with self.lock:
@@ -561,6 +564,7 @@ class MarketDataManager:
             flags['repair_reason'] = diag.get('repair_reason', '')
             flags['fallback_fraction'] = diag.get('fallback_fraction', 0.0)
             flags['rsl_price_source'] = diag.get('rsl_price_source_mode', 'adj_close')
+            flags['rsl_price_source_mode'] = diag.get('rsl_price_source_mode', 'adj_close')
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}

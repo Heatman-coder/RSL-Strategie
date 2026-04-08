@@ -2536,7 +2536,14 @@ def run_analysis_pipeline(
                                 stale_days=flags.get('stale_days', 0),
                                 first_seen_date=fs_date,
                                 is_new=is_new,
-                                integrity_warnings=flags.get('integrity_reasons', [])
+                                integrity_warnings=flags.get('integrity_reasons', []),
+                                used_close_fallback=flags.get('used_close_fallback', False),
+                                rsl_price_source=flags.get('rsl_price_source', 'adj_close'),
+                                repair_applied=flags.get('repair_applied', False),
+                                repair_method=flags.get('repair_method', ''),
+                                repair_reason=flags.get('repair_reason', ''),
+                                fallback_fraction=flags.get('fallback_fraction', 0.0),
+                                rsl_price_source_mode=flags.get('rsl_price_source_mode', '')
                             ))
                             if not mapper.get(u_key): mapper.set(u_key, y_sym)
                             pbar.update(1)
@@ -2675,7 +2682,14 @@ def run_analysis_pipeline(
                             stale_days=flags.get('stale_days', 0),
                             first_seen_date=fs_date,
                             is_new=is_new,
-                            integrity_warnings=flags.get('integrity_reasons', [])
+                            integrity_warnings=flags.get('integrity_reasons', []),
+                            used_close_fallback=flags.get('used_close_fallback', False),
+                            rsl_price_source=flags.get('rsl_price_source', 'adj_close'),
+                            repair_applied=flags.get('repair_applied', False),
+                            repair_method=flags.get('repair_method', ''),
+                            repair_reason=flags.get('repair_reason', ''),
+                            fallback_fraction=flags.get('fallback_fraction', 0.0),
+                            rsl_price_source_mode=flags.get('rsl_price_source_mode', '')
                         ))
                         mapper.set(u_key, y_sym)
                     pbar.update(1)
