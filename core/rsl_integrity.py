@@ -1116,7 +1116,8 @@ def get_rsl_integrity_reasons(
     raw_rsl: Any = None,
 ) -> List[str]:
     """
-    Sammelt Integritätsgründe. Unterstützt sowohl history_df als auch StockData Objekte.
+    Sammelt Integritätsgründe ausschließlich basierend auf DATENURSACHEN.
+    RSL-Werte oder deren Validität fließen hier NICHT mehr ein.
     """
     if isinstance(item, pd.DataFrame):
         # Direkte Analyse für DataFrames, um Rekursion mit dem Alias zu vermeiden
@@ -1129,10 +1130,12 @@ def get_rsl_integrity_reasons(
         return analysis.get("drop_reasons", [])
 
     reasons: List[str] = []
-    trust_score = int(_get_row_value(item, ["trust_score"], 3))
+    
+    # Extraktion der Ursachen-Flags vom Objekt
     flag_stale = str(_get_row_value(item, ["flag_stale"], "OK")).upper()
     flag_hist = str(_get_row_value(item, ["flag_history_length"], "OK")).upper()
     flag_scale = str(_get_row_value(item, ["flag_scale"], "OK")).upper()
+    trust_score = int(_get_row_value(item, ["trust_score"], 3))
 
     if flag_stale == "CRITICAL":
         reasons.append("critical_stale_data")
@@ -1144,6 +1147,11 @@ def get_rsl_integrity_reasons(
         reasons.append("suspicious_price_scale")
     if trust_score < 1:
         reasons.append("low_trust_score")
+
+    # Übernehme bereits bei Analyse gefundene Gründe (ohne RSL-Bezug)
+    existing_warnings = _get_row_value(item, ["integrity_warnings", "integrity_reasons"], [])
+    if isinstance(existing_warnings, list):
+        reasons.extend([str(r) for r in existing_warnings if "rsl" not in str(r).lower()])
 
     return list(dict.fromkeys(reasons))
 
@@ -1206,11 +1214,12 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     if not assessment.rsl_eligible:
         assessment.ranking_integrity_status = "not_eligible_unreliable"
         assessment.ranking_exclude_reason = "; ".join(assessment.hard_fail_reasons)
-    elif used_repair:
+    elif used_repair or assessment.repair_applied:
         assessment.ranking_integrity_status = "eligible_repaired"
     else:
         assessment.ranking_integrity_status = "eligible_original"
         
+    assessment.excluded_from_ranking = not assessment.rsl_eligible
     return assessment
 
 def filter_stock_results_for_rsl_integrity(
@@ -1218,13 +1227,16 @@ def filter_stock_results_for_rsl_integrity(
     location_suffix_map: Dict[str, str],
     config: Dict[str, Any],
 ) -> Tuple[List[Any], pd.DataFrame]:
+    """
+    Filtert das Universum basierend auf Integritätsergebnissen.
+    Wichtig: RSL ist output-only und nie Ausschlussgrund.
+    """
     valid_results: List[Any] = []
     issue_rows: List[Dict[str, Any]] = []
 
     for stock in stock_results or []:
         assessment = assess_integrity(stock, location_suffix_map, config)
         
-        # ARCHITEKTUR-GUARDRAIL: RSL ist output-only und nie Ausschlussgrund.
         all_reasons = assessment.all_reasons
         try:
             setattr(stock, "rsl_eligible", assessment.rsl_eligible)
@@ -1233,16 +1245,16 @@ def filter_stock_results_for_rsl_integrity(
             setattr(stock, "repair_method", assessment.repair_method)
             setattr(stock, "repair_reason", assessment.repair_reason)
             setattr(stock, "fallback_fraction", assessment.fallback_fraction)
-            setattr(stock, "rsl_price_source_mode", assessment.repair_method)
+            setattr(stock, "excluded_from_ranking", not assessment.rsl_eligible)
         except AttributeError: pass
 
         if assessment.all_reasons:
             try:
                 setattr(stock, "integrity_warnings", all_reasons)
-                setattr(stock, "excluded_from_ranking", not assessment.is_valid)
-                # Guardrail: ranking_exclude_reason darf keinerlei RSL-Bezug enthalten
-                clean_exclude_reason = "; ".join([r for r in assessment.hard_fail_reasons if "rsl" not in r.lower()])
-                setattr(stock, "ranking_exclude_reason", clean_exclude_reason)
+                # REINE URSACHEN-REGEL: ranking_exclude_reason darf NUR datenbasierte Hard-Fails enthalten.
+                # Jedes Wort 'rsl' wird hier strikt ausgefiltert.
+                hard_fails = [r for r in assessment.hard_fail_reasons if "rsl" not in r.lower()]
+                setattr(stock, "ranking_exclude_reason", "; ".join(hard_fails))
             except AttributeError: pass
 
         if assessment.rsl_eligible:
