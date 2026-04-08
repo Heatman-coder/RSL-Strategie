@@ -558,9 +558,6 @@ class MarketDataManager:
             
             flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
             flags['used_close_fallback'] = bool(analysis.get('used_close_fallback', False))
-            flags['rsl_price_source'] = analysis.get('diagnostics', {}).get('rsl_price_source_mode', 'adj_close')
-            flags['fallback_fraction'] = float(analysis.get('diagnostics', {}).get('fallback_fraction', 0.0) or 0.0)
-
             diagnostics = analysis.get('diagnostics', {}) or {}
             flags['rsl_price_source'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
             flags['fallback_fraction'] = float(diagnostics.get('fallback_fraction', 0.0) or 0.0)
