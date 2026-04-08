@@ -278,7 +278,7 @@ class MarketDataManager:
         
         # Nutze die reparierte Serie, falls vorhanden, sonst Fallback auf Spalten
         if price_series is not None:
-            hist_close = price_series.dropna()
+            hist_close = price_series.ffill()
         else:
             calc_col = 'Adj Close' if 'Adj Close' in hist_data.columns else 'Close'
             if calc_col not in hist_data.columns or hist_data.empty: return flags
@@ -367,7 +367,7 @@ class MarketDataManager:
                 flags['twss_score'] = float(abs_twss[max_idx])
                 flags['twss_date'] = str(max_idx.date())
                 flags['twss_days_ago'] = (datetime.date.today() - max_idx.date()).days
-                flags['twss_raw_pct'] = float(rets[max_idx])
+                flags['twss_raw_pct'] = float(rets[max_idx]) / 100.0
                 if flags['twss_score'] > 60: flags['twss_orientation'] = "HOCH"
                 elif flags['twss_score'] > 25: flags['twss_orientation'] = "MITTEL"
 
@@ -385,7 +385,7 @@ class MarketDataManager:
                         flags['rsl_change_1w'] = (curr_price / sma) - flags['rsl_past']
             flags['high_52w'] = float(hist_close.tail(252).max())
             if flags['high_52w'] > 0:
-                flags['distance_52w_high_pct'] = max(0.0, (flags['high_52w'] - curr_price) / flags['high_52w'] * 100.0)
+                flags['distance_52w_high_pct'] = max(0.0, (flags['high_52w'] - curr_price) / flags['high_52w'])
         except Exception:
             pass
         
@@ -412,11 +412,14 @@ class MarketDataManager:
         # 6. ATR & Timing
         if 'High' in hist_data.columns and 'Low' in hist_data.columns:
             try:
-                h, l, c = hist_data['High'], hist_data['Low'], hist_close
+                # Index-Alignment sicherstellen und Lücken füllen
+                h, l, c = hist_data['High'].ffill(), hist_data['Low'].ffill(), hist_close.ffill()
                 tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-                atr = float(tr.rolling(int(self.config.get('atr_period', 14))).mean().iloc[-1])
+                atr_series = tr.rolling(int(self.config.get('atr_period', 14)), min_periods=1).mean().ffill()
+                atr = float(atr_series.dropna().iloc[-1]) if not atr_series.dropna().empty else 0.0
+                
                 flags['atr'] = atr
-                flags['atr_limit'] = curr_price - (float(self.config.get('atr_multiplier_limit', 1.0)) * atr)
+                flags['atr_limit'] = curr_price - (float(self.config.get('atr_multiplier_limit', 1.0) or 1.0) * atr)
                 flags['atr_sell_limit'] = curr_price + (float(self.config.get('atr_multiplier_exit', 0.15)) * atr)
             except: pass
 
@@ -470,9 +473,8 @@ class MarketDataManager:
                 
                 f = self._get_currency_factor(t)
                 hist_adj = hist.copy()
-                for col in ['Open', 'High', 'Low', 'Close']:
+                for col in ['Open', 'High', 'Low', 'Close', 'Adj Close']:
                     if col in hist_adj.columns: hist_adj[col] *= f
-                if 'Adj Close' in hist_adj.columns: hist_adj['Adj Close'] *= f
                 
                 sma_len = int(self.config.get('sma_length', 130))
 
@@ -486,10 +488,7 @@ class MarketDataManager:
                 
                 curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
                 sma = analysis.get('rsl_sma', curr)
-                
-                # Metadaten aus Core-Analyse extrahieren
-                used_fallback = bool(analysis.get('used_close_fallback', False))
-                diag = analysis.get('diagnostics', {})
+                rsl = analysis.get('rsl_value', 0.0)
                 
                 is_young_history = len(clean_series.dropna()) < sma_len
                 if is_young_history:
@@ -497,17 +496,26 @@ class MarketDataManager:
 
                 vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
                 
-                # Flags auf der reparierten Serie berechnen, ohne das DataFrame zu mutieren
-                flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
-                
-                # Integritaets-Gründe in Flags einmischen
-                flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
-                flags['used_close_fallback'] = used_fallback
+                flags = self._calculate_flags(repaired_df, curr, sma, is_young_history, price_series=clean_series)
 
-                # Detaillierten Modus aus Diagnostics übernehmen
-                diagnostics = analysis.get('diagnostics', {}) or {}
-                flags['rsl_price_source'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
-                flags['fallback_fraction'] = float(diagnostics.get('fallback_fraction', 0.0) or 0.0)
+                # Marktkapitalisierung und Marktwert (EUR) berechnen
+                info = self.info_cache.get(t, {})
+                mkt_cap_raw = float(info.get('marketCap', 0) or 0)
+                mkt_val_eur = mkt_cap_raw * f
+
+                flags.update({
+                    'rsl': rsl,
+                    'rsl_past': analysis.get('rsl_past', 0.0),
+                    'rsl_change_1w': analysis.get('rsl_change_1w', 0.0),
+                    'integrity_reasons': analysis.get('integrity_reasons', []),
+                    'used_close_fallback': bool(analysis.get('used_close_fallback', False)),
+                    'excluded_from_ranking': analysis.get('excluded_from_ranking', False),
+                    'ranking_integrity_status': analysis.get('ranking_integrity_status', 'eligible_original'),
+                    'rsl_price_source': (analysis.get('diagnostics', {}) or {}).get('rsl_price_source_mode', 'adj_close'),
+                    'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0) / 100.0,
+                    'market_cap': mkt_cap_raw,
+                    'market_value': mkt_val_eur
+                })
                     
                 results[t] = (curr, sma, vol_eur, flags)
                 with self.lock:
@@ -525,42 +533,48 @@ class MarketDataManager:
             return (c['curr'], c['sma'], c.get('vol_eur', 0.0), c['flags'])
         
         try:
-            # auto_adjust=False fuer manuelle Pruefung
             hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=False)
             if hist.empty: return None
             f = self._get_currency_factor(ticker)
             hist_adj = hist.copy()
             for col in ['Open', 'High', 'Low', 'Close', 'Adj Close']:
-                if col in hist_adj.columns:
-                    hist_adj[col] *= f
-            if 'Adj Close' in hist_adj.columns:
-                hist_adj['Adj Close'] *= f
+                if col in hist_adj.columns: hist_adj[col] *= f
             
             sma_len = int(self.config.get('sma_length', 130))
-
             core_cfg = {**self.config, "rsl_sma_window": sma_len, "min_history_rows_for_rsl": sma_len}
             analysis = rsl_integrity_core.analyze_history_for_rsl_integrity(hist_adj, ticker=ticker, cfg=core_cfg)
             
             repaired_df = analysis['history']
             clean_col = analysis['rsl_price_column']
             clean_series = repaired_df[clean_col].ffill()
-            used_fallback = bool(analysis.get('used_close_fallback', False))
-            diag = analysis.get('diagnostics', {})
             
             curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
             sma = analysis.get('rsl_sma', curr)
+            rsl = analysis.get('rsl_value', 0.0)
             is_young_history = len(clean_series.dropna()) < sma_len
             if is_young_history:
                 self.young_tickers[ticker] = {'ticker': ticker, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
 
             vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-            flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
+            flags = self._calculate_flags(repaired_df, curr, sma, is_young_history, price_series=clean_series)
             
-            flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
-            flags['used_close_fallback'] = bool(analysis.get('used_close_fallback', False))
-            diagnostics = analysis.get('diagnostics', {}) or {}
-            flags['rsl_price_source'] = diagnostics.get('rsl_price_source_mode', 'adj_close')
-            flags['fallback_fraction'] = float(diagnostics.get('fallback_fraction', 0.0) or 0.0)
+            info = self.info_cache.get(ticker, {})
+            mkt_cap_raw = float(info.get('marketCap', 0) or 0)
+            mkt_val_eur = mkt_cap_raw * f
+            
+            flags.update({
+                'rsl': rsl,
+                'rsl_past': analysis.get('rsl_past', 0.0),
+                'rsl_change_1w': analysis.get('rsl_change_1w', 0.0),
+                'integrity_reasons': analysis.get('integrity_reasons', []),
+                'used_close_fallback': bool(analysis.get('used_close_fallback', False)),
+                'excluded_from_ranking': analysis.get('excluded_from_ranking', False),
+                'ranking_integrity_status': analysis.get('ranking_integrity_status', 'eligible_original'),
+                'rsl_price_source': (analysis.get('diagnostics', {}) or {}).get('rsl_price_source_mode', 'adj_close'),
+                'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0) / 100.0,
+                'market_cap': mkt_cap_raw,
+                'market_value': mkt_val_eur
+            })
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}

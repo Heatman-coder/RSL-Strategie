@@ -1025,11 +1025,13 @@ def refresh_market_caps_for_relevant_exchange_stocks(stock_results: List[StockDa
         market_cap = _resolve_market_cap_from_info(info or {})
         if market_cap <= 0:
             continue
+        # Waehrungsumrechnung sicherstellen
+        rate = get_currency_rate_for_ticker(symbol)
         if _safe_positive_float(getattr(stock, "market_cap", 0.0)) <= 0:
             stock.market_cap = market_cap
             updated += 1
         if _safe_positive_float(getattr(stock, "market_value", 0.0)) <= 0:
-            stock.market_value = market_cap
+            stock.market_value = market_cap * rate
 
     if fetched_any and hasattr(data_mgr, "save_info_cache"):
         try:
@@ -2014,8 +2016,9 @@ def rerender_last_analysis() -> bool:
         if _safe_positive_float(getattr(s, 'market_value', 0.0)) <= 0 and y_sym in info_cache:
             repaired_market_cap = _resolve_market_cap_from_info(cast(Dict, info_cache.get(y_sym, {})))
             if repaired_market_cap > 0:
+                rate = get_currency_rate_for_ticker(y_sym)
                 s.market_cap = repaired_market_cap
-                s.market_value = repaired_market_cap
+                s.market_value = repaired_market_cap * rate
 
     if repaired_count > 0:
         logger.info(f"Snapshot-Repair: {repaired_count} fehlende Länderinformationen aus Caches wiederhergestellt.")
@@ -2496,7 +2499,7 @@ def run_analysis_pipeline(
                                 market_value=market_value_final,
                                 kurs=curr,
                                 sma=sma,
-                                rsl=curr/sma,
+                                rsl=flags.get('rsl', 0.0),
                                 atr=flags.get('atr', 0.0),
                                 atr_limit=flags.get('atr_limit', 0.0),
                                 atr_sell_limit=flags.get('atr_sell_limit', 0.0),
@@ -2543,7 +2546,9 @@ def run_analysis_pipeline(
                                 repair_method=flags.get('repair_method', ''),
                                 repair_reason=flags.get('repair_reason', ''),
                                 fallback_fraction=flags.get('fallback_fraction', 0.0),
-                                rsl_price_source_mode=flags.get('rsl_price_source_mode', '')
+                                excluded_from_ranking=flags.get('excluded_from_ranking', False),
+                                ranking_exclude_reason=flags.get('integrity_reasons', [""])[0] if flags.get('excluded_from_ranking') else "",
+                                ranking_integrity_status=flags.get('ranking_integrity_status', 'eligible_original')
                             ))
                             if not mapper.get(u_key): mapper.set(u_key, y_sym)
                             pbar.update(1)
@@ -2642,7 +2647,7 @@ def run_analysis_pipeline(
                             market_value=market_value_final,
                             kurs=curr,
                             sma=sma,
-                            rsl=curr/sma,
+                            rsl=flags.get('rsl', 0.0),
                             atr=flags.get('atr', 0.0),
                             atr_limit=flags.get('atr_limit', 0.0),
                             atr_sell_limit=flags.get('atr_sell_limit', 0.0),
@@ -2689,7 +2694,9 @@ def run_analysis_pipeline(
                             repair_method=flags.get('repair_method', ''),
                             repair_reason=flags.get('repair_reason', ''),
                             fallback_fraction=flags.get('fallback_fraction', 0.0),
-                            rsl_price_source_mode=flags.get('rsl_price_source_mode', '')
+                            excluded_from_ranking=flags.get('excluded_from_ranking', False),
+                            ranking_exclude_reason=flags.get('integrity_reasons', [""])[0] if flags.get('excluded_from_ranking') else "",
+                            ranking_integrity_status=flags.get('ranking_integrity_status', 'eligible_original')
                         ))
                         mapper.set(u_key, y_sym)
                     pbar.update(1)
@@ -2702,12 +2709,13 @@ def run_analysis_pipeline(
         encoding='utf-8-sig',
     )
     if not integrity_issues_df.empty:
+        actual_drops = integrity_issues_df[integrity_issues_df["excluded_from_ranking"] == True]
         for _, row in integrity_issues_df.iterrows():
-            dropped_critical.append(
-                f"{row.get('yahoo_symbol', '')} ({row.get('original_ticker', '')}): RSL-Integritaet -> {row.get('integrity_reasons', '')}"
-            )
+            if row.get("excluded_from_ranking"):
+                dropped_critical.append(
+                    f"{row.get('yahoo_symbol', '')} ({row.get('original_ticker', '')}): RSL-Integritaet -> {row.get('integrity_reasons', '')}"
+                )
         
-        # NEU: Zusammenfassung der Integritäts-Flags ausgeben
         integrity_summary = quality_core.summarize_integrity_flags(integrity_issues_df)
         print(f"\nIntegritaets-Check Ergebnis: {quality_core.quality_gate_status(integrity_summary)}")
         
@@ -2718,8 +2726,8 @@ def run_analysis_pipeline(
         if "warning_reasons" in integrity_issues_df.columns:
             print(f" - Warnings: {integrity_summary['warning_count']}")
 
-        logger.info(f"[WARN] {len(integrity_issues_df)} Ticker weisen unzuverlaessige RSL-Historie auf (werden im Report markiert).")
-    apply_primary_liquidity_context(stock_results)
+        if len(actual_drops) > 0:
+            logger.info(f"[WARN] {len(actual_drops)} Ticker weisen kritische RSL-Fehler auf und wurden gefiltert.")
     refresh_market_caps_for_relevant_exchange_stocks(stock_results, data_mgr)
     mapper.save_if_dirty()
     if dropped_critical:
