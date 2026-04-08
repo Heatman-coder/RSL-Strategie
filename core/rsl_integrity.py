@@ -1453,6 +1453,265 @@ def build_home_market_rsl_audit(
             "repair_reason": _get_row_value(item, ["repair_reason"], default=""),
             "has_hard_fail": bool(analysis.get("has_hard_fail", False)),
         }
+
+# ============================================================================
+# Legacy-/Kompatibilitäts-Wrapper für final.py
+# ============================================================================
+
+def _extract_history_from_item(item: Any) -> Optional[pd.DataFrame]:
+    """
+    Versucht defensiv, eine Historie aus dict-/objektartigen Strukturen zu lesen.
+    """
+    if item is None:
+        return None
+
+    candidates = [
+        "history",
+        "hist",
+        "price_history",
+        "history_df",
+        "kurshistorie",
+    ]
+
+    if isinstance(item, dict):
+        for key in candidates:
+            value = item.get(key)
+            if isinstance(value, pd.DataFrame):
+                return value
+
+    for key in candidates:
+        try:
+            value = getattr(item, key, None)
+            if isinstance(value, pd.DataFrame):
+                return value
+        except Exception:
+            pass
+
+    return None
+
+
+def _extract_symbol_from_item(item: Any) -> Optional[str]:
+    candidates = [
+        "yahoo_symbol",
+        "ticker",
+        "symbol",
+        "original_ticker",
+    ]
+
+    if isinstance(item, dict):
+        for key in candidates:
+            value = item.get(key)
+            if value:
+                return str(value)
+
+    for key in candidates:
+        try:
+            value = getattr(item, key, None)
+            if value:
+                return str(value)
+        except Exception:
+            pass
+
+    return None
+
+
+def _extract_country_from_item(item: Any) -> Optional[str]:
+    candidates = ["land", "country", "market_country"]
+
+    if isinstance(item, dict):
+        for key in candidates:
+            value = item.get(key)
+            if value:
+                return str(value)
+
+    for key in candidates:
+        try:
+            value = getattr(item, key, None)
+            if value:
+                return str(value)
+        except Exception:
+            pass
+
+    return None
+
+
+def get_rsl_integrity_reasons(
+    item: Any,
+    location_suffix_map: Optional[Dict[str, str]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    raw_rsl: Any = None,
+) -> List[str]:
+    """
+    Legacy-API: liefert die vollständigen Integrity-Reasons.
+    """
+    history = _extract_history_from_item(item)
+    if history is None or history.empty:
+        return ["missing_history_for_symbol"]
+
+    analysis = analyze_history_for_rsl_integrity(
+        history_df=history,
+        ticker=_extract_symbol_from_item(item),
+        country=_extract_country_from_item(item),
+        cfg=cfg,
+    )
+    return list(analysis.get("integrity_reasons", []) or [])
+
+
+def get_rsl_integrity_drop_reasons(
+    item: Any,
+    location_suffix_map: Optional[Dict[str, str]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    raw_rsl: Any = None,
+) -> List[str]:
+    """
+    Legacy-API: liefert nur die Legacy-Drop-Reasons.
+    """
+    history = _extract_history_from_item(item)
+    if history is None or history.empty:
+        return ["missing_history_for_symbol"]
+
+    analysis = analyze_history_for_rsl_integrity(
+        history_df=history,
+        ticker=_extract_symbol_from_item(item),
+        country=_extract_country_from_item(item),
+        cfg=cfg,
+    )
+    return list(analysis.get("drop_reasons", []) or [])
+
+
+def filter_stock_results_for_rsl_integrity(
+    results: Iterable[Any],
+    location_suffix_map: Optional[Dict[str, str]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+):
+    """
+    Legacy-API fuer final.py:
+    - behaelt nur Objekte ohne Hard-Fail
+    - markiert Problemfaelle optional am Objekt
+    """
+    filtered = []
+
+    for item in results:
+        history = _extract_history_from_item(item)
+        if history is None or history.empty:
+            continue
+
+        analysis = analyze_history_for_rsl_integrity(
+            history_df=history,
+            ticker=_extract_symbol_from_item(item),
+            country=_extract_country_from_item(item),
+            cfg=cfg,
+        )
+
+        has_hard_fail = bool(analysis.get("has_hard_fail", False))
+
+        try:
+            if isinstance(item, dict):
+                item["integrity_reasons"] = list(analysis.get("integrity_reasons", []) or [])
+                item["integrity_warnings"] = list(analysis.get("integrity_warnings", []) or [])
+                item["drop_reasons"] = list(analysis.get("drop_reasons", []) or [])
+                item["used_close_fallback"] = bool(analysis.get("used_close_fallback", False))
+                item["has_hard_fail"] = has_hard_fail
+            else:
+                setattr(item, "integrity_reasons", list(analysis.get("integrity_reasons", []) or []))
+                setattr(item, "integrity_warnings", list(analysis.get("integrity_warnings", []) or []))
+                setattr(item, "drop_reasons", list(analysis.get("drop_reasons", []) or []))
+                setattr(item, "used_close_fallback", bool(analysis.get("used_close_fallback", False)))
+                setattr(item, "has_hard_fail", has_hard_fail)
+        except Exception:
+            pass
+
+        if not has_hard_fail:
+            filtered.append(item)
+
+    return filtered
+
+
+def _infer_home_symbol(symbol: str, location_suffix_map: Optional[Dict[str, str]] = None) -> str:
+    """
+    Sehr defensiver Home-Market-Heuristik-Helper:
+    wenn kein Mapping greift, bleibt das Symbol unverändert.
+    """
+    if not symbol:
+        return symbol
+
+    if not location_suffix_map:
+        return symbol
+
+    # Heuristik: wenn Symbol bereits einen bekannten Suffix hat, 그대로 lassen
+    for suffix in location_suffix_map.values():
+        if suffix and str(symbol).endswith(str(suffix)):
+            return symbol
+
+    return symbol
+
+
+def build_home_market_rsl_audit(
+    results: Iterable[Any],
+    location_suffix_map: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """
+    Baut eine Audit-Tabelle für final.py.
+    Minimal, robust, ohne neue Fachlogik zu erfinden.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for item in results:
+        symbol = _extract_symbol_from_item(item) or ""
+        home_symbol = _infer_home_symbol(symbol, location_suffix_map)
+
+        if isinstance(item, dict):
+            row = dict(item)
+        else:
+            row = {}
+            for attr in [
+                "name", "land", "sector", "industry", "rsl", "kurs", "sma",
+                "ranking_integrity_status", "integrity_reasons", "drop_reasons",
+                "integrity_warnings", "used_close_fallback", "rsl_price_source",
+                "ranking_exclude_reason", "rsl_rang", "market_value"
+            ]:
+                try:
+                    row[attr] = getattr(item, attr, None)
+                except Exception:
+                    pass
+
+        row["symbol"] = symbol
+        row["home_symbol"] = home_symbol
+        row["is_home_symbol"] = (symbol == home_symbol)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_home_market_rsl_review_shortlist(
+    audit_df: pd.DataFrame,
+    top_rank: int = 300,
+) -> pd.DataFrame:
+    """
+    Minimaler Review-Shortlist-Builder für final.py.
+    """
+    if audit_df is None or audit_df.empty:
+        return pd.DataFrame()
+
+    df = audit_df.copy()
+
+    if "rsl_rang" in df.columns:
+        rank_mask = pd.to_numeric(df["rsl_rang"], errors="coerce").fillna(np.inf) <= top_rank
+        df = df.loc[rank_mask].copy()
+
+    review_mask = pd.Series(False, index=df.index)
+
+    for col in ["integrity_reasons", "drop_reasons", "integrity_warnings"]:
+        if col in df.columns:
+            review_mask = review_mask | df[col].astype(str).str.len().gt(2)
+
+    if "used_close_fallback" in df.columns:
+        review_mask = review_mask | df["used_close_fallback"].fillna(False).astype(bool)
+
+    if "is_home_symbol" in df.columns:
+        review_mask = review_mask | (~df["is_home_symbol"].fillna(True))
+
+    return df.loc[review_mask].copy()
         rows.append(row)
 
     audit_df = pd.DataFrame(rows)
