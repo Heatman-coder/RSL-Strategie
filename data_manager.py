@@ -109,7 +109,7 @@ class StockData:
     repair_applied: bool = False
     repair_method: str = ""
     repair_reason: str = ""
-    fallback_fraction: float = 0.0
+    fallback_fraction: Optional[float] = None
     rsl_price_source_mode: str = ""
 
     def to_dict(self):
