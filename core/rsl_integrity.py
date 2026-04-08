@@ -1145,10 +1145,6 @@ def get_rsl_integrity_reasons(
     if trust_score < 1:
         reasons.append("low_trust_score")
 
-    rsl_val = _coerce_float(_get_row_value(item, ["rsl"], 0.0))
-    if rsl_val <= 0:
-        reasons.append("no_valid_rsl_data")
-
     return list(dict.fromkeys(reasons))
 
 def get_history_status(item: Any, location_suffix_map: Dict[str, str]) -> str:
@@ -1175,7 +1171,6 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     
     # 1. UNREPARIERBARE SHOWSTOPPER (Immer Ausschluss)
     showstoppers = {
-        "no_valid_rsl_data",
         "critical_history_length",
         "critical_price_series_unreliable",
         "critical_stale_secondary_history"
@@ -1229,7 +1224,7 @@ def filter_stock_results_for_rsl_integrity(
     for stock in stock_results or []:
         assessment = assess_integrity(stock, location_suffix_map, config)
         
-        # Metadaten am Objekt persistieren
+        # ARCHITEKTUR-GUARDRAIL: RSL ist output-only und nie Ausschlussgrund.
         all_reasons = assessment.all_reasons
         try:
             setattr(stock, "rsl_eligible", assessment.rsl_eligible)
@@ -1238,14 +1233,15 @@ def filter_stock_results_for_rsl_integrity(
             setattr(stock, "repair_method", assessment.repair_method)
             setattr(stock, "repair_reason", assessment.repair_reason)
             setattr(stock, "fallback_fraction", assessment.fallback_fraction)
+            setattr(stock, "rsl_price_source_mode", assessment.repair_method)
         except AttributeError: pass
 
         if assessment.all_reasons:
             try:
                 setattr(stock, "integrity_warnings", all_reasons)
                 setattr(stock, "excluded_from_ranking", not assessment.is_valid)
-                # Guardrail: ranking_exclude_reason darf keine RSL-Werte enthalten
-                clean_exclude_reason = "; ".join([r for r in assessment.hard_fail_reasons if "rsl" not in r.lower() or r == "no_valid_rsl_data"])
+                # Guardrail: ranking_exclude_reason darf keinerlei RSL-Bezug enthalten
+                clean_exclude_reason = "; ".join([r for r in assessment.hard_fail_reasons if "rsl" not in r.lower()])
                 setattr(stock, "ranking_exclude_reason", clean_exclude_reason)
             except AttributeError: pass
 
