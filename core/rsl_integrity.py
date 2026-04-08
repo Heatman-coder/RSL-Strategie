@@ -1770,3 +1770,229 @@ def build_home_market_rsl_review_shortlist(
         shortlist = shortlist.sort_values(sort_cols, ascending=ascending, na_position="last")
 
     return shortlist.reset_index(drop=True)
+
+# ============================================================================
+# Legacy-Wrapper fuer final.py / bestehende Aufrufer
+# ============================================================================
+
+def _legacy_get(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def _legacy_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x).strip()]
+    if isinstance(value, tuple):
+        return [str(x) for x in value if str(x).strip()]
+    if isinstance(value, set):
+        return [str(x) for x in value if str(x).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _legacy_unique(seq: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for x in seq:
+        s = str(x).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def get_rsl_integrity_reasons(
+    item: Any,
+    location_suffix_map: Optional[Dict[str, str]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    raw_rsl: Any = None,
+) -> List[str]:
+    reasons: List[str] = []
+
+    reasons.extend(_legacy_list(_legacy_get(item, "integrity_reasons", [])))
+    reasons.extend(_legacy_list(_legacy_get(item, "hard_fail_reasons", [])))
+    reasons.extend(_legacy_list(_legacy_get(item, "warning_reasons", [])))
+    reasons.extend(_legacy_list(_legacy_get(item, "review_reasons", [])))
+    reasons.extend(_legacy_list(_legacy_get(item, "drop_reasons", [])))
+    reasons.extend(_legacy_list(_legacy_get(item, "integrity_warnings", [])))
+
+    if bool(_legacy_get(item, "used_close_fallback", False)):
+        reasons.append("close_fallback_used")
+
+    source = str(_legacy_get(item, "rsl_price_source", "") or "").strip()
+    if source:
+        reasons.append(f"rsl_price_source:{source}")
+
+    fallback_fraction = _legacy_get(item, "fallback_fraction", None)
+    try:
+        if fallback_fraction is not None:
+            reasons.append(f"fallback_fraction:{float(fallback_fraction):.4f}")
+    except Exception:
+        pass
+
+    return _legacy_unique(reasons)
+
+
+def get_rsl_integrity_drop_reasons(
+    item: Any,
+    location_suffix_map: Optional[Dict[str, str]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+    raw_rsl: Any = None,
+) -> List[str]:
+    hard = _legacy_list(_legacy_get(item, "hard_fail_reasons", []))
+    if hard:
+        return _legacy_unique(hard)
+
+    has_hard_fail = bool(_legacy_get(item, "has_hard_fail", False))
+    drop = _legacy_list(_legacy_get(item, "drop_reasons", []))
+
+    if has_hard_fail:
+        return _legacy_unique(drop or ["hard_fail"])
+
+    # Legacy-Fallback: falls nur gemischte integrity_reasons vorhanden sind
+    reasons = get_rsl_integrity_reasons(
+        item,
+        location_suffix_map=location_suffix_map,
+        cfg=cfg,
+        raw_rsl=raw_rsl,
+    )
+    hard_like = [
+        r for r in reasons
+        if any(token in str(r).lower() for token in [
+            "hard_fail",
+            "insufficient_history",
+            "too_much_close_fallback",
+            "invalid",
+            "broken",
+            "missing",
+        ])
+    ]
+    return _legacy_unique(hard_like)
+
+
+def filter_stock_results_for_rsl_integrity(
+    results: Any,
+    location_suffix_map: Optional[Dict[str, str]] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+):
+    if results is None:
+        return results
+
+    if isinstance(results, pd.DataFrame):
+        if len(results) == 0:
+            return results.copy()
+
+        def _row_ok(row: pd.Series) -> bool:
+            hard = bool(row.get("has_hard_fail", False))
+            if hard:
+                return False
+            drop = row.get("drop_reasons", [])
+            if isinstance(drop, str):
+                drop = [drop]
+            return len(drop or []) == 0
+
+        mask = results.apply(_row_ok, axis=1)
+        return results.loc[mask].copy()
+
+    if isinstance(results, (list, tuple)):
+        filtered = []
+        for item in results:
+            hard = bool(_legacy_get(item, "has_hard_fail", False))
+            drop = get_rsl_integrity_drop_reasons(
+                item,
+                location_suffix_map=location_suffix_map,
+                cfg=cfg,
+            )
+            if not hard and not drop:
+                filtered.append(item)
+        return filtered
+
+    return results
+
+
+def build_home_market_rsl_audit(
+    results,
+    location_suffix_map: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    if not results:
+        return pd.DataFrame(columns=[
+            "Ticker",
+            "Name",
+            "Land",
+            "Yahoo Symbol",
+            "RSL",
+            "RSL Rang",
+            "used_close_fallback",
+            "rsl_price_source",
+            "fallback_fraction",
+            "has_hard_fail",
+            "drop_reasons",
+            "integrity_reasons",
+        ])
+
+    for item in results:
+        ticker = _legacy_get(item, "original_ticker", _legacy_get(item, "ticker", ""))
+        yahoo_symbol = _legacy_get(item, "yahoo_symbol", ticker)
+        name = _legacy_get(item, "name", "")
+        land = _legacy_get(item, "land", _legacy_get(item, "country", ""))
+        rsl = _legacy_get(item, "rsl", _legacy_get(item, "RSL", np.nan))
+        rsl_rang = _legacy_get(item, "rsl_rang", _legacy_get(item, "RSL_Rang", 0))
+        used_close_fallback = bool(_legacy_get(item, "used_close_fallback", False))
+        rsl_price_source = str(_legacy_get(item, "rsl_price_source", "") or "")
+        fallback_fraction = _legacy_get(item, "fallback_fraction", None)
+        has_hard_fail = bool(_legacy_get(item, "has_hard_fail", False))
+        drop_reasons = get_rsl_integrity_drop_reasons(item, location_suffix_map=location_suffix_map)
+        integrity_reasons = get_rsl_integrity_reasons(item, location_suffix_map=location_suffix_map)
+
+        rows.append({
+            "Ticker": ticker,
+            "Name": name,
+            "Land": land,
+            "Yahoo Symbol": yahoo_symbol,
+            "RSL": rsl,
+            "RSL Rang": rsl_rang,
+            "used_close_fallback": used_close_fallback,
+            "rsl_price_source": rsl_price_source,
+            "fallback_fraction": fallback_fraction,
+            "has_hard_fail": has_hard_fail,
+            "drop_reasons": ", ".join(drop_reasons),
+            "integrity_reasons": ", ".join(integrity_reasons),
+        })
+
+    audit_df = pd.DataFrame(rows)
+
+    if "RSL Rang" in audit_df.columns:
+        audit_df = audit_df.sort_values(
+            by=["RSL Rang", "RSL"],
+            ascending=[True, False],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    return audit_df
+
+
+def build_home_market_rsl_review_shortlist(
+    audit_df: pd.DataFrame,
+    top_rank: int = 300,
+) -> pd.DataFrame:
+    if audit_df is None or len(audit_df) == 0:
+        return pd.DataFrame(columns=list(audit_df.columns) if isinstance(audit_df, pd.DataFrame) else [])
+
+    work = audit_df.copy()
+
+    if "RSL Rang" in work.columns:
+        work = work.loc[pd.to_numeric(work["RSL Rang"], errors="coerce") <= float(top_rank)].copy()
+
+    if "drop_reasons" in work.columns:
+        work = work.loc[work["drop_reasons"].fillna("").astype(str).str.strip() == ""].copy()
+
+    if "integrity_reasons" in work.columns:
+        work = work.loc[work["integrity_reasons"].fillna("").astype(str).str.strip() != ""].copy()
+
+    return work.reset_index(drop=True)
