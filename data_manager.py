@@ -525,7 +525,7 @@ class MarketDataManager:
             if hist.empty: return None
             f = self._get_currency_factor(ticker)
             hist_adj = hist.copy()
-            for col in ['Open', 'High', 'Low', 'Close']:
+            for col in ['Open', 'High', 'Low', 'Close', 'Adj Close']:
                 if col in hist_adj.columns: hist_adj[col] *= f
             
             sma_len = int(self.config.get('sma_length', 130))
@@ -536,6 +536,7 @@ class MarketDataManager:
             repaired_df = analysis['history']
             clean_col = analysis['rsl_price_column']
             clean_series = repaired_df[clean_col].ffill()
+            used_fallback = bool(analysis.get('used_close_fallback', False))
             
             curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
             sma = analysis.get('rsl_sma', curr)
@@ -545,7 +546,10 @@ class MarketDataManager:
 
             vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
             flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
+            
             flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
+            flags['used_close_fallback'] = used_fallback
+            flags['rsl_price_source'] = analysis.get('diagnostics', {}).get('rsl_price_source_mode', 'adj_close')
             
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
