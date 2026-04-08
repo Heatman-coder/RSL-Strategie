@@ -81,6 +81,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Trigger für "Adj Close weicht stark von Close ab"
     "adj_close_gap_warn_threshold": 0.08,   # 8 %
     "adj_close_gap_hard_threshold": 0.25,   # 25 %
+    "adj_close_gap_hard_threshold_ratio": 2.0, # Faktor 2.0 (oder 0.5) für extreme Abweichung
+    "global_scale_fallback_min_fraction": 0.20, # Mindestanteil Tage für globalen Fallback
 
     # Wenn die beobachtete Anpassung viel größer ist als die Dividende erklärt
     "dividend_multiplier_tolerance": 0.08,  # 8 %-Punkte Abweichung
@@ -417,17 +419,9 @@ def validate_basic_history_integrity(
     diagnostics["max_flat_run"] = max_flat_run
 
     if max_flat_run >= cfg["flat_run_hard"]:
-        reasons.add("flatline_price_series", "hard_fail")
-        reasons.add("critical_stale_data", "hard_fail")
+        reasons.add("stale_price_series_extreme_flat_run", "hard_fail")
     elif max_flat_run >= cfg["flat_run_warn"]:
         reasons.add("stale_price_series_flat_run", "warning")
-
-    # Illiquid check: unique prices ratio (marktstrukturelle Prüfung)
-    if len(valid_price) > 30:
-        unique_ratio = float(valid_price.nunique() / len(valid_price))
-        diagnostics["unique_price_ratio"] = unique_ratio
-        if unique_ratio < 0.05: # Weniger als 1 neuer Preis pro Monat im Schnitt
-            reasons.add("illiquid_price_series", "hard_fail")
 
     returns = valid_price.pct_change().replace([np.inf, -np.inf], np.nan)
     if len(returns.dropna()) > 0:
@@ -436,17 +430,6 @@ def validate_basic_history_integrity(
 
         if max_abs_ret >= cfg["daily_return_hard_threshold"]:
             reasons.add("extreme_price_discontinuity", "hard_fail")
-            
-            # Jump after flatline: Prüfung auf Sprünge nach Stagnationsphasen
-            if len(returns) > 15:
-                jump_indices = returns[returns.abs() > 0.15].index
-                for jump_dt in jump_indices:
-                    loc = returns.index.get_loc(jump_dt)
-                    if loc >= 10:
-                        prev_prices = valid_price.iloc[loc-10 : loc]
-                        if _max_consecutive_equal(prev_prices) >= 7:
-                            reasons.add("jump_after_flatline", "hard_fail")
-                            break
         elif max_abs_ret >= cfg["daily_return_warn_threshold"]:
             reasons.add("large_price_discontinuity", "warning")
 
@@ -724,24 +707,28 @@ def build_rsl_price_series(
         reasons.add("adjclose_missing_close_used", "review")
 
     used_close_fallback = False
+    global_fallback_reason = ""
     
-    # --- NEU: GLOBALER SCALE-CHECK (Event-unabhängig) ---
-    # Wenn Adj Close massiv von Close abweicht (Yahoo-Bug), umschalten bevor wir Fenster prüfen
+    # --- GLOBALER SCALE-CHECK (Yahoo Floor Bug Detektion) ---
+    # ARCHITEKTUR-REGEL: Wir vergleichen URSACHEN (Skalierung), nicht RSL-Symptome.
     if close_col is not None and adj_col is not None:
         c_vals = pd.to_numeric(df[close_col], errors="coerce")
         a_vals = pd.to_numeric(df[adj_col], errors="coerce")
         
-        # Prüfe das Median-Verhältnis über die gesamte Historie
-        # (Ratio > 2.0 oder < 0.5 deutet auf globalen Floor-Fehler hin)
+        # Ratio-Analyse über die gesamte verfügbare Historie
         ratio_series = (c_vals / a_vals.replace(0, np.nan)).dropna()
-        global_median_ratio = float(ratio_series.median()) if not ratio_series.empty else 1.0
-        
-        if global_median_ratio > 2.0 or global_median_ratio < 0.5:
-            df["rsl_price"] = c_vals
-            df["rsl_price_source"] = "close_global_scale_fallback"
-            used_close_fallback = True
-            reasons.add("extreme_adjclose_close_gap", "warning")
-            # In diesem Fall brauchen wir keine Fenster-Reparatur mehr
+        if len(ratio_series) > 30:
+            global_median_ratio = float(ratio_series.median())
+            extreme_ratio_mask = (ratio_series > cfg["adj_close_gap_hard_threshold_ratio"]) | (ratio_series < 1.0 / cfg["adj_close_gap_hard_threshold_ratio"])
+            extreme_fraction = float(extreme_ratio_mask.mean())
+            
+            # Wenn Abweichung persistent (>20% der Tage) und extrem (Median), umschalten.
+            if extreme_fraction >= cfg["global_scale_fallback_min_fraction"] and (global_median_ratio > 1.5 or global_median_ratio < 0.6):
+                df["rsl_price"] = c_vals
+                df["rsl_price_source"] = "close_global_scale_fallback"
+                used_close_fallback = True
+                global_fallback_reason = "extreme_adjclose_close_gap_global"
+                reasons.add(global_fallback_reason, "warning")
 
     # Wenn beide vorhanden sind, Dividenden-/Adjustierungsprüfung
     if not used_close_fallback and close_col is not None and adj_col is not None:
@@ -779,14 +766,12 @@ def build_rsl_price_series(
                     w_close = pd.to_numeric(df[close_col].iloc[w_start:w_end], errors="coerce")
                     w_adj = pd.to_numeric(df[adj_col].iloc[w_start:w_end], errors="coerce")
                     
-                    ratio_series = (w_close / w_adj.replace(0, np.nan)).dropna()
-                    median_ratio = float(ratio_series.median()) if not ratio_series.empty else 1.0
+                    ratio_series_win = (w_close / w_adj.replace(0, np.nan)).dropna()
+                    median_ratio_win = float(ratio_series_win.median()) if not ratio_series_win.empty else 1.0
                     
-                    # Wenn die lokale Ratio massiv abweicht, korrigieren wir den globalen Floor davor
-                    is_global_bug = median_ratio > 2.0 or median_ratio < 0.5
-                    
-                    if is_global_bug:
-                        start = 0 # Gesamte Historie davor korrigieren
+                    # Falls lokale Ratio massiv abweicht, korrigieren wir den gesamten Floor davor (Yahoo Floor Bug)
+                    if median_ratio_win > 2.0 or median_ratio_win < 0.5:
+                        start = 0
                         repair_mode = "global_pre_ex_fallback"
                     else:
                         start = max(0, loc - int(cfg["dividend_window_before"]))
@@ -835,9 +820,14 @@ def build_rsl_price_series(
         elif fallback_frac >= cfg["fallback_fraction_warn"]:
             reasons.add("substantial_close_fallback_in_rsl_series", "warning")
 
-    # Ermittle den dominanten Modus der Preisquelle
+    # Ermittle den dominanten Modus der Preisquelle für die Dokumentation
     source_counts = df["rsl_price_source"].value_counts()
-    primary_source = str(source_counts.idxmax()) if not source_counts.empty else "unknown"
+    primary_source = str(source_counts.idxmax()) if not source_counts.empty else "adj_close"
+    
+    # Reparatur-Metadaten für StockData-Objekt aufbereiten
+    repair_applied = used_close_fallback
+    repair_method = primary_source
+    repair_reason = global_fallback_reason or ("; ".join(reasons.warning_reasons) if used_close_fallback else "")
 
     return PriceSeriesBuildResult(
         history=df,
@@ -846,7 +836,11 @@ def build_rsl_price_series(
         reasons=reasons,
         diagnostics={
             **diagnostics,
-            "rsl_price_source_mode": primary_source
+            "fallback_fraction": fallback_frac,
+            "rsl_price_source_mode": primary_source,
+            "repair_applied": repair_applied,
+            "repair_method": repair_method,
+            "repair_reason": repair_reason
         },
     )
 
@@ -896,19 +890,6 @@ def analyze_history_for_rsl_integrity(
 
     if len(df) < int(cfg["min_history_rows_for_rsl"]):
         reasons.add("insufficient_history_for_rsl_window", "hard_fail")
-
-    # WICHTIG:
-    # kein Hard-Fail nur wegen hohem RSL!
-    # Aber wenn RSL extrem hoch ist UND Datenprobleme vorliegen, markieren wir den Zusammenhang.
-    if np.isfinite(rsl_value):
-        diagnostics["rsl_value"] = rsl_value
-        diagnostics["rsl_sma"] = sma_value
-
-        if rsl_value > 5:
-            if reasons.has_any():
-                reasons.add("extreme_rsl_with_detected_data_issue", "review")
-            else:
-                reasons.add("extreme_rsl_without_detected_cause_review_needed", "review")
 
     result = {
         "history": df,
@@ -1078,6 +1059,7 @@ class IntegrityAssessment:
     repair_applied: bool = False
     repair_method: str = ""
     repair_reason: str = ""
+    fallback_fraction: float = 0.0
 
     def add_hard_fail(self, reason: str) -> None:
         if reason not in self.hard_fail_reasons:
@@ -1147,12 +1129,6 @@ def get_rsl_integrity_reasons(
         return analysis.get("drop_reasons", [])
 
     reasons: List[str] = []
-    
-    # Übernehme bereits bei der Analyse/Download gefundene Gründe vom Objekt
-    existing_reasons = _get_row_value(item, ["integrity_warnings", "integrity_reasons"], [])
-    if isinstance(existing_reasons, list):
-        reasons.extend([str(r) for r in existing_reasons])
-
     trust_score = int(_get_row_value(item, ["trust_score"], 3))
     flag_stale = str(_get_row_value(item, ["flag_stale"], "OK")).upper()
     flag_hist = str(_get_row_value(item, ["flag_history_length"], "OK")).upper()
@@ -1195,23 +1171,14 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     assessment = IntegrityAssessment()
     reasons = get_rsl_integrity_reasons(item, location_suffix_map, config)
     history_status = get_history_status(item, location_suffix_map)
-    
-    # Metadaten vom MarketDataManager / StockData abrufen
-    used_repair = bool(_get_row_value(item, ["used_close_fallback"], False))
-    final_flag_scale = str(_get_row_value(item, ["flag_scale"], "OK")).upper()
-    final_trust = int(_get_row_value(item, ["trust_score"], 3))
-    source_mode = str(_get_row_value(item, ["rsl_price_source"], "adj_close"))
+    used_repair = getattr(item, 'used_close_fallback', False)
     
     # 1. UNREPARIERBARE SHOWSTOPPER (Immer Ausschluss)
     showstoppers = {
         "no_valid_rsl_data",
         "critical_history_length",
         "critical_price_series_unreliable",
-        "critical_stale_secondary_history",
-        "flatline_price_series",
-        "critical_stale_data",
-        "jump_after_flatline",
-        "illiquid_price_series"
+        "critical_stale_secondary_history"
     }
     
     # 2. REPARIERBARE FEHLER (Ausschluss nur, wenn Reparatur nicht erfolgte)
@@ -1228,12 +1195,8 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
         if r in showstoppers:
             assessment.add_hard_fail(r)
         elif r in repairable_issues:
-            # Entscheidend ist nicht der Fehler, sondern die Qualität danach
-            if used_repair and final_flag_scale == "OK" and final_trust >= 2:
-                assessment.add_warning(f"fixed_{r}")
-                assessment.repair_applied = True
-                assessment.repair_reason = r
-                assessment.repair_method = source_mode
+            if used_repair:
+                assessment.add_warning(f"repaired_{r}")
             else:
                 assessment.add_hard_fail(r)
         elif r == "critical_stale_data":
@@ -1248,7 +1211,7 @@ def assess_integrity(item: Any, location_suffix_map: Dict[str, str], config: Dic
     if not assessment.rsl_eligible:
         assessment.ranking_integrity_status = "not_eligible_unreliable"
         assessment.ranking_exclude_reason = "; ".join(assessment.hard_fail_reasons)
-    elif assessment.repair_applied:
+    elif used_repair:
         assessment.ranking_integrity_status = "eligible_repaired"
     else:
         assessment.ranking_integrity_status = "eligible_original"
@@ -1266,18 +1229,24 @@ def filter_stock_results_for_rsl_integrity(
     for stock in stock_results or []:
         assessment = assess_integrity(stock, location_suffix_map, config)
         
-        # Metadaten am Objekt setzen
+        # Metadaten am Objekt persistieren
         all_reasons = assessment.all_reasons
         try:
             setattr(stock, "rsl_eligible", assessment.rsl_eligible)
             setattr(stock, "ranking_integrity_status", assessment.ranking_integrity_status)
+            setattr(stock, "repair_applied", assessment.repair_applied)
+            setattr(stock, "repair_method", assessment.repair_method)
+            setattr(stock, "repair_reason", assessment.repair_reason)
+            setattr(stock, "fallback_fraction", assessment.fallback_fraction)
         except AttributeError: pass
 
         if assessment.all_reasons:
             try:
                 setattr(stock, "integrity_warnings", all_reasons)
                 setattr(stock, "excluded_from_ranking", not assessment.is_valid)
-                setattr(stock, "ranking_exclude_reason", assessment.ranking_exclude_reason)
+                # Guardrail: ranking_exclude_reason darf keine RSL-Werte enthalten
+                clean_exclude_reason = "; ".join([r for r in assessment.hard_fail_reasons if "rsl" not in r.lower() or r == "no_valid_rsl_data"])
+                setattr(stock, "ranking_exclude_reason", clean_exclude_reason)
             except AttributeError: pass
 
         if assessment.rsl_eligible:
@@ -1292,11 +1261,15 @@ def filter_stock_results_for_rsl_integrity(
                 "land": _get_row_value(stock, ["land"], ""),
                 "history_status": get_history_status(stock, location_suffix_map),
                 "integrity_reasons": ", ".join(all_reasons),
-                "is_valid": assessment.is_valid, # Legacy kompatibel
+                "is_valid": assessment.is_valid, 
                 "rsl_eligible": assessment.rsl_eligible,
                 "ranking_integrity_status": assessment.ranking_integrity_status,
                 "excluded_from_ranking": not assessment.rsl_eligible,
                 "ranking_exclude_reason": assessment.ranking_exclude_reason,
+                "repair_applied": assessment.repair_applied,
+                "repair_method": assessment.repair_method,
+                "repair_reason": assessment.repair_reason,
+                "fallback_fraction": assessment.fallback_fraction,
                 "needs_review": assessment.needs_review,
                 "hard_fail_reasons": "; ".join(assessment.hard_fail_reasons),
                 "warning_reasons": "; ".join(assessment.warning_reasons),
