@@ -39,15 +39,15 @@ class StockData:
     kurs: float
     sma: float
     rsl: float
+
     atr: float = 0.0
     atr_limit: float = 0.0
     atr_sell_limit: float = 0.0
-   
     avg_volume_eur: float = 0.0
     primary_liquidity_eur: float = 0.0
     primary_liquidity_symbol: str = ""
     primary_liquidity_basis: str = ""
-   
+
     # DATA QUALITY FLAGS
     flag_gap: str = "OK"
     flag_liquidity: str = "OK"
@@ -64,14 +64,14 @@ class StockData:
     trend_sma50: str = "OK"
     trend_smoothness: float = 0.0
     trend_quality: str = "N/A"
-   
-    # TWSS (Time-Weighted Spike Score)
+
+    # TWSS
     twss_score: float = 0.0
     twss_date: str = ""
     twss_days_ago: int = 0
     twss_raw_pct: float = 0.0
     twss_orientation: str = "NIEDRIG"
-   
+
     # Momentum & Ranking
     rsl_change_1w: float = 0.0
     rsl_past: Optional[float] = None
@@ -88,7 +88,6 @@ class StockData:
     peer_spread: float = 0.0
     high_52w: float = 0.0
     distance_52w_high_pct: Optional[float] = None
-   
     trust_score: int = 0
     rsl_rang: int = 0
     mktcap_rang: int = 0
@@ -96,9 +95,10 @@ class StockData:
     source_etf: str = ""
     listing_source: str = ""
     market_cap: float = 0.0
-   
     first_seen_date: str = ""
     is_new: bool = False
+
+    # RSL INTEGRITY / RANKING
     integrity_warnings: List[str] = field(default_factory=list)
     excluded_from_ranking: bool = False
     ranking_exclude_reason: str = ""
@@ -106,11 +106,10 @@ class StockData:
     ranking_integrity_status: str = "eligible_original"
     used_close_fallback: bool = False
     rsl_price_source: str = "adj_close"
+    fallback_fraction: Optional[float] = None
     repair_applied: bool = False
     repair_method: str = ""
     repair_reason: str = ""
-    fallback_fraction: Optional[float] = None
-    rsl_price_source_mode: str = ""
 
     def to_dict(self):
         return asdict(self)
