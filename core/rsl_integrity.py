@@ -1040,10 +1040,6 @@ def get_rsl_integrity_reasons(
     config: Optional[Dict[str, Any]] = None,
     raw_rsl: Any = None,
 ) -> List[str]:
-    """
-    Legacy-/Kompatibilitätsfunktion.
-    Liefert ALLE Integritäts-Reasons für ein Item.
-    """
     ticker, country, history = _extract_item_meta(item)
     if history is None or not isinstance(history, pd.DataFrame) or history.empty:
         return []
@@ -1063,10 +1059,6 @@ def get_rsl_integrity_drop_reasons(
     config: Optional[Dict[str, Any]] = None,
     raw_rsl: Any = None,
 ) -> List[str]:
-    """
-    Legacy-/Kompatibilitätsfunktion.
-    Wichtig: Nur echte Hard-Fails zurückgeben. Kein RSL-Symptom darf alleiniger Ausschlussgrund sein.
-    """
     ticker, country, history = _extract_item_meta(item)
     if history is None or not isinstance(history, pd.DataFrame) or history.empty:
         return []
@@ -1082,10 +1074,6 @@ def get_rsl_integrity_drop_reasons(
 
 
 def _clean_hard_fail_reasons(reasons: List[str]) -> List[str]:
-    """
-    Entfernt reine RSL-Symptom-Reasons.
-    Datenursachen bleiben erhalten.
-    """
     blocked = {
         "no_valid_rsl_data",
         "invalid_rsl_value",
@@ -1108,15 +1096,6 @@ def filter_stock_results_for_rsl_integrity(
     location_suffix_map: Optional[Dict[str, Any]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Any], pd.DataFrame]:
-    """
-    Legacy-/Kompatibilitätsfunktion für final.py.
-
-    Regeln:
-    - Ausschluss nur bei echten Hard-Fail-Datenursachen.
-    - Hoher / fehlender / auffälliger RSL ist NIE alleiniger Ausschlussgrund.
-    - Falls Close-Fallback / Reparatur verwendet wurde und kein Hard-Fail vorliegt:
-      -> eligible_repaired
-    """
     if not results:
         return results, pd.DataFrame()
 
@@ -1212,10 +1191,6 @@ def build_home_market_rsl_audit(
     results: List[Any],
     location_suffix_map: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
-    """
-    Baut ein Audit-DataFrame für spätere manuelle Prüfung.
-    Minimal-kompatibel für final.py.
-    """
     rows: List[Dict[str, Any]] = []
 
     for stock in results or []:
@@ -1247,11 +1222,6 @@ def build_home_market_rsl_review_shortlist(
     audit_df: pd.DataFrame,
     top_rank: int = 300,
 ) -> pd.DataFrame:
-    """
-    Erstellt eine kompakte Review-Liste:
-    - bevorzugt problematische / reparierte Fälle
-    - optional auf Top-Rank beschränkt
-    """
     if audit_df is None or len(audit_df) == 0:
         return pd.DataFrame()
 
