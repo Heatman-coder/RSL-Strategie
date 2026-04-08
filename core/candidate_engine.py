@@ -267,7 +267,7 @@ def suggest_portfolio_candidates(
             # Kriterium: Positive RSL-Änderung (>1%) UND positive Beschleunigung (3M > 6M/12M)
             # UPDATE: Zusätzlicher Schutz durch R²-Smoothness (>0.6) und Volatilitäts-Cap (Z_Vol < 1.5)
             r2_val = _coerce_float(stock.trend_smoothness)
-            if _coerce_float(stock.rsl_change_1w) > 0.01 and _coerce_float(stock.mom_accel) > 0:
+            if _coerce_float(stock.rsl_change_1w) > 0.0001 and _coerce_float(stock.mom_accel) > 0:
                 if r2_val > 0.6 and zs['z_vol'] < 1.5:
                     is_rising_star = True
         
@@ -578,8 +578,8 @@ def _calculate_institutional_score(stock: Any, zs: Dict[str, float], config: Dic
         penalties.append(0.10)
         
     # Distance 52W High Penalty (wenn zu weit weg)
-    if dist > 20.0:
-        penalties.append(0.05 + (dist - 20.0)/100.0)
+    if dist > 0.20:
+        penalties.append(0.05 + (dist - 0.20))
 
     # Log-Space Summation
     log_penalty_sum = sum(math.log1p(-min(0.99, p)) for p in penalties)

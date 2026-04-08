@@ -272,8 +272,8 @@ def summarize_integrity_flags(df: pd.DataFrame) -> dict:
     """Erstellt eine Statistik über die neuen Integritäts-Flags im DataFrame."""
     return {
         "total_rows": int(len(df)),
-        "hard_fail_count": int((df["is_valid"] == False).sum()) if "is_valid" in df.columns else 0,
-        "review_count": int((df["needs_review"] == True).sum()) if "needs_review" in df.columns else 0,
+        "hard_fail_count": int((df["excluded_from_ranking"] == True).sum()) if "excluded_from_ranking" in df.columns else 0,
+        "review_count": int(df["ranking_integrity_status"].astype(str).str.contains("review", case=False).sum()) if "ranking_integrity_status" in df.columns else 0,
         "warning_count": int(
             df["warning_reasons"].fillna("").astype(str).str.len().gt(0).sum()
         ) if "warning_reasons" in df.columns else 0,

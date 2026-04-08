@@ -796,7 +796,8 @@ def build_rsl_price_series(
     if len(valid_rsl_price.dropna()) < min_rows:
         reasons.add("insufficient_history_for_rsl", "hard_fail")
 
-    rsl_series = _compute_rsl_from_series(valid_rsl_price, int(cfg["rsl_sma_window"]))
+    # Berechne RSL auf ffilled Preisen, um Lücken in der Historie zu überbrücken
+    rsl_series = _compute_rsl_from_series(valid_rsl_price.ffill(), int(cfg["rsl_sma_window"]))
     df["rsl_value"] = rsl_series
 
     if len(rsl_series.dropna()) == 0 and len(valid_rsl_price.dropna()) >= min_rows:
@@ -809,6 +810,59 @@ def build_rsl_price_series(
         reasons=reasons,
         diagnostics=diagnostics,
     )
+
+
+def analyze_history_for_rsl_integrity(
+    history_df: pd.DataFrame, ticker: str = "", cfg: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Zentrale Einstiegsfunktion für den DataManager.
+    Baut die RSL-Preisserie auf und gibt Metadaten zurück.
+    """
+    res = build_rsl_price_series(history_df, cfg)
+    
+    # SMA für den DataManager extrahieren
+    sma_window = int((cfg or {}).get("rsl_sma_window", 130))
+    # Wir nehmen die bereinigte Preisserie (ffill für Robustheit)
+    price_col = res.rsl_price_column
+    price_series = res.history[price_col].ffill()
+    
+    sma_series = _rolling_sma(price_series, sma_window)
+    last_sma = float(sma_series.iloc[-1]) if not sma_series.dropna().empty else 0.0
+    
+    # Diagnostics aufbereiten für DataManager Erwartungen
+    diag = dict(res.diagnostics)
+    # DataManager erwartet 'rsl_price_source_mode' für die Anzeige
+    source_series = res.history.get("rsl_price_source")
+    if source_series is not None and not source_series.dropna().empty:
+        diag['rsl_price_source_mode'] = str(source_series.dropna().iloc[-1])
+    else:
+        diag['rsl_price_source_mode'] = diag.get('rsl_price_source', 'adj_close')
+
+    # Den RSL-Wert extrahieren (robuster Umgang mit NaNs am Ende durch ffill)
+    rsl_series = res.history.get("rsl_value")
+    last_rsl = 0.0
+    rsl_past = 0.0
+    rsl_change = 0.0
+    
+    if rsl_series is not None and not rsl_series.dropna().empty:
+        clean_rsl = rsl_series.ffill()
+        last_rsl = float(clean_rsl.iloc[-1])
+        if len(clean_rsl) > 5:
+            rsl_past = float(clean_rsl.iloc[-6])
+            rsl_change = last_rsl - rsl_past
+
+    return {
+        'history': res.history,
+        'rsl_price_column': res.rsl_price_column,
+        'used_close_fallback': res.used_close_fallback,
+        'integrity_reasons': res.reasons.all_reasons(),
+        'rsl_sma': last_sma,
+        'rsl_value': last_rsl,
+        'rsl_past': rsl_past,
+        'rsl_change_1w': rsl_change,
+        'diagnostics': diag
+    }
 
 
 # ============================================================================
@@ -864,6 +918,20 @@ def evaluate_stock_rsl_integrity(
     }
 
     if history is None or not isinstance(history, pd.DataFrame) or len(history) == 0:
+        # Falls das Item bereits Metadaten hat (vom DataManager), nutzen wir diese
+        existing_status = str(_get_row_value(item, ["ranking_integrity_status"], "")).lower()
+        if existing_status and existing_status != "missing_history":
+            result["ranking_integrity_status"] = existing_status
+            result["excluded_from_ranking"] = bool(_get_row_value(item, ["excluded_from_ranking"], False))
+            result["ranking_exclude_reason"] = str(_get_row_value(item, ["ranking_exclude_reason"], ""))
+            result["rsl_price_source"] = str(_get_row_value(item, ["rsl_price_source"], "missing"))
+            result["repair_applied"] = bool(_get_row_value(item, ["repair_applied"], False))
+            result["used_close_fallback"] = bool(_get_row_value(item, ["used_close_fallback"], False))
+            result["fallback_fraction"] = _get_row_value(item, ["fallback_fraction"])
+            result["integrity_warnings"] = _safe_list(_get_row_value(item, ["integrity_warnings", "integrity_reasons"], []))
+            result["drop_reasons"] = _unique_keep_order(result["integrity_warnings"])
+            return result
+            
         if _looks_like_foreign_secondary_listing(ticker, country, cfg):
             result["review_reasons"] = ["foreign_secondary_listing_possible"]
             result["integrity_warnings"] = ["foreign_secondary_listing_possible"]
@@ -978,7 +1046,12 @@ def filter_stock_results_for_rsl_integrity(
         )
 
         updated_stock = _apply_integrity_fields_to_item(stock, info)
-        audit_rows.append(_audit_row_from_item(updated_stock))
+        
+        # Nur Ticker mit echten Auffälligkeiten oder Ausschlussgründen im Audit-Log vermerken
+        is_issue = info.get("excluded_from_ranking") or info.get("used_close_fallback") or len(info.get("integrity_warnings", [])) > 0
+        
+        if is_issue:
+            audit_rows.append(_audit_row_from_item(updated_stock))
 
         if not info.get("excluded_from_ranking", False):
             valid_results.append(updated_stock)
@@ -1070,6 +1143,11 @@ def _audit_row_from_item(stock: Any) -> Dict[str, Any]:
 def build_rsl_integrity_audit_df(results: List[Any]) -> pd.DataFrame:
     rows = [_audit_row_from_item(stock) for stock in (results or [])]
     return pd.DataFrame(rows)
+
+
+def build_home_market_rsl_audit(results: List[Any], location_suffix_map: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """Alias für build_rsl_integrity_audit_df für Kompatibilität mit final.py."""
+    return build_rsl_integrity_audit_df(results)
 
 
 def build_home_market_rsl_review_shortlist(

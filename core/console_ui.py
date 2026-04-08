@@ -217,16 +217,16 @@ def _build_main_export_dataframe(
                 pass
 
         atr_limit_value = d['atr_limit']
-        if (pd.isna(atr_limit_value) or atr_limit_value == 0.0) and s.atr and s.kurs:
+        if (pd.isna(atr_limit_value) or atr_limit_value == 0.0) and (s.atr and not pd.isna(s.atr)) and s.kurs:
             try:
-                atr_limit_value = float(s.kurs) - (1.0 * float(s.atr))
+                atr_limit_value = float(s.kurs) - (float(config.get('atr_multiplier_limit', 1.0) or 1.0) * float(s.atr))
             except Exception:
                 atr_limit_value = np.nan
 
         atr_sell_limit_value = d['atr_sell_limit']
-        if (pd.isna(atr_sell_limit_value) or atr_sell_limit_value == 0.0) and s.atr and s.kurs:
+        if (pd.isna(atr_sell_limit_value) or atr_sell_limit_value == 0.0) and (s.atr and not pd.isna(s.atr)) and s.kurs:
             try:
-                atr_sell_limit_value = float(s.kurs) + (settings_catalog_core.USER_SETTINGS_DEFAULTS['atr_multiplier_exit'] * float(s.atr))
+                atr_sell_limit_value = float(s.kurs) + (float(config.get('atr_multiplier_exit', 0.15) or 0.15) * float(s.atr))
             except Exception:
                 atr_sell_limit_value = np.nan
 
