@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -13,10 +12,9 @@ RSL-Integritätslogik mit Fokus auf URSACHEN statt Symptomen.
 
 PHILOSOPHIE
 -----------
-Ein hoher RSL-Wert ist kein Ausschlussgrund an sich.
-Wenn ein RSL-Wert unplausibel hoch erscheint, muss die Datenursache
-identifiziert werden. Nur die Ursache darf zu Review / Warning /
-Hard-Fail führen.
+Ein hoher RSL-Wert ist kein Ausschlussgrund an sich. Wenn ein RSL-Wert
+unplausibel hoch erscheint, muss die Datenursache identifiziert werden.
+Nur die Ursache darf zu Review / Warning / Hard-Fail führen.
 
 Diese Datei stellt daher Funktionen bereit für:
 - Erkennung problematischer Preisserien
@@ -34,7 +32,9 @@ RÜCKWÄRTSKOMPATIBILITÄT
 ERWARTETE DATEN
 ---------------
 Die Funktionen sind defensiv gebaut und akzeptieren mehrere typische
-Spaltennamen. Für historische Kursdaten werden u. a. erkannt:
+Spaltennamen.
+
+Für historische Kursdaten werden u. a. erkannt:
 
 Datum:
 - Date
@@ -64,8 +64,8 @@ Es wird eine "rsl_price"-Serie konstruiert:
 WICHTIG
 -------
 Diese Datei entfernt NICHT automatisch Werte nur wegen eines hohen RSL.
-Sie markiert stattdessen die Ursachen. Hard-Fails entstehen nur bei
-echten Datenproblemen.
+Sie markiert stattdessen die Ursachen.
+Hard-Fails entstehen nur bei echten Datenproblemen.
 """
 
 
@@ -81,8 +81,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Trigger für "Adj Close weicht stark von Close ab"
     "adj_close_gap_warn_threshold": 0.08,   # 8 %
     "adj_close_gap_hard_threshold": 0.25,   # 25 %
-    "adj_close_gap_hard_threshold_ratio": 2.0, # Faktor 2.0 (oder 0.5) für extreme Abweichung
-    "global_scale_fallback_min_fraction": 0.20, # Mindestanteil Tage für globalen Fallback
+    "adj_close_gap_hard_threshold_ratio": 2.0,  # Faktor 2.0 (oder 0.5) für extreme Abweichung
+    "global_scale_fallback_min_fraction": 0.20,  # Mindestanteil Tage für globalen Fallback
 
     # Wenn die beobachtete Anpassung viel größer ist als die Dividende erklärt
     "dividend_multiplier_tolerance": 0.08,  # 8 %-Punkte Abweichung
@@ -134,15 +134,25 @@ class IntegrityReasonSet:
             if reason not in self.review_reasons:
                 self.review_reasons.append(reason)
 
+    def extend(self, other: "IntegrityReasonSet") -> None:
+        for r in other.hard_fail_reasons:
+            self.add(r, "hard_fail")
+        for r in other.warning_reasons:
+            self.add(r, "warning")
+        for r in other.review_reasons:
+            self.add(r, "review")
+
     def all_reasons(self) -> List[str]:
         return self.hard_fail_reasons + self.warning_reasons + self.review_reasons
 
     def legacy_drop_reasons(self) -> List[str]:
         """
-        Legacy-Verhalten:
-        Historisch wurden verschiedene Reasons pauschal als drop_reasons geführt.
+        Legacy-Verhalten: Historisch wurden verschiedene Reasons pauschal
+        als drop_reasons geführt.
+
         Für Rückwärtskompatibilität geben wir hier ALLE Reasons zurück.
-        Die eigentliche Hard-Fail-Entscheidung basiert aber nur auf hard_fail_reasons.
+        Die eigentliche Hard-Fail-Entscheidung basiert aber nur auf
+        hard_fail_reasons.
         """
         return self.all_reasons()
 
@@ -150,7 +160,11 @@ class IntegrityReasonSet:
         return len(self.hard_fail_reasons) > 0
 
     def has_any(self) -> bool:
-        return bool(self.hard_fail_reasons or self.warning_reasons or self.review_reasons)
+        return bool(
+            self.hard_fail_reasons
+            or self.warning_reasons
+            or self.review_reasons
+        )
 
 
 @dataclass
@@ -182,14 +196,19 @@ def _safe_list(value: Any) -> List[Any]:
         return list(value)
     if isinstance(value, set):
         return list(value)
-    if pd.isna(value) if not isinstance(value, (list, tuple, set, dict)) else False:
-        return []
+    if isinstance(value, dict):
+        return [value]
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
     return [value]
 
 
 def _unique_keep_order(values: Iterable[Any]) -> List[Any]:
     seen = set()
-    out = []
+    out: List[Any] = []
     for v in values:
         if v not in seen:
             seen.add(v)
@@ -208,16 +227,17 @@ def _ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     if isinstance(out.index, pd.DatetimeIndex):
-        out = out.sort_index()
-        return out
+        return out.sort_index()
 
-    date_col = _find_first_existing_column(out, ["Date", "date", "Datetime", "datetime", "timestamp"])
+    date_col = _find_first_existing_column(
+        out,
+        ["Date", "date", "Datetime", "datetime", "timestamp"],
+    )
     if date_col is not None:
         out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
         out = out.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
         return out
 
-    # Fallback: versuchen, den bestehenden Index zu konvertieren
     try:
         out.index = pd.to_datetime(out.index, errors="coerce")
         out = out[~out.index.isna()].sort_index()
@@ -253,6 +273,9 @@ def _max_consecutive_equal(values: pd.Series) -> int:
         return 0
 
     arr = values.astype(float).round(10).to_numpy()
+    if len(arr) == 0:
+        return 0
+
     max_run = 1
     current = 1
 
@@ -280,13 +303,17 @@ def _compute_rsl_from_series(price: pd.Series, sma_window: int = 130) -> pd.Seri
     return (price / sma).replace([np.inf, -np.inf], np.nan)
 
 
-def _looks_like_foreign_secondary_listing(ticker: Optional[str], country: Optional[str], cfg: Dict[str, Any]) -> bool:
+def _looks_like_foreign_secondary_listing(
+    ticker: Optional[str],
+    country: Optional[str],
+    cfg: Dict[str, Any],
+) -> bool:
     if not ticker:
         return False
 
     ticker = str(ticker).upper().strip()
     suffixes = cfg.get("foreign_secondary_suffixes", [])
-    has_secondary_suffix = any(ticker.endswith(sfx.upper()) for sfx in suffixes)
+    has_secondary_suffix = any(ticker.endswith(str(sfx).upper()) for sfx in suffixes)
 
     if not has_secondary_suffix:
         return False
@@ -314,7 +341,6 @@ def _get_row_value(row: Any, candidates: List[str], default: Any = None) -> Any:
                 return row[c]
         return default
 
-    # pandas Series / namedtuple / object
     for c in candidates:
         try:
             if hasattr(row, c):
@@ -329,6 +355,21 @@ def _get_row_value(row: Any, candidates: List[str], default: Any = None) -> Any:
             pass
 
     return default
+
+
+def _extract_history_object(item: Any) -> Optional[pd.DataFrame]:
+    history = _get_row_value(
+        item,
+        [
+            "history",
+            "price_history",
+            "historical_data",
+            "df_history",
+            "history_df",
+        ],
+        None,
+    )
+    return history if isinstance(history, pd.DataFrame) else None
 
 
 # ============================================================================
@@ -350,14 +391,10 @@ def normalize_history_frame(history_df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = [c for c in cols.values() if c is not None]
     df = _coerce_numeric(df, numeric_cols)
 
-    # Fehlende Actions-Spalten anlegen
     if cols["dividends"] is None:
         df["Dividends"] = 0.0
     if cols["splits"] is None:
         df["Stock Splits"] = 0.0
-
-    # Wenn eben neu angelegt wurde, Spalten neu ermitteln
-    cols = _get_price_columns(df)
 
     return df.sort_index()
 
@@ -444,6 +481,7 @@ def _get_dividend_col(df: pd.DataFrame) -> str:
     cols = _get_price_columns(df)
     if cols["dividends"] is not None:
         return cols["dividends"]
+
     if "Dividends" not in df.columns:
         df["Dividends"] = 0.0
     return "Dividends"
@@ -453,6 +491,7 @@ def _get_split_col(df: pd.DataFrame) -> str:
     cols = _get_price_columns(df)
     if cols["splits"] is not None:
         return cols["splits"]
+
     if "Stock Splits" not in df.columns:
         df["Stock Splits"] = 0.0
     return "Stock Splits"
@@ -490,8 +529,6 @@ def detect_dividend_adjustment_issues(
     split_col = _get_split_col(df)
 
     dividends = pd.to_numeric(df[div_col], errors="coerce").fillna(0.0)
-    splits = pd.to_numeric(df[split_col], errors="coerce").fillna(0.0)
-
     dividend_dates = df.index[dividends > 0].tolist()
     diagnostics["dividend_event_count"] = int(len(dividend_dates))
 
@@ -501,22 +538,18 @@ def detect_dividend_adjustment_issues(
     close = pd.to_numeric(df[close_col], errors="coerce")
     adj = pd.to_numeric(df[adj_col], errors="coerce")
 
-    event_rows = []
+    event_rows: List[Dict[str, Any]] = []
 
     for dt in dividend_dates:
         if dt not in df.index:
             continue
 
         loc = df.index.get_loc(dt)
-        if isinstance(loc, slice):
-            # sehr unwahrscheinlich bei eindeutigen Datumsindizes
-            continue
-        if isinstance(loc, np.ndarray):
+        if isinstance(loc, slice) or isinstance(loc, np.ndarray):
             continue
 
         before_n = int(cfg["dividend_window_before"])
         after_n = int(cfg["dividend_window_after"])
-
         start = max(0, loc - before_n)
         end = min(len(df), loc + after_n + 1)
 
@@ -530,17 +563,12 @@ def detect_dividend_adjustment_issues(
         w_splits = pd.to_numeric(w[split_col], errors="coerce").fillna(0.0)
 
         if (w_splits > 0).any():
-            # Splits machen die Interpretation deutlich schwieriger.
-            # Nicht sofort failen, aber als Review markieren.
             reasons.add("split_present_near_dividend_window", "review")
 
-        # Ex-Tag-Dividende
         ex_div = float(df.loc[dt, div_col]) if pd.notna(df.loc[dt, div_col]) else 0.0
 
-        # Preis am Vortag / nächster valider Preis davor
         prior_close = np.nan
         prior_adj = np.nan
-
         for i in range(loc - 1, -1, -1):
             c_val = close.iloc[i]
             a_val = adj.iloc[i]
@@ -550,50 +578,38 @@ def detect_dividend_adjustment_issues(
                     prior_adj = float(a_val)
                 break
 
-        # Falls kein gültiger Vortagespreis
         if not np.isfinite(prior_close) or prior_close <= 0:
             continue
 
-        # Yahoo-artige theoretische Multiplikator-Idee:
-        # multiplier ~= 1 - dividend / prev_close
         explained_gap = abs(ex_div / prior_close) if prior_close > 0 else np.nan
 
-        # Tatsächliche mediane relative Differenz im Fenster
         gap_series = _safe_pct_diff(w_adj, w_close)
         median_gap = float(gap_series.median(skipna=True)) if len(gap_series.dropna()) else np.nan
         max_gap = float(gap_series.max(skipna=True)) if len(gap_series.dropna()) else np.nan
 
-        # Renditebrüche vergleichen
         close_ret = w_close.pct_change().replace([np.inf, -np.inf], np.nan)
         adj_ret = w_adj.pct_change().replace([np.inf, -np.inf], np.nan)
 
         max_abs_close_ret = float(close_ret.abs().max(skipna=True)) if len(close_ret.dropna()) else np.nan
         max_abs_adj_ret = float(adj_ret.abs().max(skipna=True)) if len(adj_ret.dropna()) else np.nan
 
-        # Hat Adj Close offensichtlich "schlimmere" Brüche?
         adj_worse_than_close = False
         if np.isfinite(max_abs_adj_ret) and np.isfinite(max_abs_close_ret):
             adj_worse_than_close = max_abs_adj_ret > (max_abs_close_ret + 0.15)
 
-        # Zusätzlicher Sonderfall: negative Adj Close Werte
         negative_adj_present = bool((w_adj.dropna() < 0).any())
 
-        # Plausibilitätsbewertung
-        event_problem_severity = None
-        event_reasons = []
+        event_problem_severity: Optional[str] = None
+        event_reasons: List[str] = []
 
         if negative_adj_present:
             event_problem_severity = "hard_fail"
             event_reasons.append("negative_adjclose_in_dividend_window")
 
-        # Wenn die beobachtete Gap viel größer ist als die Dividende erklärt
         if np.isfinite(median_gap) and np.isfinite(explained_gap):
-            # Beispiel:
-            # Dividende erklärt 1 %, beobachtet 15 % => verdächtig
             if median_gap > explained_gap + cfg["dividend_multiplier_tolerance"]:
                 event_reasons.append("adjclose_close_gap_unplausible_for_dividend")
 
-        # Sehr große absolute Adj/Close-Abweichungen
         if np.isfinite(max_gap):
             if max_gap >= cfg["adj_close_gap_hard_threshold"]:
                 event_reasons.append("extreme_adjclose_close_gap_in_dividend_window")
@@ -602,10 +618,8 @@ def detect_dividend_adjustment_issues(
                 event_reasons.append("large_adjclose_close_gap_in_dividend_window")
                 event_problem_severity = event_problem_severity or "warning"
 
-        # Adj-Serie wirkt kaputter als Close-Serie
         if adj_worse_than_close:
             event_reasons.append("adjclose_discontinuity_worse_than_close")
-
             if np.isfinite(max_abs_adj_ret) and max_abs_adj_ret >= cfg["daily_return_hard_threshold"]:
                 event_problem_severity = event_problem_severity or "hard_fail"
             else:
@@ -618,29 +632,34 @@ def detect_dividend_adjustment_issues(
 
             if "adjclose_close_gap_unplausible_for_dividend" in event_reasons and sev != "hard_fail":
                 reasons.add("bad_dividend_adjustment", "warning")
-
             if "extreme_adjclose_close_gap_in_dividend_window" in event_reasons:
                 reasons.add("bad_dividend_adjustment", "hard_fail")
             elif "large_adjclose_close_gap_in_dividend_window" in event_reasons:
                 reasons.add("bad_dividend_adjustment", "warning")
 
-        event_rows.append({
-            "event_date": dt,
-            "dividend": ex_div,
-            "prior_close": prior_close,
-            "explained_gap_estimate": explained_gap,
-            "median_adj_close_gap": median_gap,
-            "max_adj_close_gap": max_gap,
-            "max_abs_close_return": max_abs_close_ret,
-            "max_abs_adj_return": max_abs_adj_ret,
-            "adj_worse_than_close": adj_worse_than_close,
-            "negative_adj_present": negative_adj_present,
-            "event_reasons": "|".join(event_reasons) if event_reasons else "",
-            "event_severity": event_problem_severity or "",
-        })
+        event_rows.append(
+            {
+                "event_date": dt,
+                "dividend": ex_div,
+                "prior_close": prior_close,
+                "prior_adj": prior_adj,
+                "window_dividend_sum": float(w_div.sum(skipna=True)),
+                "explained_gap_estimate": explained_gap,
+                "median_adj_close_gap": median_gap,
+                "max_adj_close_gap": max_gap,
+                "max_abs_close_return": max_abs_close_ret,
+                "max_abs_adj_return": max_abs_adj_ret,
+                "adj_worse_than_close": adj_worse_than_close,
+                "negative_adj_present": negative_adj_present,
+                "event_reasons": "|".join(event_reasons) if event_reasons else "",
+                "event_severity": event_problem_severity or "",
+            }
+        )
 
     event_df = pd.DataFrame(event_rows)
-    diagnostics["problem_dividend_events"] = int((event_df["event_reasons"] != "").sum()) if not event_df.empty else 0
+    diagnostics["problem_dividend_events"] = (
+        int((event_df["event_reasons"] != "").sum()) if not event_df.empty else 0
+    )
 
     return reasons, diagnostics, event_df
 
@@ -679,12 +698,7 @@ def build_rsl_price_series(
         )
 
     basic_reasons, basic_diag = validate_basic_history_integrity(df, cfg)
-    for r in basic_reasons.hard_fail_reasons:
-        reasons.add(r, "hard_fail")
-    for r in basic_reasons.warning_reasons:
-        reasons.add(r, "warning")
-    for r in basic_reasons.review_reasons:
-        reasons.add(r, "review")
+    reasons.extend(basic_reasons)
     diagnostics.update(basic_diag)
 
     cols = _get_price_columns(df)
@@ -697,7 +711,6 @@ def build_rsl_price_series(
         df["rsl_price_source"] = "missing"
         return PriceSeriesBuildResult(df, "rsl_price", False, reasons, diagnostics)
 
-    # Standardquelle
     if adj_col is not None:
         df["rsl_price"] = pd.to_numeric(df[adj_col], errors="coerce")
         df["rsl_price_source"] = "adj_close"
@@ -708,312 +721,275 @@ def build_rsl_price_series(
 
     used_close_fallback = False
     global_fallback_reason = ""
-    
-    # --- GLOBALER SCALE-CHECK (Yahoo Floor Bug Detektion) ---
-    # ARCHITEKTUR-REGEL: Wir vergleichen URSACHEN (Skalierung), nicht RSL-Symptome.
+
     if close_col is not None and adj_col is not None:
         c_vals = pd.to_numeric(df[close_col], errors="coerce")
         a_vals = pd.to_numeric(df[adj_col], errors="coerce")
-        
-        # Ratio-Analyse über die gesamte verfügbare Historie
+
         ratio_series = (c_vals / a_vals.replace(0, np.nan)).dropna()
         if len(ratio_series) > 30:
             global_median_ratio = float(ratio_series.median())
-            extreme_ratio_mask = (ratio_series > cfg["adj_close_gap_hard_threshold_ratio"]) | (ratio_series < 1.0 / cfg["adj_close_gap_hard_threshold_ratio"])
+            extreme_ratio_mask = (
+                (ratio_series > cfg["adj_close_gap_hard_threshold_ratio"])
+                | (ratio_series < 1.0 / cfg["adj_close_gap_hard_threshold_ratio"])
+            )
             extreme_fraction = float(extreme_ratio_mask.mean())
-            
-            # Wenn Abweichung persistent (>20% der Tage) und extrem (Median), umschalten.
-            if extreme_fraction >= cfg["global_scale_fallback_min_fraction"] and (global_median_ratio > 1.5 or global_median_ratio < 0.6):
+
+            diagnostics["global_close_adj_ratio_median"] = global_median_ratio
+            diagnostics["global_close_adj_ratio_extreme_fraction"] = extreme_fraction
+
+            if extreme_fraction >= cfg["global_scale_fallback_min_fraction"]:
                 df["rsl_price"] = c_vals
-                df["rsl_price_source"] = "close_global_scale_fallback"
+                df["rsl_price_source"] = "close_global_fallback"
                 used_close_fallback = True
-                global_fallback_reason = "extreme_adjclose_close_gap_global"
-                reasons.add(global_fallback_reason, "warning")
+                global_fallback_reason = "global_adjclose_scale_issue"
+                reasons.add("global_adjclose_scale_issue", "hard_fail")
 
-    # Wenn beide vorhanden sind, Dividenden-/Adjustierungsprüfung
-    if not used_close_fallback and close_col is not None and adj_col is not None:
-        div_reasons, div_diag, event_df = detect_dividend_adjustment_issues(df, cfg)
+    div_reasons, div_diag, event_df = detect_dividend_adjustment_issues(df, cfg)
+    reasons.extend(div_reasons)
+    diagnostics.update(div_diag)
 
-        for r in div_reasons.hard_fail_reasons:
-            reasons.add(r, "hard_fail")
-        for r in div_reasons.warning_reasons:
-            reasons.add(r, "warning")
-        for r in div_reasons.review_reasons:
-            reasons.add(r, "review")
+    if not used_close_fallback and close_col is not None and adj_col is not None and not event_df.empty:
+        problem_events = event_df[event_df["event_reasons"].astype(str) != ""].copy()
 
-        diagnostics["dividend_adjustment"] = div_diag
-        diagnostics["dividend_events_table"] = event_df
+        if len(problem_events) > 0:
+            before_n = int(cfg["dividend_window_before"])
+            after_n = int(cfg["dividend_window_after"])
 
-        # Lokaler Fallback rund um problematische Dividendenfenster
-        if not event_df.empty:
-            problematic_events = event_df[event_df["event_reasons"].fillna("") != ""].copy()
+            use_close_mask = pd.Series(False, index=df.index)
+            for _, row in problem_events.iterrows():
+                dt = row["event_date"]
+                if dt not in df.index:
+                    continue
+                loc = df.index.get_loc(dt)
+                if isinstance(loc, slice) or isinstance(loc, np.ndarray):
+                    continue
+                start = max(0, loc - before_n)
+                end = min(len(df), loc + after_n + 1)
+                use_close_mask.iloc[start:end] = True
 
-            if len(problematic_events) > 0:
-                close_series = pd.to_numeric(df[close_col], errors="coerce")
+            close_numeric = pd.to_numeric(df[close_col], errors="coerce")
+            fallback_days = int(use_close_mask.sum())
+            diagnostics["local_close_fallback_days"] = fallback_days
 
-                for _, evt in problematic_events.iterrows():
-                    dt = evt["event_date"]
-                    if dt not in df.index:
-                        continue
+            if fallback_days > 0:
+                df.loc[use_close_mask, "rsl_price"] = close_numeric.loc[use_close_mask]
+                df.loc[use_close_mask, "rsl_price_source"] = "close_local_fallback"
+                used_close_fallback = True
 
-                    loc = df.index.get_loc(dt)
-                    if isinstance(loc, slice) or isinstance(loc, np.ndarray):
-                        continue
-
-                    # Lokale Ratio-Prüfung im Fenster
-                    w_start = max(0, loc - 5)
-                    w_end = min(len(df), loc + 5)
-                    w_close = pd.to_numeric(df[close_col].iloc[w_start:w_end], errors="coerce")
-                    w_adj = pd.to_numeric(df[adj_col].iloc[w_start:w_end], errors="coerce")
-                    
-                    ratio_series_win = (w_close / w_adj.replace(0, np.nan)).dropna()
-                    median_ratio_win = float(ratio_series_win.median()) if not ratio_series_win.empty else 1.0
-                    
-                    # Falls lokale Ratio massiv abweicht, korrigieren wir den gesamten Floor davor (Yahoo Floor Bug)
-                    if median_ratio_win > 2.0 or median_ratio_win < 0.5:
-                        start = 0
-                        repair_mode = "global_pre_ex_fallback"
-                    else:
-                        start = max(0, loc - int(cfg["dividend_window_before"]))
-                        repair_mode = "local_window_fallback"
-
-                    end = min(len(df), loc + int(cfg["dividend_window_after"]) + 1)
-                    fallback_idx = df.index[start:end]
-
-                    # Nur dort ersetzen, wo Close plausibel > 0 ist
-                    close_slice = close_series.loc[fallback_idx]
-                    valid_mask = close_slice.notna() & (close_slice > 0)
-
-                    if valid_mask.any():
-                        idx_to_replace = close_slice.index[valid_mask]
-                        df.loc[idx_to_replace, "rsl_price"] = close_slice.loc[idx_to_replace]
-                        df.loc[idx_to_replace, "rsl_price_source"] = f"close_{repair_mode}"
-                        used_close_fallback = True
-
-                if used_close_fallback:
-                    reasons.add("close_fallback_used", "warning")
-
-    # Fallback falls rsl_price trotz allem leer ist
-    if close_col is not None:
-        close_series = pd.to_numeric(df[close_col], errors="coerce")
-        missing_rsl_mask = df["rsl_price"].isna() & close_series.notna() & (close_series > 0)
-        if missing_rsl_mask.any():
-            df.loc[missing_rsl_mask, "rsl_price"] = close_series.loc[missing_rsl_mask]
-            df.loc[missing_rsl_mask, "rsl_price_source"] = "close_fill_missing"
-            reasons.add("close_used_to_fill_missing_adjclose", "review")
-
-    # Validierung der finalen rsl_price-Serie
-    rsl_price = pd.to_numeric(df["rsl_price"], errors="coerce")
-    valid_rsl_price = rsl_price.dropna()
-
-    if len(valid_rsl_price) == 0:
-        reasons.add("no_valid_rsl_price_series", "hard_fail")
+    valid_rsl_price = pd.to_numeric(df["rsl_price"], errors="coerce")
+    if len(df) > 0:
+        fallback_fraction = float((df["rsl_price_source"] != "adj_close").mean())
     else:
-        if (valid_rsl_price <= 0).any():
-            reasons.add("non_positive_values_in_rsl_price", "hard_fail")
+        fallback_fraction = 0.0
 
-        fallback_frac = float((df["rsl_price_source"].astype(str).str.contains("close", case=False, na=False)).mean())
-        diagnostics["fallback_fraction"] = fallback_frac
+    diagnostics["fallback_fraction"] = fallback_fraction
+    diagnostics["global_fallback_reason"] = global_fallback_reason
+    diagnostics["used_close_fallback"] = used_close_fallback
 
-        if fallback_frac >= cfg["fallback_fraction_hard"]:
-            reasons.add("too_much_close_fallback_in_rsl_series", "hard_fail")
-        elif fallback_frac >= cfg["fallback_fraction_warn"]:
-            reasons.add("substantial_close_fallback_in_rsl_series", "warning")
+    if fallback_fraction >= cfg["fallback_fraction_hard"]:
+        reasons.add("fallback_fraction_too_high", "hard_fail")
+    elif fallback_fraction >= cfg["fallback_fraction_warn"]:
+        reasons.add("fallback_fraction_elevated", "warning")
 
-    # Ermittle den dominanten Modus der Preisquelle für die Dokumentation
-    source_counts = df["rsl_price_source"].value_counts()
-    primary_source = str(source_counts.idxmax()) if not source_counts.empty else "adj_close"
-    
-    # Reparatur-Metadaten für StockData-Objekt aufbereiten
-    repair_applied = used_close_fallback
-    repair_method = primary_source
-    repair_reason = global_fallback_reason or ("; ".join(reasons.warning_reasons) if used_close_fallback else "")
+    min_rows = int(cfg["min_history_rows_for_rsl"])
+    if len(valid_rsl_price.dropna()) < min_rows:
+        reasons.add("insufficient_history_for_rsl", "hard_fail")
+
+    rsl_series = _compute_rsl_from_series(valid_rsl_price, int(cfg["rsl_sma_window"]))
+    df["rsl_value"] = rsl_series
+
+    if len(rsl_series.dropna()) == 0 and len(valid_rsl_price.dropna()) >= min_rows:
+        reasons.add("rsl_computation_failed", "hard_fail")
 
     return PriceSeriesBuildResult(
         history=df,
         rsl_price_column="rsl_price",
         used_close_fallback=used_close_fallback,
         reasons=reasons,
-        diagnostics={
-            **diagnostics,
-            "fallback_fraction": fallback_frac,
-            "rsl_price_source_mode": primary_source,
-            "repair_applied": repair_applied,
-            "repair_method": repair_method,
-            "repair_reason": repair_reason
-        },
+        diagnostics=diagnostics,
     )
 
 
 # ============================================================================
-# RSL-Berechnung + Integritätsauswertung für eine Historie
+# High-level API für einzelne Stocks / Ergebnislisten
 # ============================================================================
 
-def analyze_history_for_rsl_integrity(
-    history_df: pd.DataFrame,
-    ticker: Optional[str] = None,
-    country: Optional[str] = None,
-    cfg: Optional[Dict[str, Any]] = None,
+def evaluate_stock_rsl_integrity(
+    item: Any,
+    location_suffix_map: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
+    raw_rsl: Any = None,
 ) -> Dict[str, Any]:
-    """
-    Hauptanalyse für EINE Kursreihe.
-    Gibt ein strukturiertes Dict zurück.
-    """
-    cfg = _merge_config(cfg)
-    build = build_rsl_price_series(history_df, cfg)
+    cfg = _merge_config(config)
 
-    reasons = build.reasons
-    df = build.history.copy()
-    diagnostics = dict(build.diagnostics)
-
-    if _looks_like_foreign_secondary_listing(ticker, country, cfg):
-        reasons.add("foreign_secondary_listing_possible", "review")
-
-    rsl_value = np.nan
-    sma_value = np.nan
-
-    if build.rsl_price_column in df.columns:
-        rsl_series = _compute_rsl_from_series(
-            pd.to_numeric(df[build.rsl_price_column], errors="coerce"),
-            sma_window=int(cfg["rsl_sma_window"]),
+    ticker = _normalize_string(
+        _get_row_value(
+            item,
+            ["yahoo_symbol", "ticker", "Ticker", "Symbol", "symbol", "original_ticker"],
+            None,
         )
-        df["rsl"] = rsl_series
+    ) or None
 
-        valid_rsl = rsl_series.dropna()
-        if len(valid_rsl) > 0:
-            rsl_value = float(valid_rsl.iloc[-1])
+    country = _normalize_string(
+        _get_row_value(
+            item,
+            ["land", "Land", "country", "Country"],
+            None,
+        )
+    ) or None
 
-        sma = _rolling_sma(pd.to_numeric(df[build.rsl_price_column], errors="coerce"), int(cfg["rsl_sma_window"]))
-        valid_sma = sma.dropna()
-        if len(valid_sma) > 0:
-            sma_value = float(valid_sma.iloc[-1])
+    history = _extract_history_object(item)
 
-    if len(df) < int(cfg["min_history_rows_for_rsl"]):
-        reasons.add("insufficient_history_for_rsl_window", "hard_fail")
-
-    result = {
-        "history": df,
-        "rsl_price_column": build.rsl_price_column,
-        "used_close_fallback": build.used_close_fallback,
-        "rsl_value": rsl_value,
-        "rsl_sma": sma_value,
-        "integrity_reasons": reasons.all_reasons(),
-        "hard_fail_reasons": reasons.hard_fail_reasons,
-        "warning_reasons": reasons.warning_reasons,
-        "review_reasons": reasons.review_reasons,
-        "drop_reasons": reasons.legacy_drop_reasons(),  # Legacy
-        "integrity_warnings": reasons.warning_reasons,  # Legacy
-        "has_hard_fail": reasons.has_hard_fail(),
-        "diagnostics": diagnostics,
+    result: Dict[str, Any] = {
+        "ticker": ticker,
+        "country": country,
+        "raw_rsl": raw_rsl,
+        "ranking_integrity_status": "missing_history",
+        "excluded_from_ranking": True,
+        "ranking_exclude_reason": "missing_history",
+        "drop_reasons": ["missing_history"],
+        "integrity_warnings": [],
+        "hard_fail_reasons": ["missing_history"],
+        "warning_reasons": [],
+        "review_reasons": [],
+        "used_close_fallback": False,
+        "rsl_price_source": "missing",
+        "fallback_fraction": None,
+        "repair_applied": False,
+        "repair_method": "",
+        "repair_reason": "",
+        "history": history,
+        "diagnostics": {},
     }
+
+    if history is None or not isinstance(history, pd.DataFrame) or len(history) == 0:
+        if _looks_like_foreign_secondary_listing(ticker, country, cfg):
+            result["review_reasons"] = ["foreign_secondary_listing_possible"]
+            result["integrity_warnings"] = ["foreign_secondary_listing_possible"]
+        return result
+
+    built = build_rsl_price_series(history, cfg)
+    reasons = built.reasons
+    diagnostics = dict(built.diagnostics)
+
+    review_reasons = list(reasons.review_reasons)
+    if _looks_like_foreign_secondary_listing(ticker, country, cfg):
+        if "foreign_secondary_listing_possible" not in review_reasons:
+            review_reasons.append("foreign_secondary_listing_possible")
+
+    hard_fail_reasons = list(reasons.hard_fail_reasons)
+    warning_reasons = list(reasons.warning_reasons)
+
+    excluded = len(hard_fail_reasons) > 0
+    if excluded:
+        status = "excluded_hard_fail"
+        exclude_reason = hard_fail_reasons[0]
+    elif built.used_close_fallback:
+        status = "eligible_repaired"
+        exclude_reason = ""
+    else:
+        status = "eligible_original"
+        exclude_reason = ""
+
+    rsl_source_series = built.history.get("rsl_price_source")
+    rsl_price_source = ""
+    if rsl_source_series is not None and len(rsl_source_series) > 0:
+        last_non_na = rsl_source_series.dropna()
+        if len(last_non_na) > 0:
+            rsl_price_source = str(last_non_na.iloc[-1])
+
+    result.update(
+        {
+            "ranking_integrity_status": status,
+            "excluded_from_ranking": excluded,
+            "ranking_exclude_reason": exclude_reason,
+            "drop_reasons": _unique_keep_order(
+                hard_fail_reasons + warning_reasons + review_reasons
+            ),
+            "integrity_warnings": _unique_keep_order(warning_reasons + review_reasons),
+            "hard_fail_reasons": hard_fail_reasons,
+            "warning_reasons": warning_reasons,
+            "review_reasons": review_reasons,
+            "used_close_fallback": bool(built.used_close_fallback),
+            "rsl_price_source": rsl_price_source,
+            "fallback_fraction": diagnostics.get("fallback_fraction"),
+            "repair_applied": bool(built.used_close_fallback),
+            "repair_method": "close_fallback" if built.used_close_fallback else "",
+            "repair_reason": diagnostics.get("global_fallback_reason", "") or (
+                "dividend_window_local_fallback" if built.used_close_fallback else ""
+            ),
+            "history": built.history,
+            "diagnostics": diagnostics,
+        }
+    )
+
     return result
 
 
+def _apply_integrity_fields_to_item(item: Any, info: Dict[str, Any]) -> Any:
+    field_map = {
+        "ranking_integrity_status": info.get("ranking_integrity_status", ""),
+        "excluded_from_ranking": info.get("excluded_from_ranking", False),
+        "ranking_exclude_reason": info.get("ranking_exclude_reason", ""),
+        "drop_reasons": info.get("drop_reasons", []),
+        "integrity_warnings": info.get("integrity_warnings", []),
+        "hard_fail_reasons": info.get("hard_fail_reasons", []),
+        "warning_reasons": info.get("warning_reasons", []),
+        "review_reasons": info.get("review_reasons", []),
+        "used_close_fallback": info.get("used_close_fallback", False),
+        "rsl_price_source": info.get("rsl_price_source", ""),
+        "fallback_fraction": info.get("fallback_fraction", None),
+        "repair_applied": info.get("repair_applied", False),
+        "repair_method": info.get("repair_method", ""),
+        "repair_reason": info.get("repair_reason", ""),
+        "diagnostics": info.get("diagnostics", {}),
+        "history": info.get("history", None),
+    }
+
+    if isinstance(item, dict):
+        out = dict(item)
+        out.update(field_map)
+        return out
+
+    for key, value in field_map.items():
+        try:
+            setattr(item, key, value)
+        except Exception:
+            pass
+    return item
+
+
+def filter_stock_results_for_rsl_integrity(
+    results: List[Any],
+    location_suffix_map: Optional[Dict[str, Any]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Any], pd.DataFrame]:
+    valid_results: List[Any] = []
+    audit_rows: List[Dict[str, Any]] = []
+
+    for stock in results or []:
+        raw_rsl = _get_row_value(stock, ["rsl", "RSL", "rsl_value"], None)
+        info = evaluate_stock_rsl_integrity(
+            stock,
+            location_suffix_map=location_suffix_map,
+            config=config,
+            raw_rsl=raw_rsl,
+        )
+
+        updated_stock = _apply_integrity_fields_to_item(stock, info)
+        audit_rows.append(_audit_row_from_item(updated_stock))
+
+        if not info.get("excluded_from_ranking", False):
+            valid_results.append(updated_stock)
+
+    audit_df = pd.DataFrame(audit_rows)
+    return valid_results, audit_df
+
+
 # ============================================================================
-# DataFrame-/Universe-Helfer
+# Legacy-/Reason-API
 # ============================================================================
-
-def _extract_history_object(row: Any) -> Optional[pd.DataFrame]:
-    """
-    Versucht, aus einer Zeile/Objekt die Historie zu extrahieren.
-    Unterstützte Kandidaten:
-    - history
-    - price_history
-    - hist
-    - yf_history
-    """
-    candidates = ["history", "price_history", "hist", "yf_history"]
-    for c in candidates:
-        val = _get_row_value(row, [c], default=None)
-        if isinstance(val, pd.DataFrame):
-            return val
-    return None
-
-
-def _append_reasons_to_row_dict(row_dict: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
-    row_dict = dict(row_dict)
-    row_dict["integrity_reasons"] = analysis.get("integrity_reasons", [])
-    row_dict["hard_fail_reasons"] = analysis.get("hard_fail_reasons", [])
-    row_dict["warning_reasons"] = analysis.get("warning_reasons", [])
-    row_dict["review_reasons"] = analysis.get("review_reasons", [])
-    row_dict["drop_reasons"] = analysis.get("drop_reasons", [])  # Legacy
-    row_dict["integrity_warnings"] = analysis.get("integrity_warnings", [])  # Legacy
-    row_dict["has_hard_fail"] = bool(analysis.get("has_hard_fail", False))
-    row_dict["used_close_fallback"] = bool(analysis.get("used_close_fallback", False))
-    row_dict["rsl_price_source"] = analysis.get("diagnostics", {}).get("rsl_price_source_mode", "adj_close")
-    row_dict["fallback_fraction"] = analysis.get("diagnostics", {}).get("fallback_fraction")
-
-    if pd.isna(row_dict.get("RSL")) or row_dict.get("RSL") is None:
-        row_dict["RSL"] = analysis.get("rsl_value", np.nan)
-
-    return row_dict
-
-
-def apply_rsl_integrity_to_universe(
-    universe_df: pd.DataFrame,
-    history_map: Optional[Dict[str, pd.DataFrame]] = None,
-    ticker_col_candidates: Optional[List[str]] = None,
-    country_col_candidates: Optional[List[str]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Analysiert je Zeile die Historie und ergänzt strukturierte Integritätsfelder.
-    """
-    if universe_df is None or len(universe_df) == 0:
-        return pd.DataFrame() if universe_df is None else universe_df.copy()
-
-    ticker_col_candidates = ticker_col_candidates or [
-        "ticker", "Ticker", "Symbol", "symbol", "Yahoo Symbol", "yahoo_symbol", "original_ticker"
-    ]
-    country_col_candidates = country_col_candidates or [
-        "country", "Country", "land", "Land"
-    ]
-
-    out_rows: List[Dict[str, Any]] = []
-
-    for _, row in universe_df.iterrows():
-        row_dict = row.to_dict()
-        ticker = None
-        country = None
-
-        for c in ticker_col_candidates:
-            if c in row_dict and str(row_dict.get(c) or "").strip():
-                ticker = str(row_dict[c]).strip()
-                break
-
-        for c in country_col_candidates:
-            if c in row_dict and str(row_dict.get(c) or "").strip():
-                country = str(row_dict[c]).strip()
-                break
-
-        history = _extract_history_object(row_dict)
-        if history is None and history_map and ticker:
-            history = history_map.get(ticker)
-
-        if isinstance(history, pd.DataFrame) and not history.empty:
-            analysis = analyze_history_for_rsl_integrity(
-                history_df=history,
-                ticker=ticker,
-                country=country,
-                cfg=cfg,
-            )
-            row_dict = _append_reasons_to_row_dict(row_dict, analysis)
-        else:
-            row_dict.setdefault("integrity_reasons", [])
-            row_dict.setdefault("hard_fail_reasons", [])
-            row_dict.setdefault("warning_reasons", [])
-            row_dict.setdefault("review_reasons", [])
-            row_dict.setdefault("drop_reasons", [])
-            row_dict.setdefault("integrity_warnings", [])
-            row_dict.setdefault("has_hard_fail", False)
-            row_dict.setdefault("used_close_fallback", False)
-            row_dict.setdefault("rsl_price_source", "adj_close")
-            row_dict.setdefault("fallback_fraction", None)
-
-        out_rows.append(row_dict)
-
-    return pd.DataFrame(out_rows)
-
 
 def _extract_item_meta(item: Any) -> Tuple[Optional[str], Optional[str], Optional[pd.DataFrame]]:
     ticker = _get_row_value(
@@ -1040,17 +1016,13 @@ def get_rsl_integrity_reasons(
     config: Optional[Dict[str, Any]] = None,
     raw_rsl: Any = None,
 ) -> List[str]:
-    ticker, country, history = _extract_item_meta(item)
-    if history is None or not isinstance(history, pd.DataFrame) or history.empty:
-        return []
-
-    analysis = analyze_history_for_rsl_integrity(
-        history_df=history,
-        ticker=ticker,
-        country=country,
-        cfg=config,
+    info = evaluate_stock_rsl_integrity(
+        item,
+        location_suffix_map=location_suffix_map,
+        config=config,
+        raw_rsl=raw_rsl,
     )
-    return list(analysis.get("integrity_reasons", []))
+    return _unique_keep_order(info.get("drop_reasons", []))
 
 
 def get_rsl_integrity_drop_reasons(
@@ -1059,162 +1031,44 @@ def get_rsl_integrity_drop_reasons(
     config: Optional[Dict[str, Any]] = None,
     raw_rsl: Any = None,
 ) -> List[str]:
-    ticker, country, history = _extract_item_meta(item)
-    if history is None or not isinstance(history, pd.DataFrame) or history.empty:
-        return []
-
-    analysis = analyze_history_for_rsl_integrity(
-        history_df=history,
-        ticker=ticker,
-        country=country,
-        cfg=config,
+    return get_rsl_integrity_reasons(
+        item,
+        location_suffix_map=location_suffix_map,
+        config=config,
+        raw_rsl=raw_rsl,
     )
-    hard_fails = list(analysis.get("hard_fail_reasons", []))
-    return [r for r in hard_fails if r not in {"no_valid_rsl_data", "invalid_rsl_value", "missing_rsl"}]
 
 
-def _clean_hard_fail_reasons(reasons: List[str]) -> List[str]:
-    blocked = {
-        "no_valid_rsl_data",
-        "invalid_rsl_value",
-        "missing_rsl",
-        "no_valid_rsl",
-        "rsl_invalid",
+# ============================================================================
+# Audit / Review DataFrames
+# ============================================================================
+
+def _audit_row_from_item(stock: Any) -> Dict[str, Any]:
+    return {
+        "ticker": _get_row_value(stock, ["yahoo_symbol", "ticker", "Ticker", "Symbol", "symbol"], ""),
+        "name": _get_row_value(stock, ["name", "Name", "company_name"], ""),
+        "country": _get_row_value(stock, ["land", "Land", "country", "Country"], ""),
+        "rsl": _get_row_value(stock, ["rsl", "RSL", "rsl_value"], None),
+        "rsl_rank": _get_row_value(stock, ["rsl_rank", "rank", "Rank"], None),
+        "ranking_integrity_status": _get_row_value(stock, ["ranking_integrity_status"], ""),
+        "excluded_from_ranking": _get_row_value(stock, ["excluded_from_ranking"], False),
+        "ranking_exclude_reason": _get_row_value(stock, ["ranking_exclude_reason"], ""),
+        "used_close_fallback": _get_row_value(stock, ["used_close_fallback"], False),
+        "rsl_price_source": _get_row_value(stock, ["rsl_price_source"], ""),
+        "fallback_fraction": _get_row_value(stock, ["fallback_fraction"], None),
+        "repair_applied": _get_row_value(stock, ["repair_applied"], False),
+        "repair_method": _get_row_value(stock, ["repair_method"], ""),
+        "repair_reason": _get_row_value(stock, ["repair_reason"], ""),
+        "drop_reasons": ", ".join(_safe_list(_get_row_value(stock, ["drop_reasons"], []))),
+        "integrity_warnings": ", ".join(_safe_list(_get_row_value(stock, ["integrity_warnings"], []))),
+        "hard_fail_reasons": ", ".join(_safe_list(_get_row_value(stock, ["hard_fail_reasons"], []))),
+        "warning_reasons": ", ".join(_safe_list(_get_row_value(stock, ["warning_reasons"], []))),
+        "review_reasons": ", ".join(_safe_list(_get_row_value(stock, ["review_reasons"], []))),
     }
-    return [r for r in reasons if r not in blocked]
 
 
-def _set_if_attr(obj: Any, attr: str, value: Any) -> None:
-    try:
-        setattr(obj, attr, value)
-    except Exception:
-        pass
-
-
-def filter_stock_results_for_rsl_integrity(
-    results: List[Any],
-    location_suffix_map: Optional[Dict[str, Any]] = None,
-    config: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Any], pd.DataFrame]:
-    if not results:
-        return results, pd.DataFrame()
-
-    dropped_results: List[Dict[str, Any]] = []
-
-    for stock in results:
-        ticker, country, history = _extract_item_meta(stock)
-
-        if history is None or not isinstance(history, pd.DataFrame) or history.empty:
-            _set_if_attr(stock, "rsl_eligible", True)
-            _set_if_attr(stock, "excluded_from_ranking", False)
-            _set_if_attr(stock, "ranking_exclude_reason", "")
-            _set_if_attr(stock, "ranking_integrity_status", "eligible_original")
-            _set_if_attr(stock, "used_close_fallback", False)
-            _set_if_attr(stock, "rsl_price_source", "adj_close")
-            _set_if_attr(stock, "fallback_fraction", None)
-            continue
-
-        analysis = analyze_history_for_rsl_integrity(
-            history_df=history,
-            ticker=ticker,
-            country=country,
-            cfg=config,
-        )
-
-        diagnostics = analysis.get("diagnostics", {}) or {}
-        hard_fail_reasons = _clean_hard_fail_reasons(list(analysis.get("hard_fail_reasons", [])))
-        warning_reasons = list(analysis.get("warning_reasons", []))
-        review_reasons = list(analysis.get("review_reasons", []))
-        used_close_fallback = bool(analysis.get("used_close_fallback", False))
-        rsl_price_source = diagnostics.get("rsl_price_source_mode", "adj_close")
-        fallback_fraction = diagnostics.get("fallback_fraction")
-        has_hard_fail = len(hard_fail_reasons) > 0
-
-        _set_if_attr(stock, "integrity_warnings", warning_reasons + review_reasons)
-        _set_if_attr(stock, "used_close_fallback", used_close_fallback)
-        _set_if_attr(stock, "rsl_price_source", rsl_price_source)
-        _set_if_attr(stock, "fallback_fraction", fallback_fraction)
-        _set_if_attr(stock, "rsl_eligible", not has_hard_fail)
-        _set_if_attr(stock, "excluded_from_ranking", has_hard_fail)
-        _set_if_attr(stock, "ranking_exclude_reason", "; ".join(hard_fail_reasons) if has_hard_fail else "")
-
-        if has_hard_fail:
-            _set_if_attr(stock, "ranking_integrity_status", "not_eligible_unreliable")
-            _set_if_attr(stock, "repair_applied", False)
-            _set_if_attr(stock, "repair_method", "")
-            _set_if_attr(stock, "repair_reason", "")
-
-            dropped_results.append(
-                {
-                    "ticker": ticker or _get_row_value(stock, ["name"], ""),
-                    "reason": "; ".join(hard_fail_reasons),
-                    "hard_fail_reasons": hard_fail_reasons,
-                    "warning_reasons": warning_reasons,
-                    "review_reasons": review_reasons,
-                    "used_close_fallback": used_close_fallback,
-                    "rsl_price_source": rsl_price_source,
-                    "fallback_fraction": fallback_fraction,
-                }
-            )
-        else:
-            if used_close_fallback:
-                _set_if_attr(stock, "ranking_integrity_status", "eligible_repaired")
-                _set_if_attr(stock, "repair_applied", True)
-                _set_if_attr(stock, "repair_method", str(rsl_price_source))
-                _set_if_attr(stock, "repair_reason", "; ".join(warning_reasons + review_reasons))
-            else:
-                _set_if_attr(stock, "ranking_integrity_status", "eligible_original")
-                _set_if_attr(stock, "repair_applied", False)
-                _set_if_attr(stock, "repair_method", "")
-                _set_if_attr(stock, "repair_reason", "")
-
-        rsl_value = analysis.get("rsl_value", np.nan)
-        rsl_sma = analysis.get("rsl_sma", np.nan)
-
-        try:
-            if np.isfinite(rsl_value):
-                _set_if_attr(stock, "rsl", float(rsl_value))
-        except Exception:
-            pass
-
-        try:
-            if np.isfinite(rsl_sma):
-                _set_if_attr(stock, "sma", float(rsl_sma))
-        except Exception:
-            pass
-
-    re_issues_df = pd.DataFrame(dropped_results)
-    return results, re_issues_df
-
-
-def build_home_market_rsl_audit(
-    results: List[Any],
-    location_suffix_map: Optional[Dict[str, Any]] = None,
-) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-
-    for stock in results or []:
-        rows.append(
-            {
-                "ticker": _get_row_value(stock, ["yahoo_symbol", "ticker", "original_ticker"], ""),
-                "name": _get_row_value(stock, ["name"], ""),
-                "country": _get_row_value(stock, ["land", "country"], ""),
-                "rsl": _get_row_value(stock, ["rsl"], np.nan),
-                "sma": _get_row_value(stock, ["sma"], np.nan),
-                "rsl_rank": _get_row_value(stock, ["rsl_rang"], 0),
-                "ranking_integrity_status": _get_row_value(stock, ["ranking_integrity_status"], ""),
-                "excluded_from_ranking": _get_row_value(stock, ["excluded_from_ranking"], False),
-                "ranking_exclude_reason": _get_row_value(stock, ["ranking_exclude_reason"], ""),
-                "used_close_fallback": _get_row_value(stock, ["used_close_fallback"], False),
-                "rsl_price_source": _get_row_value(stock, ["rsl_price_source"], ""),
-                "fallback_fraction": _get_row_value(stock, ["fallback_fraction"], None),
-                "repair_applied": _get_row_value(stock, ["repair_applied"], False),
-                "repair_method": _get_row_value(stock, ["repair_method"], ""),
-                "repair_reason": _get_row_value(stock, ["repair_reason"], ""),
-                "integrity_warnings": ", ".join(_safe_list(_get_row_value(stock, ["integrity_warnings"], []))),
-            }
-        )
-
+def build_rsl_integrity_audit_df(results: List[Any]) -> pd.DataFrame:
+    rows = [_audit_row_from_item(stock) for stock in (results or [])]
     return pd.DataFrame(rows)
 
 
@@ -1231,17 +1085,33 @@ def build_home_market_rsl_review_shortlist(
         df["rsl_rank"] = pd.to_numeric(df["rsl_rank"], errors="coerce")
         df = df[(df["rsl_rank"].isna()) | (df["rsl_rank"] <= top_rank)]
 
-    mask = (
-        df.get("excluded_from_ranking", False).astype(bool)
-        | df.get("used_close_fallback", False).astype(bool)
-        | df.get("repair_applied", False).astype(bool)
-        | df.get("ranking_integrity_status", "").astype(str).ne("eligible_original")
+    excluded = (
+        df["excluded_from_ranking"].astype(bool)
+        if "excluded_from_ranking" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    close_fallback = (
+        df["used_close_fallback"].astype(bool)
+        if "used_close_fallback" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    repaired = (
+        df["repair_applied"].astype(bool)
+        if "repair_applied" in df.columns
+        else pd.Series(False, index=df.index)
+    )
+    status_not_original = (
+        df["ranking_integrity_status"].astype(str).ne("eligible_original")
+        if "ranking_integrity_status" in df.columns
+        else pd.Series(False, index=df.index)
     )
 
+    mask = excluded | close_fallback | repaired | status_not_original
     shortlist = df.loc[mask].copy()
 
     sort_cols = [
-        c for c in ["excluded_from_ranking", "repair_applied", "used_close_fallback", "rsl_rank"]
+        c
+        for c in ["excluded_from_ranking", "repair_applied", "used_close_fallback", "rsl_rank"]
         if c in shortlist.columns
     ]
     if sort_cols:
