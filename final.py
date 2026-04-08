@@ -2535,7 +2535,8 @@ def run_analysis_pipeline(
                                 distance_52w_high_pct=flags.get('distance_52w_high_pct'),
                                 stale_days=flags.get('stale_days', 0),
                                 first_seen_date=fs_date,
-                                is_new=is_new
+                                is_new=is_new,
+                                integrity_warnings=flags.get('integrity_reasons', [])
                             ))
                             if not mapper.get(u_key): mapper.set(u_key, y_sym)
                             pbar.update(1)
@@ -2673,7 +2674,8 @@ def run_analysis_pipeline(
                             distance_52w_high_pct=flags.get('distance_52w_high_pct'),
                             stale_days=flags.get('stale_days', 0),
                             first_seen_date=fs_date,
-                            is_new=is_new
+                            is_new=is_new,
+                            integrity_warnings=flags.get('integrity_reasons', [])
                         ))
                         mapper.set(u_key, y_sym)
                     pbar.update(1)

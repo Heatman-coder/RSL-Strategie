@@ -260,7 +260,7 @@ class MarketDataManager:
             if ticker.endswith(suffix): return rate
         return self.currency_rates.get("DEFAULT", 1.0)
 
-    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float, is_young_history: bool) -> Dict[str, Any]:
+    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float, is_young_history: bool, price_series: Optional[pd.Series] = None) -> Dict[str, Any]:
         flags: Dict[str, Any] = {
             'flag_gap': "OK", 'flag_liquidity': "OK", 'flag_stale': "OK", 'flag_scale': "OK",
             'scale_reason': "", 'price_scale_ratio': 1.0, 'stale_days': 0, 'trend_sma50': "OK",
@@ -274,10 +274,15 @@ class MarketDataManager:
             'mom_score_adj': None, 'mom_accel': None,
             'stale_days_max': 0
         }
-        # Identifiziere die Berechnungsspalte (Adj Close hat Vorrang)
-        calc_col = 'Adj Close' if 'Adj Close' in hist_data.columns else 'Close'
-        if calc_col not in hist_data.columns or hist_data.empty: return flags
-        hist_close = hist_data[calc_col].dropna()
+        
+        # Nutze die reparierte Serie, falls vorhanden, sonst Fallback auf Spalten
+        if price_series is not None:
+            hist_close = price_series.dropna()
+        else:
+            calc_col = 'Adj Close' if 'Adj Close' in hist_data.columns else 'Close'
+            if calc_col not in hist_data.columns or hist_data.empty: return flags
+            hist_close = hist_data[calc_col].dropna()
+
         if len(hist_close) < 20: return flags
 
         try:
@@ -534,13 +539,12 @@ class MarketDataManager:
             
             curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
             sma = analysis.get('rsl_sma', curr)
-            hist_adj['Adj Close'] = clean_series
             is_young_history = len(clean_series.dropna()) < sma_len
             if is_young_history:
                 self.young_tickers[ticker] = {'ticker': ticker, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
 
             vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-            flags = self._calculate_flags(hist_adj, curr, sma, is_young_history)
+            flags = self._calculate_flags(hist_adj, curr, sma, is_young_history, price_series=clean_series)
             flags['integrity_reasons'] = analysis.get('integrity_reasons', [])
             
             with self.lock:
