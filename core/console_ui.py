@@ -22,10 +22,10 @@ MAIN_EXPORT_COLUMN_ORDER = [
     "Branche",
     "Land",
     "Kurs",
+    "Market Cap (Mio EUR)",
+    "Umsatz 20T (Mio EUR)",
     "ATR Buy",
     "ATR Sell",
-    "Listing Umsatz 20T (Mio EUR)",
-    "Primary Liquidity 20T (Mio EUR)",
     "Peer Spread",
     "Abst. 52W-Hoch %",
     "Mom 12M",
@@ -145,9 +145,12 @@ def _build_main_export_dataframe(
     candidate_symbols: Set[str],
     watchlist_set: Set[str],
     build_yahoo_quote_url: Callable[[str], str],
+    config: Optional[Dict[str, Any]] = None,
     threshold_rank: int = -1,
+    buy_threshold_rank: int = -1,
 ) -> pd.DataFrame:
     """Stellt das Haupt-DataFrame fuer den Excel-Export zusammen."""
+    config = dict(config or {})
     export_data = []
     for s in stock_results:
         d = s.to_dict()
@@ -200,7 +203,12 @@ def _build_main_export_dataframe(
             else:
                 status = "CUT"
 
-        link_type = "D" if str(s.yahoo_symbol or "").strip().isalnum() else "S"
+        # NEU: Markierung fuer die Kaufkandidaten-Grenze (Gruen)
+        if buy_threshold_rank > 0 and s.rsl_rang == buy_threshold_rank:
+            if status:
+                status += "/BUY_CUT"
+            else:
+                status = "BUY_CUT"
 
         avg_vol_display = None
         if s.avg_volume_eur is not None and isinstance(s.avg_volume_eur, (int, float)):
@@ -213,6 +221,13 @@ def _build_main_export_dataframe(
         if primary_liquidity_value is not None and isinstance(primary_liquidity_value, (int, float)):
             try:
                 primary_liquidity_display = primary_liquidity_value / 1_000_000
+            except (ValueError, TypeError):
+                pass
+
+        market_cap_display = None
+        if s.market_value is not None and isinstance(s.market_value, (int, float)):
+            try:
+                market_cap_display = s.market_value / 1_000_000
             except (ValueError, TypeError):
                 pass
 
@@ -239,20 +254,26 @@ def _build_main_export_dataframe(
             source_display_parts.append(f"Boerse: {listing_source_txt}")
         source_display = " | ".join(source_display_parts)
 
+        link_symbol = str(s.yahoo_symbol or "").strip()
+        link_mode = ""
+        if link_symbol:
+            link_mode = "D" if link_symbol.isalnum() else "S"
+
         row = {
             'RSL-Rang': s.rsl_rang,
             'RSL': d['rsl'],
             'Tr': rsl_dir,
             'Ticker': s.yahoo_symbol,
             'ISIN': getattr(s, 'isin', ''),
-            'Lk': link_type,
             'Name': s.name,
             'St': status,
+            'Lk': link_mode,
             'MktCap-Rang': s.mktcap_rang,
             'Orig. Ticker': s.original_ticker,
             'Sektor': s.sector,
             'Branche': s.industry,
             'Land': s.land,
+            'Market Cap (Mio EUR)': market_cap_display,
             'ETFs/Boerse': source_display,
             'RSL 1W Diff': d['rsl_change_1w'],
             'Mom Cluster': s.mom_cluster,
@@ -262,8 +283,7 @@ def _build_main_export_dataframe(
             'Kurs': d['kurs'],
             'ATR Buy': atr_limit_value,
             'ATR Sell': atr_sell_limit_value,
-            'Listing Umsatz 20T (Mio EUR)': avg_vol_display,
-            'Primary Liquidity 20T (Mio EUR)': primary_liquidity_display,
+            'Umsatz 20T (Mio EUR)': primary_liquidity_display or avg_vol_display,
             'Peer Spread': getattr(s, 'peer_spread', np.nan),
             'Abst. 52W-Hoch %': getattr(s, 'distance_52w_high_pct', np.nan),
             'SMA50': s.trend_sma50, 'Trend-Qual.': s.trend_quality,
@@ -404,6 +424,7 @@ def render_analysis_output(
     suggest_portfolio_candidates: Optional[Callable] = None,
     market_regime: Optional[Dict[str, Any]] = None,
     integrity_drops_df: Optional[pd.DataFrame] = None,
+    universe_audit_df: Optional[pd.DataFrame] = None,
     watchlist_symbols: Optional[set] = None,
 ) -> None:
     current_portfolio_dicts = portfolio_mgr.current_portfolio
@@ -429,6 +450,10 @@ def render_analysis_output(
 
     n_stocks = len(stock_results)
     hold_threshold_rank = max(1, int(n_stocks * config['top_percent_threshold']))
+    # NEU: Kauf-Schwelle berechnen (z.B. Top 1%)
+    buy_threshold_pct = float(config.get('candidate_top_percent_threshold', 0.01) or 0.01)
+    buy_threshold_rank = max(1, int(np.ceil(n_stocks * buy_threshold_pct)))
+
     warning_threshold_rank = max(1, int(hold_threshold_rank * 0.9))
     multiscope_status_map = build_multiscope_status_map(
         stock_results=stock_results,
@@ -634,15 +659,8 @@ def render_analysis_output(
         for _, row in top_industries_for_candidates_df.iterrows():
             rank = row.get('Rank', '')
             branche = _shorten_text(str(row.get('Branche', '')), 35)
-            # Rueckwaertskompatibilitaet:
-            # Aeltere Exporte/Snapshots koennen den Spaltennamen noch mit der frueheren
-            # Umlaut-/Mojibake-Variante enthalten. Wir lesen deshalb beide Varianten.
-            sector_val = str(
-                row.get(
-                    'Sektor (repraesentativ)',
-                    row.get('Sektor (reprÃ¤sentativ)', '')
-                )
-            )
+            # Nutzt den neuen, sauberen Schluessel ohne Umlaute
+            sector_val = str(row.get('Sektor', 'Unknown'))
             sector = _shorten_text(sector_val, 25)
             
             score_val = row.get('Score')
@@ -1154,7 +1172,7 @@ def render_analysis_output(
                         f" | RSL1W={_fmt_component(detail.get('rsl_change_component'))}"
                         f" | Peer={_fmt_component(detail.get('peer_spread_component'))}"
                         f" | IndustryAdj={_fmt_component(detail.get('industry_neutral_component'))}"
-                        f" | Final={_fmt_plain(detail.get('final_score'))}"
+                        f" | P-Rank={_fmt_plain(detail.get('final_score'))}"
                     )
                     dist_52w_txt = "-"
                     if detail.get("max_distance_52w_high_pct", 0):
@@ -1239,7 +1257,9 @@ def render_analysis_output(
         candidate_symbols,
         watchlist_set,
         build_yahoo_quote_url,
-        threshold_rank=hold_threshold_rank
+        config=config,
+        threshold_rank=hold_threshold_rank,
+        buy_threshold_rank=buy_threshold_rank
     )
     raw_df_out = _build_raw_export_dataframe(
         stock_results,
@@ -1291,7 +1311,10 @@ def render_analysis_output(
         ysym = str(getattr(s, "yahoo_symbol", "")).strip().upper()
         if not ysym:
             continue
-        memberships = [p.strip().upper() for p in str(getattr(s, "source_etf", "")).split(",") if p and p.strip()]
+        source_tokens = [p.strip().upper() for p in str(getattr(s, "source_etf", "")).split(",") if p and p.strip()]
+        listing_tokens = [p.strip().upper() for p in str(getattr(s, "listing_source", "")).split(",") if p and p.strip()]
+        memberships = list(set(source_tokens) | set(listing_tokens))
+
         sector_name = str(getattr(s, "sector", "")).strip() or "Unbekannt"
         industry_name = str(getattr(s, "industry", "")).strip() or "Unbekannt"
         cluster_name = str(getattr(s, "mom_cluster", "")).strip()
@@ -1504,6 +1527,8 @@ def render_analysis_output(
         'indikatoren': indikator_df,
         'config_snapshot': config_snapshot_df
     }
+    if universe_audit_df is not None:
+        excel_sheets['universe_audit'] = universe_audit_df
     if integrity_drops_df is not None and not integrity_drops_df.empty:
         excel_sheets['integrity_issues'] = integrity_drops_df
 

@@ -124,8 +124,6 @@ SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
             "mom_weight_12m": 0.50,
             "mom_weight_6m": 0.30,
             "mom_weight_3m": 0.20,
-            "history_period": "18mo",
-            "info_fetch_delay_s": 0.9,
         },
     },
     "defensiv": {
@@ -168,8 +166,6 @@ SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
             "mom_weight_12m": 0.60,
             "mom_weight_6m": 0.30,
             "mom_weight_3m": 0.10,
-            "history_period": "18mo",
-            "info_fetch_delay_s": 1.0,
         },
     },
     "dynamisch": {
@@ -212,9 +208,13 @@ SETTINGS_PRESETS: Dict[str, Dict[str, Any]] = {
             "mom_weight_12m": 0.45,
             "mom_weight_6m": 0.30,
             "mom_weight_3m": 0.25,
-            "history_period": "18mo",
-            "info_fetch_delay_s": 0.8,
         },
+    },
+    "werk": {
+        "label": "Basis - Werkszustand (Code-Defaults)",
+        "summary": "Wählt die im Programmcode fest hinterlegten Standardwerte als aktives Profil aus.",
+        "why": "Stellt sicher, dass exakt mit der programmierten Basis-Logik gerechnet wird, ohne jegliche Anpassungen.",
+        "values": USER_SETTINGS_DEFAULTS,
     },
 }
 
@@ -263,8 +263,6 @@ BUILTIN_CUSTOM_PROFILES: Dict[str, Dict[str, Any]] = {
             "mom_weight_12m": 0.40,
             "mom_weight_6m": 0.35,
             "mom_weight_3m": 0.25,
-            "history_period": "18mo",
-            "info_fetch_delay_s": 0.9,
         },
     },
     "q1_2026_breakout": {
@@ -310,8 +308,6 @@ BUILTIN_CUSTOM_PROFILES: Dict[str, Dict[str, Any]] = {
             "mom_weight_12m": 0.20,
             "mom_weight_6m": 0.30,
             "mom_weight_3m": 0.50,
-            "history_period": "18mo",
-            "info_fetch_delay_s": 0.8,
         },
     },
     "small_cap_champions": {
@@ -357,8 +353,6 @@ BUILTIN_CUSTOM_PROFILES: Dict[str, Dict[str, Any]] = {
             "mom_weight_12m": 0.30,
             "mom_weight_6m": 0.30,
             "mom_weight_3m": 0.40,
-            "history_period": "18mo",
-            "info_fetch_delay_s": 0.7,
         },
     },
 }
@@ -398,7 +392,7 @@ SETTING_LABELS: Dict[str, str] = {
 }
 
 
-PRESET_DISPLAY_ORDER: List[str] = ["standard", "defensiv", "dynamisch"]
+PRESET_DISPLAY_ORDER: List[str] = ["standard", "defensiv", "dynamisch", "werk"]
 STRATEGY_METADATA_KEY = "_active_strategy_key"
 STRATEGY_METADATA_SOURCE = "_active_strategy_source"
 PROFILE_SOURCE_PRESET = "preset"

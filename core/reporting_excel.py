@@ -79,6 +79,13 @@ def _build_yahoo_finance_url(symbol: str) -> str:
 
 
 def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, logger: Any, threshold_rank: int = -1) -> bool:
+    try:
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except (ImportError, ModuleNotFoundError):
+        logger.error("Excel-Export nicht moeglich: 'openpyxl' ist nicht installiert.")
+        return False
+
     # Define formats
     FORMAT_PERCENT = "0.00%"
     FORMAT_PERCENT_1 = "0.0%"
@@ -100,8 +107,8 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
             "Kurs": FORMAT_FLOAT_2,
             "ATR Buy": FORMAT_FLOAT_2,
             "ATR Sell": FORMAT_FLOAT_2,
-            "Listing Umsatz 20T (Mio EUR)": FORMAT_FLOAT_2,
-            "Primary Liquidity 20T (Mio EUR)": FORMAT_FLOAT_2,
+            "Umsatz 20T (Mio EUR)": FORMAT_FLOAT_2,
+            "Market Cap (Mio EUR)": FORMAT_FLOAT_2,
             "Peer Spread": FORMAT_FLOAT_4,
             "Abst. 52W-Hoch %": FORMAT_PERCENT_1,
             "Trend-Exzess": FORMAT_FLOAT_2,
@@ -141,11 +148,17 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
             "re:^candidate_.*score.*": FORMAT_FLOAT_4,
             "re:^candidate_.*component$": FORMAT_FLOAT_4,
             "re:^candidate_.*pct$": FORMAT_PERCENT_1,
+            "fallback_fraction": FORMAT_PERCENT_1,
         },
         "etf_summary": {
             "Durchschnitt RSL": FORMAT_FLOAT_4,
             "RSL am Grenzrang": FORMAT_FLOAT_4,
             "Top-% Schwelle": FORMAT_PERCENT,
+            "Breadth Ratio": FORMAT_PERCENT,
+            "Strong Breadth Ratio": FORMAT_PERCENT,
+            "Leader Ratio": FORMAT_PERCENT,
+            "Score": FORMAT_FLOAT_4,
+            "re:^Score .*": FORMAT_FLOAT_4,
         },
         "sector_summary": {
             "Durchschnitt RSL": FORMAT_FLOAT_4,
@@ -171,13 +184,17 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
             "Cluster Anteil %": FORMAT_PERCENT_1,
             "Score": FORMAT_FLOAT_4,
         },
+        "universe_audit": {
+            "Status": Font(bold=True),
+        },
+        "integrity_issues": {
+            "rsl": FORMAT_FLOAT_4,
+            "fallback_fraction": FORMAT_PERCENT_1,
+        },
     }
 
     while True:
         try:
-            from openpyxl.styles import Font, PatternFill
-            from openpyxl.utils import get_column_letter
-
             hidden_main_cols = {
                 "RSL-Rang",
                 "ETFs",
@@ -230,6 +247,7 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
             sector_hold_fill = PatternFill(fill_type="solid", fgColor="E2F0D9")
             candidate_fill = PatternFill(fill_type="solid", fgColor="E2EFDA")  # Hellgruen fuer Kaufkandidaten
             industry_top_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+            buy_cut_fill = PatternFill(fill_type="solid", fgColor="C6EFCE")  # Gruen fuer BUY_CUT Zeile
             threshold_fill = PatternFill(fill_type="solid", fgColor="FF9999")  # Rot fuer die Cutoff-Zeile
             watchlist_fill = PatternFill(fill_type="solid", fgColor="E0F7FF")
             role_font_map = {
@@ -237,25 +255,21 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
                 "Kaufkandidaten (Yahoo)": Font(color="008000", bold=True),
                 "Verkaufssignale (Yahoo)": Font(color="C00000", bold=True),
             }
-            linktype_fill_map = {
-                "D": PatternFill(fill_type="solid", fgColor="EAF4E6"),
-                "S": PatternFill(fill_type="solid", fgColor="FFF2CC"),
-            }
             main_width_map = {
                 "RSL": 7,
                 "Tr": 5,
                 "Ticker": 12,
+                "Lk": 4,
                 "Name": 26,
                 "St": 4,
-                "Lk": 4,
                 "Sektor": 16,
                 "Branche": 24,
                 "Land": 8,
                 "Kurs": 10,
                 "ATR Buy": 10,
                 "ATR Sell": 10,
-                "Listing Umsatz 20T (Mio EUR)": 15,
-                "Primary Liquidity 20T (Mio EUR)": 15,
+                "Market Cap (Mio EUR)": 15,
+                "Umsatz 20T (Mio EUR)": 15,
                 "Mom 12M": 10,
                 "Trust": 6,
                 "Trend-Qual.": 10,
@@ -340,15 +354,18 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
                                 if status_col_idx:
                                     status_val = str(ws.cell(row=row_idx, column=status_col_idx).value or "").strip().upper()
 
-                                is_held = status_val == "D"
-                                is_candidate = status_val == "K"
-                                is_watchlist = status_val == "W"
+                                is_held = status_val.startswith("D")
+                                is_candidate = "K" in status_val.split("/")
+                                is_buy_cut = "BUY_CUT" in status_val
+                                is_watchlist = status_val.startswith("W")
 
                                 if not is_held and ysym_col_idx is not None:
                                     ysym = str(ws.cell(row=row_idx, column=ysym_col_idx).value or "").strip().upper()
                                     is_held = ysym in held_symbols
 
-                                if is_held:
+                                if is_buy_cut:
+                                    _fill_row(ws, row_idx, ws.max_column, buy_cut_fill)
+                                elif is_held:
                                     # Einheitliche Farbe fuer Depotwerte, unabhaengig vom Sektor
                                     _fill_row(ws, row_idx, ws.max_column, hold_row_default_fill)
                                 elif is_candidate:
@@ -368,15 +385,6 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
                                     display = ticker.replace('"', '""')
                                     cell.value = f'=HYPERLINK("{url}","{display}")'
                                     cell.style = "Hyperlink"
-
-                        if "Lk" in df.columns and len(df.index) > 0:
-                            linktype_col_idx = list(df.columns).index("Lk") + 1
-                            for row_idx in range(2, ws.max_row + 1):
-                                cell = ws.cell(row=row_idx, column=linktype_col_idx)
-                                key = str(cell.value or "").strip().upper()
-                                fill_obj = linktype_fill_map.get(key)
-                                if fill_obj is not None:
-                                    cell.fill = fill_obj
 
                         # Markiere die Threshold-Zeile (Top-X% Grenze) am Ende, um vorherige Fills zu ueberschreiben
                         if threshold_rank > 0 and "RSL-Rang" in df.columns:
@@ -463,9 +471,6 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
             if user_in.strip().lower() == "x":
                 logger.warning("Excel-Speichern durch Benutzer abgebrochen.")
                 return False
-        except ModuleNotFoundError:
-            logger.error("Excel-Export nicht moeglich: 'openpyxl' ist nicht installiert.")
-            return False
         except ValueError as e:
             logger.error(f"Excel-Export fehlgeschlagen: {e}")
             return False

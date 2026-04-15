@@ -77,50 +77,67 @@ def generate_candidates(
         if not base:
             return []
         
-        suffix = exchange_suffix_map.get(exchange, location_suffix_map.get(land, ''))
-        suffix = str(suffix).upper().strip() if suffix else ""
-        if suffix and not suffix.startswith('.'):
-            suffix = f".{suffix}"
-        suffix = re.sub(r"[^A-Z0-9.]", "", suffix)
+        # Suffix-Bestimmung (Mapping-basiert)
+        determined_suffix = exchange_suffix_map.get(exchange, location_suffix_map.get(land, ''))
+        determined_suffix = str(determined_suffix).upper().strip() if determined_suffix else ""
+        if determined_suffix and not determined_suffix.startswith('.'):
+            determined_suffix = f".{determined_suffix}"
+        determined_suffix = re.sub(r"[^A-Z0-9.]", "", determined_suffix)
         
-        if base.isdigit():
-            if 'Hong Kong' in exchange or land == 'Hong Kong':
-                base, suffix = f"{int(base):04d}", '.HK'
-            elif 'KOSDAQ' in str(exchange).upper():
-                base, suffix = base.zfill(6), '.KQ'
-            elif 'Korea' in exchange or land in ('South Korea', 'Korea (South)'):
-                base = base.zfill(6)
-                suffix = suffix or '.KS'
-            elif 'Shanghai' in exchange:
-                suffix = '.SS'
-            elif 'Shenzhen' in exchange:
-                suffix = '.SZ'
-            elif 'Japan' in exchange or land == 'Japan':
-                suffix = '.T'
-        
+        # Extraktion des Stamm-Tickers (ohne Suffix)
         has_explicit_suffix = "." in base
+        ticker_stem = base.split('.')[0] if has_explicit_suffix else base
+        
+        # Sonderfall: iShares 'UW'/'UN'/'UQ' Suffixe (Nasdaq/NYSE) entfernen
+        if re.search(r' (UW|UN|UQ|UA|N|O|P)$', str(original).upper()):
+            ticker_stem = str(original).upper().split()[0]
+            has_explicit_suffix = False
 
-        # Bereits suffixed Yahoo-Ticker immer zuerst pruefen.
-        # Sonst entstehen ungueltige Kandidaten wie ABC.F.DE.
+        # Spezialbehandlung fuer numerische Maerkte (z.B. Japan, HK)
+        if ticker_stem.isdigit():
+            if 'Hong Kong' in exchange or land == 'Hong Kong':
+                ticker_stem, determined_suffix = f"{int(ticker_stem):04d}", '.HK'
+            elif 'KOSDAQ' in str(exchange).upper():
+                ticker_stem, determined_suffix = ticker_stem.zfill(6), '.KQ'
+            elif 'Korea' in exchange or land in ('South Korea', 'Korea (South)'):
+                ticker_stem = ticker_stem.zfill(6)
+                determined_suffix = determined_suffix or '.KS'
+            elif 'Shanghai' in exchange:
+                determined_suffix = '.SS'
+            elif 'Shenzhen' in exchange:
+                determined_suffix = '.SZ'
+            elif 'Japan' in exchange or land == 'Japan':
+                determined_suffix = '.T'
+            # Schutz: Numerische Ticker aus Fernost nicht mit westlichen Suffixen mischen
+            if ticker_stem.isdigit() and determined_suffix in ('.DE', '.F', '.L', '.PA'):
+                determined_suffix = "" 
+
+            elif land == 'Taiwan':
+                determined_suffix = '.TW'
+        
+        # Kandidaten sammeln
         if has_explicit_suffix:
-            cands.append(base)
+            cands.append(base) # Original (z.B. 6971.T)
+            cands.append(ticker_stem) # Stamm (z.B. 6971)
+            if determined_suffix:
+                cands.append(f"{ticker_stem}{determined_suffix}") # Korrigierter Suffix
         else:
-            if suffix and not base.endswith(suffix):
-                cands.append(f"{base}{suffix}")
-            cands.append(base)
+            if determined_suffix:
+                cands.append(f"{ticker_stem}{determined_suffix}")
+            cands.append(ticker_stem)
         
         if land == 'China' or 'China' in exchange:
-            if suffix == '.SS':
-                cands.append(f"{base}.SZ")
-            elif suffix == '.SZ':
-                cands.append(f"{base}.SS")
-            cands.append(f"{base}.HK")
-            if base.isdigit():
-                cands.append(f"{int(base):04d}.HK")
+            if determined_suffix == '.SS':
+                cands.append(f"{ticker_stem}.SZ")
+            elif determined_suffix == '.SZ':
+                cands.append(f"{ticker_stem}.SS")
+            cands.append(f"{ticker_stem}.HK")
+            if ticker_stem.isdigit():
+                cands.append(f"{int(ticker_stem):04d}.HK")
         
-        if '.SS' in base:
-            cands.append(base.replace('.SS', '.HK'))
-            cands.append(base.replace('.SS', ''))
+        if '.SS' in base or determined_suffix == '.SS':
+            cands.append(f"{ticker_stem}.HK")
+            cands.append(ticker_stem)
         
         normalized = []
         for cand in cands:

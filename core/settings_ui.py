@@ -81,7 +81,8 @@ def configure_user_settings_interactive(
                 for idx, preset_key in enumerate(settings_catalog_core.get_preset_keys(), start=1):
                     preset = presets[preset_key]
                     values = preset["values"]
-                    print(f"\n{idx}) {preset['label']}")
+                    is_active = (active_strategy.get("key") == preset_key and active_strategy.get("source") == settings_catalog_core.PROFILE_SOURCE_PRESET)
+                    print(f"\n{idx}) {preset['label']} {' \033[92m(AKTIV)\033[0m' if is_active else ''}")
                     print(f"   Zweck: {preset['summary']}")
                     print(f"   Warum so: {preset['why']}")
                     if preset.get("market_context"):
@@ -101,9 +102,12 @@ def configure_user_settings_interactive(
                         f"Cluster={int(values['cluster_top_n'])}/{int(values['cluster_min_size'])}, "
                         f"Mom={float(values['mom_weight_12m']):.2f}/{float(values['mom_weight_6m']):.2f}/{float(values['mom_weight_3m']):.2f}"
                     )
-                choice = input("\nPaket anwenden [1-3, Enter=zurueck]: ").strip()
-                key_map = {"1": "standard", "2": "defensiv", "3": "dynamisch"}
-                preset_key = key_map.get(choice)
+                preset_keys = settings_catalog_core.get_preset_keys()
+                choice = input(f"\nPaket anwenden [1-{len(preset_keys)}, Enter=zurueck]: ").strip()
+                preset_key = None
+                if choice.isdigit() and 1 <= int(choice) <= len(preset_keys):
+                    preset_key = preset_keys[int(choice) - 1]
+
                 if preset_key:
                     settings.update(presets[preset_key]["values"])
                     settings[settings_catalog_core.STRATEGY_METADATA_KEY] = preset_key

@@ -88,8 +88,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dividend_multiplier_tolerance": 0.08,  # 8 %-Punkte Abweichung
 
     # Rendite-/Serienbruch-Trigger
-    "daily_return_warn_threshold": 0.35,    # 35 %
-    "daily_return_hard_threshold": 0.80,    # 80 %
+    "daily_return_warn_threshold": 0.25,    # Strikter: 25 % (Auffaelligkeit)
+    "daily_return_hard_threshold": 0.60,    # Strikter: 60 % (Blockiert Bad Ticks schneller)
 
     # Negative / nicht sinnvolle Preise
     "allow_zero_prices": False,
@@ -102,12 +102,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "foreign_secondary_suffixes": [".F", ".BE", ".MU", ".DU", ".SG", ".HM"],
 
     # Wenn zu viele Fallback-Tage in der RSL-Basis vorkommen
-    "fallback_fraction_warn": 0.10,
-    "fallback_fraction_hard": 0.35,
+    "fallback_fraction_warn": 0.08,
+    "fallback_fraction_hard": 0.25,
 
     # Wenn zu viele Flat-Tage in Folge vorkommen
-    "flat_run_warn": 10,
-    "flat_run_hard": 25,
+    "flat_run_warn": 7,
+    "flat_run_hard": 15,
+
+    # NEU: Kausale Qualitäts-Checks
+    "min_trading_participation_ratio": 0.15,  # Zurueck auf strikt: 15% Handelstage in 60d
+    "absolute_minimum_price": 0.01,           # Strikter: 1 Cent Floor (verhindert Zombie-Momentum)
+    "price_volume_coherence_threshold": 10.0, # Toleranter gegenüber Sprüngen bei dünnem Handel
+    "price_scale_critical_ratio": 50.0,       # Zurueck auf strikt: Ab 50x hart ausschliessen
 }
 
 
@@ -324,6 +330,16 @@ def _looks_like_foreign_secondary_listing(
     c = str(country).strip().lower()
     return c not in {"deutschland", "germany", "de", "ger"}
 
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", ".")
+        f = float(value)
+        return f if np.isfinite(f) else default
+    except (ValueError, TypeError):
+        return default
 
 def _normalize_string(x: Any) -> str:
     if x is None:
@@ -407,6 +423,13 @@ def validate_basic_history_integrity(
     reasons = IntegrityReasonSet()
     diagnostics: Dict[str, Any] = {}
 
+    # Defensive Spaltenprüfung
+    required = ['Close', 'Volume']
+    missing = [c for c in required if c not in history_df.columns]
+    if missing or history_df.empty:
+        reasons.add("missing_data_columns", "hard_fail")
+        return reasons, diagnostics
+
     df = normalize_history_frame(history_df)
 
     if df.empty:
@@ -419,6 +442,16 @@ def validate_basic_history_integrity(
     adj_col = cols["adj_close"]
 
     diagnostics["history_rows"] = int(len(df))
+
+    # KAUSALER CHECK 6: Zeitliche Kontinuität (Missing Chunks)
+    # Yahoo liefert manchmal "löchrige" Daten für exotische Börsen.
+    if not df.index.empty:
+        date_diffs = pd.Series(df.index).diff().dt.days
+        max_gap = float(date_diffs.max())
+        diagnostics["max_date_gap_days"] = max_gap
+        if max_gap > 90: # Zurueck auf strikt: Luecken > 1 Quartal blockieren
+            reasons.add("critical_date_gap_in_history", "warning")
+            reasons.add("history_has_huge_gaps", "review")
 
     if close_col is None and adj_col is None:
         reasons.add("missing_close_and_adjclose", "hard_fail")
@@ -440,6 +473,9 @@ def validate_basic_history_integrity(
         reasons.add("no_valid_price_values", "hard_fail")
         return reasons, diagnostics
 
+    # Basis-Renditen berechnen (wird für mehrere nachfolgende Checks benötigt)
+    returns = valid_price.pct_change().replace([np.inf, -np.inf], np.nan)
+
     if (valid_price < 0).any():
         reasons.add("negative_price_values", "hard_fail")
 
@@ -460,13 +496,118 @@ def validate_basic_history_integrity(
     elif max_flat_run >= cfg["flat_run_warn"]:
         reasons.add("stale_price_series_flat_run", "warning")
 
-    returns = valid_price.pct_change().replace([np.inf, -np.inf], np.nan)
-    if len(returns.dropna()) > 0:
-        max_abs_ret = float(returns.abs().max())
+    # URSACHE 1: Absolute Illiquidität (Ghost Ticker)
+    # Wenn an diesem Listing in den letzten 20 Tagen überhaupt kein Handel stattfand,
+    # sind die Preisdaten für eine Trendberechnung nicht belastbar.
+    vol_col = _get_price_columns(df)["volume"]
+    if vol_col:
+        # KAUSALER CHECK 1: Handelsbeteiligung (Trading Participation)
+        # Prüft, an wie vielen Tagen in den letzten 60 Tagen tatsächlich Volumen floss.
+        recent_vol = df[vol_col].tail(60)
+        trading_days = int((recent_vol > 0).sum())
+        participation_ratio = trading_days / len(recent_vol) if len(recent_vol) > 0 else 0
+        diagnostics["trading_participation_60d"] = float(participation_ratio)
+        
+        if participation_ratio < cfg.get("min_trading_participation_ratio", 0.15):
+            reasons.add("insufficient_trading_participation", "warning")
+
+        # Erweiterter Liquiditäts-Check: Median-Volumen muss positiv sein
+        vol_series = df[vol_col].tail(20)
+        median_vol = float(vol_series.median())
+        diagnostics["avg_volume_20d"] = median_vol
+        
+        if median_vol <= 0:
+            reasons.add("zero_volume_listing_dead", "warning")
+        elif (vol_series == 0).sum() > 15: # Mehr als 15 von 20 Tagen kein Handel
+            reasons.add("extreme_intermittent_trading", "warning")
+
+    # URSACHE: Preis unter absolutem Minimum (Penny-Stock Trash)
+    abs_min = float(cfg.get("absolute_minimum_price", 0.01))
+    if valid_price.iloc[-1] < abs_min:
+        reasons.add("price_below_absolute_minimum", "hard_fail")
+
+    # URSACHE 2: Technischer Skalenbruch (angepasst auf SMA-Fenster)
+    # Wir prüfen die Preis-Skala nur für die letzten 130 Tage (ca. 6 Monate).
+    # Dies deckt den Zeitraum ab, der den SMA(130) und somit den RSL direkt beeinflusst.
+    recent_prices = valid_price.tail(130)
+    price_range_ratio = recent_prices.max() / recent_prices.min() if not recent_prices.empty and recent_prices.min() > 0 else 0
+    if price_range_ratio >= cfg.get("price_scale_critical_ratio", 50.0):
+        reasons.add("technical_scale_break_suspected", "hard_fail") 
+    elif price_range_ratio >= 30.0:
+        reasons.add("large_price_scale_ratio", "warning")
+
+    # KAUSALER CHECK 4: Preis-Volumen-Inkohärenz
+    # Erkennt extreme Preissprünge, die ohne jegliche Handelsaktivität passieren (Bad Ticks)
+    if vol_col:
+        abs_rets = returns.abs()
+        # Wir prüfen nur Sprünge im SMA-Fenster (130 Tage)
+        recent_rets = abs_rets.tail(130)
+        extreme_move_days = recent_rets[recent_rets > cfg["daily_return_warn_threshold"]].index
+        if not extreme_move_days.empty:
+            avg_vol_20d = diagnostics.get("avg_volume_20d", 0)
+            for dt in extreme_move_days:
+                day_vol = df.loc[dt, vol_col]
+                # Wenn das Volumen am Tag des Sprungs fast Null ist oder massiv unter dem Schnitt liegt
+                if day_vol < 5 or (avg_vol_20d > 0 and day_vol < (avg_vol_20d / cfg["price_volume_coherence_threshold"])):
+                    reasons.add("price_jump_without_volume_confirmation", "warning")
+                    break
+
+    # KAUSALER CHECK 5: Ein-Tages-Ausreißer (Bad Tick Detection)
+    # Verhindert, dass singuläre Datenfehler den SMA/RSL verfälschen.
+    if len(valid_price) >= 3 and (valid_price > 0).all():
+        # Preis-Rückkehr-Check (Spike & Reversal)
+        log_prices = np.log(valid_price)
+        log_rets = log_prices.diff()
+        
+        # Suche nach |log_ret| > 0.18 (ca 20%) gefolgt von fast exakter Umkehrung
+        spike_detect = (log_rets.abs() > 0.18).tail(130)
+        if spike_detect.any():
+            for dt in spike_detect[spike_detect].index:
+                loc = valid_price.index.get_loc(dt)
+                if loc < len(valid_price) - 1:
+                    next_log_ret = log_rets.iloc[loc + 1]
+                    # Wenn der heutige Sprung durch den morgigen fast neutralisiert wird (< 3% Rest)
+                    if abs(log_rets.loc[dt] + next_log_ret) < 0.03:
+                        reasons.add("one_day_price_outlier_detected", "warning")
+                        diagnostics["bad_tick_date"] = str(dt.date())
+                        break
+
+    # KAUSALER CHECK 7: Mikro-Umsatz (Faktische Illiquidität)
+    # Wenn zwar "Preise" da sind, aber der Tagesumsatz unter 100 EUR liegt,
+    # ist der Preis nicht repräsentativ für den Markt.
+    if vol_col and close_col:
+        turnover = df[close_col] * df[vol_col]
+        recent_turnover = turnover.tail(60)
+        # Wenn an mehr als 80% der Tage mit Umsatz dieser unter 100 EUR lag
+        trading_days_with_vol = recent_turnover[recent_turnover > 0]
+        if len(trading_days_with_vol) > 5:
+            micro_days = (trading_days_with_vol < 100).sum()
+            micro_ratio = micro_days / len(trading_days_with_vol)
+            if micro_ratio > 0.80:
+                reasons.add("insufficient_monetary_turnover", "review")
+
+    # KAUSALER CHECK 8: Unprotokollierter Split-Verdacht
+    # Preissturz um fast exakt 50%, 75% oder 90% an einem Tag OHNE Split-Ereignis.
+    if not returns.empty:
+        split_ratios = [0.5, 0.3333, 0.25, 0.2, 0.1, 0.05]
+        recent_rets = returns.tail(130)
+        price_ratios = recent_rets + 1.0
+        for ratio in split_ratios:
+            unrecorded_split = price_ratios[(price_ratios / ratio - 1).abs() < 0.01]
+            if not unrecorded_split.empty:
+                for dt in unrecorded_split.index:
+                    if dt in df.index and df.loc[dt, _get_split_col(df)] == 0:
+                        reasons.add("unrecorded_stock_split_suspected", "warning")
+                        break
+
+    # Rendite-Check ebenfalls auf SMA-Fenster begrenzen
+    recent_abs_rets = returns.abs().tail(130)
+    if not recent_abs_rets.dropna().empty:
+        max_abs_ret = float(recent_abs_rets.max())
         diagnostics["max_abs_daily_return"] = max_abs_ret
 
         if max_abs_ret >= cfg["daily_return_hard_threshold"]:
-            reasons.add("extreme_price_discontinuity", "hard_fail")
+            reasons.add("extreme_price_discontinuity", "warning")
         elif max_abs_ret >= cfg["daily_return_warn_threshold"]:
             reasons.add("large_price_discontinuity", "warning")
 
@@ -633,7 +774,7 @@ def detect_dividend_adjustment_issues(
             if "adjclose_close_gap_unplausible_for_dividend" in event_reasons and sev != "hard_fail":
                 reasons.add("bad_dividend_adjustment", "warning")
             if "extreme_adjclose_close_gap_in_dividend_window" in event_reasons:
-                reasons.add("bad_dividend_adjustment", "hard_fail")
+                reasons.add("bad_dividend_adjustment", "warning")
             elif "large_adjclose_close_gap_in_dividend_window" in event_reasons:
                 reasons.add("bad_dividend_adjustment", "warning")
 
@@ -788,7 +929,7 @@ def build_rsl_price_series(
     diagnostics["used_close_fallback"] = used_close_fallback
 
     if fallback_fraction >= cfg["fallback_fraction_hard"]:
-        reasons.add("fallback_fraction_too_high", "hard_fail")
+        reasons.add("fallback_fraction_too_high", "warning")
     elif fallback_fraction >= cfg["fallback_fraction_warn"]:
         reasons.add("fallback_fraction_elevated", "warning")
 
@@ -857,6 +998,7 @@ def analyze_history_for_rsl_integrity(
         'rsl_price_column': res.rsl_price_column,
         'used_close_fallback': res.used_close_fallback,
         'integrity_reasons': res.reasons.all_reasons(),
+        'excluded_from_ranking': res.reasons.has_hard_fail(),
         'rsl_sma': last_sma,
         'rsl_value': last_rsl,
         'rsl_past': rsl_past,
@@ -920,16 +1062,46 @@ def evaluate_stock_rsl_integrity(
     if history is None or not isinstance(history, pd.DataFrame) or len(history) == 0:
         # Falls das Item bereits Metadaten hat (vom DataManager), nutzen wir diese
         existing_status = str(_get_row_value(item, ["ranking_integrity_status"], "")).lower()
-        if existing_status and existing_status != "missing_history":
+        if existing_status and existing_status not in ("", "missing_history", "none", "nan"):
+            # Sticky Status: Wir vertrauen der vorherigen Entscheidung, 
+            # da im Re-Render oft die volle Historie fuer Neu-Checks fehlt.
+            excluded = bool(_get_row_value(item, ["excluded_from_ranking"], False))
+            
+            # Restore sub-lists correctly (handle both actual lists and joined strings from DFs)
+            hf = _safe_list(_get_row_value(item, ["hard_fail_reasons"], []))
+            wf = _safe_list(_get_row_value(item, ["warning_reasons"], []))
+            rv = _safe_list(_get_row_value(item, ["review_reasons"], []))
+
+            # NEU: Sanity Check für extreme RSL Werte (Strategische Plausibilität)
+            rsl_val = _to_float(raw_rsl, 0.0)
+            if rsl_val >= 1.5:
+                # Wenn RSL extrem hoch, aber Momentum fehlt -> Review Marker
+                mom6 = _get_row_value(item, ["mom_6m"])
+                if mom6 is not None and _to_float(mom6) < 0.10:
+                    if "high_rsl_without_momentum_confirmation" not in rv:
+                        rv.append("high_rsl_without_momentum_confirmation")
+                
+                # Trend-Qualitaet Check
+                smoothness = _to_float(_get_row_value(item, ["trend_smoothness"]), 0.0)
+                if smoothness < 0.3:
+                    if "high_rsl_low_smoothness_suspicious" not in rv:
+                        rv.append("high_rsl_low_smoothness_suspicious")
+
             result["ranking_integrity_status"] = existing_status
-            result["excluded_from_ranking"] = bool(_get_row_value(item, ["excluded_from_ranking"], False))
+            result["excluded_from_ranking"] = excluded
+            result["hard_fail_reasons"] = hf
+            result["warning_reasons"] = wf
+            result["review_reasons"] = rv
             result["ranking_exclude_reason"] = str(_get_row_value(item, ["ranking_exclude_reason"], ""))
             result["rsl_price_source"] = str(_get_row_value(item, ["rsl_price_source"], "missing"))
             result["repair_applied"] = bool(_get_row_value(item, ["repair_applied"], False))
+            result["repair_method"] = str(_get_row_value(item, ["repair_method"], ""))
+            result["repair_reason"] = str(_get_row_value(item, ["repair_reason"], ""))
             result["used_close_fallback"] = bool(_get_row_value(item, ["used_close_fallback"], False))
             result["fallback_fraction"] = _get_row_value(item, ["fallback_fraction"])
-            result["integrity_warnings"] = _safe_list(_get_row_value(item, ["integrity_warnings", "integrity_reasons"], []))
-            result["drop_reasons"] = _unique_keep_order(result["integrity_warnings"])
+            result["diagnostics"] = _get_row_value(item, ["diagnostics"], {})
+            result["integrity_warnings"] = _unique_keep_order(wf + rv)
+            result["drop_reasons"] = _unique_keep_order(hf + wf + rv)
             return result
             
         if _looks_like_foreign_secondary_listing(ticker, country, cfg):
@@ -1121,13 +1293,19 @@ def _audit_row_from_item(stock: Any) -> Dict[str, Any]:
         "ticker": _get_row_value(stock, ["yahoo_symbol", "ticker", "Ticker", "Symbol", "symbol"], ""),
         "name": _get_row_value(stock, ["name", "Name", "company_name"], ""),
         "country": _get_row_value(stock, ["land", "Land", "country", "Country"], ""),
+        "Kurs": _get_row_value(stock, ["kurs"], 0.0),
+        "Market Cap (Mio EUR)": _to_float(_get_row_value(stock, ["market_value", "market_cap"], 0.0)) / 1_000_000,
+        "Umsatz 20T (Mio EUR)": _to_float(_get_row_value(stock, ["primary_liquidity_eur", "avg_volume_eur"], 0.0)) / 1_000_000,
         "rsl": _get_row_value(stock, ["rsl", "RSL", "rsl_value"], None),
         "rsl_rank": _get_row_value(stock, ["rsl_rank", "rank", "Rank"], None),
+        "Trust": _get_row_value(stock, ["trust_score"], 0),
         "ranking_integrity_status": _get_row_value(stock, ["ranking_integrity_status"], ""),
         "excluded_from_ranking": _get_row_value(stock, ["excluded_from_ranking"], False),
         "ranking_exclude_reason": _get_row_value(stock, ["ranking_exclude_reason"], ""),
         "used_close_fallback": _get_row_value(stock, ["used_close_fallback"], False),
         "rsl_price_source": _get_row_value(stock, ["rsl_price_source"], ""),
+        "price_scale_ratio": _get_row_value(stock, ["price_scale_ratio"], 1.0),
+        "stale_days": _get_row_value(stock, ["stale_days"], 0),
         "fallback_fraction": _get_row_value(stock, ["fallback_fraction"], None),
         "repair_applied": _get_row_value(stock, ["repair_applied"], False),
         "repair_method": _get_row_value(stock, ["repair_method"], ""),

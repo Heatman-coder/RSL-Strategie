@@ -37,8 +37,8 @@ _CORPORATE_SUFFIX_TOKENS = {
 
 
 def normalize_name_for_dedup(name: Any) -> str:
-    text = unicodedata.normalize("NFKD", str(name or ""))
-    text = text.encode("ascii", "ignore").decode("ascii")
+    # Nutze NFKC fuer robustere Normalisierung von Sonderzeichen
+    text = unicodedata.normalize("NFKC", str(name or ""))
     text = text.replace("&", " and ")
     text = re.sub(r"\bs\.?\s*a\.?\b", " sa ", text, flags=re.IGNORECASE)
     text = re.sub(r"\bn\.?\s*v\.?\b", " nv ", text, flags=re.IGNORECASE)

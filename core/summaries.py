@@ -21,7 +21,10 @@ def build_etf_rsl_summary(
     etf_rsl_past_map: Dict[str, List[float]] = {sym: [] for sym in etf_syms}
 
     for stock in stock_results:
-        memberships = set(_split_source_etfs(stock.source_etf))
+        source_tokens = _split_source_etfs(getattr(stock, 'source_etf', ""))
+        listing_tokens = _split_source_etfs(getattr(stock, 'listing_source', ""))
+        memberships = set(source_tokens) | set(listing_tokens)
+
         if not memberships:
             continue
         for etf_sym in memberships:
@@ -144,7 +147,10 @@ def build_etf_rsl_summary(
     selected_set = set(etf_syms)
     combined_values = []
     for stock in stock_results:
-        memberships = set(_split_source_etfs(stock.source_etf))
+        source_tokens = _split_source_etfs(getattr(stock, 'source_etf', ""))
+        listing_tokens = _split_source_etfs(getattr(stock, 'listing_source', ""))
+        memberships = set(source_tokens) | set(listing_tokens)
+
         if memberships & selected_set:
             try:
                 combined_values.append(float(stock.rsl))
@@ -417,7 +423,7 @@ def build_industry_rsl_summary(
         
         row = {
             'Branche': industry,
-            'Sektor (repräsentativ)': representative_sector,
+            'Sektor': representative_sector,
             'Aktien': count_total,
             'Breadth > 1.1': count_strong,
             'Breadth Ratio': breadth,

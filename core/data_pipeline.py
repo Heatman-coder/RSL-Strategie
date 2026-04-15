@@ -16,12 +16,15 @@ def _safe_get_columns(data):
 
 def _get_ticker_priority(ticker: Any) -> int:
     t = str(ticker or "").strip().upper()
-    if t.endswith(".DE"): return 1
-    if t and "." not in t: return 5
-    native_suffixes = [".T", ".L", ".HK", ".TO", ".AX", ".OL", ".ST", ".CO", ".KS", ".KQ", ".TW", ".TWO"]
+    # 1. Prio: US-Original (kein Punkt) oder Native Maerkte (z.B. .OL fuer Norwegen)
+    native_suffixes = [".T", ".L", ".HK", ".TO", ".AX", ".OL", ".ST", ".CO", ".KS", ".KQ", ".TW", ".TWO", ".SS", ".SZ", ".SN"]
     if any(t.endswith(s) for s in native_suffixes):
-        return 10
-    if t.endswith(".F") or t.endswith(".SG") or t.endswith(".DU"):
+        return 1
+    if t and "." not in t: return 2
+    # 2. Prio: Xetra (.DE)
+    if t.endswith(".DE"): return 10
+    # 3. Prio: Andere deutsche Regionalboersen
+    if t.endswith((".F", ".SG", ".DU", ".BE", ".HM", ".MU")):
         return 100
     return 200
 
@@ -45,7 +48,8 @@ def _has_valid_isin_data(df: pd.DataFrame) -> bool:
     valid = cleaned[~cleaned.isin(["", "NAN", "NONE"])]
     if valid.empty:
         return False
-    return bool((valid.str.match(r'^[A-Z]{2}[A-Z0-9]{9}\d$')).any())
+    # Toleranterer Check: 2 Buchstaben + 10 alphanumerische Zeichen
+    return bool((valid.str.match(r'^[A-Z]{2}[A-Z0-9]{10}$')).any())
 
 
 def load_selected_etf_universe(
@@ -152,8 +156,18 @@ def load_selected_etf_universe(
             logger.error("Keine Daten fuer die gewaehlte Auswahl im Cache gefunden.")
             return pd.DataFrame(), 0
 
+    # Spalten-Normalisierung: Symbol -> Ticker, Isin -> ISIN
+    rename_map = {
+        "Symbol": "Ticker",
+        "Isin": "ISIN"
+    }
+    master_df = master_df.rename(columns={k: v for k, v in rename_map.items() if k in master_df.columns})
+
     if "Sector" in master_df.columns:
         master_df["Sector"] = master_df["Sector"].apply(normalize_sector_name)
+
+    if "Location" in master_df.columns and "Land" not in master_df.columns:
+        master_df = master_df.rename(columns={"Location": "Land"})
 
     if "Listing_Source" not in master_df.columns:
         master_df["Listing_Source"] = ""
@@ -168,6 +182,9 @@ def load_selected_etf_universe(
     # Deduplizierung nach ISIN (falls vorhanden), sonst Name, sonst Ticker
     # Wir fassen die Quellen (Source_ETF) fuer dieselbe ISIN zusammen
     if _has_valid_isin_data(master_df):
+        # ISIN-Spalte vereinheitlichen und Platzhalter entfernen
+        master_df["ISIN"] = master_df["ISIN"].astype(str).str.strip().str.upper()
+        master_df.loc[master_df["ISIN"].isin(["", "NAN", "NONE", "0", "NULL"]), "ISIN"] = np.nan
         master_df["_dedup_id"] = master_df["ISIN"].fillna(master_df["Ticker"]).astype(str).str.strip().str.upper()
     elif "Name" in master_df.columns:
         master_df["_norm_name"] = master_df["Name"].apply(_normalize_name_for_dedup)
@@ -231,8 +248,17 @@ def load_exchange_universe(
         try:
             response = requests.get(url, headers=headers, timeout=30)
             response.raise_for_status()
-            # CSV parsen (skiprows=2 ist typisch fuer T7 Berichte)
-            df = pd.read_csv(io.StringIO(response.text), sep=None, skiprows=2, engine='python')
+
+            # Robustes CSV-Parsing: Header-Suche statt festem Skip
+            text = response.text
+            lines = text.splitlines()
+            header_idx = 0
+            for idx, line in enumerate(lines[:15]):
+                if "ISIN" in line.upper() and ("MNEMONIC" in line.upper() or "TICKER" in line.upper()):
+                    header_idx = idx
+                    break
+            
+            df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), sep=None, engine='python')
             df.columns = df.columns.str.strip()
             
             # 1. Filter: Nur Common Stocks (Aktien) wie in beispiel.py
@@ -333,9 +359,24 @@ def perform_final_deduplication(results: List[Any]) -> List[Any]:
         if len(group) == 1:
             final_deduped.append(group[0])
             continue
-        group.sort(key=lambda s: (-getattr(s, 'trust_score', 0), -getattr(s, 'primary_liquidity_eur', 0), support.stock_history_priority_score(s, {})))
+        # Sortierung: ETF-Herkunft (Prio 1) -> Trust-Score -> Liquiditaet -> Ticker-Prioritaet
+        # Nutze primary_liquidity_eur falls vorhanden, sonst avg_volume_eur
+        group.sort(key=lambda s: (
+            0 if str(getattr(s, 'source_etf', '')).strip() and getattr(s, 'source_etf') != 'MANUAL' else 1,
+            -int(getattr(s, 'trust_score', 0)), 
+            -float(getattr(s, 'primary_liquidity_eur', getattr(s, 'avg_volume_eur', 0.0))), 
+            support.stock_history_priority_score(s, {}))
+        )
         best = group[0]
-        # Metadaten / Quellen mergen...
+        all_sources = set()
+        all_listings = set()
+        for s in group:
+            all_sources.update(support.parse_tokens(getattr(s, 'source_etf', "")))
+            all_listings.update(support.parse_tokens(getattr(s, 'listing_source', "")))
+        
+        best.source_etf = ", ".join(sorted(all_sources))
+        best.listing_source = ", ".join(sorted(all_listings))
+        
         final_deduped.append(best)
 
     return final_deduped

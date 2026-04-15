@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from collections import defaultdict
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import requests # type: ignore
@@ -22,6 +23,105 @@ def _item_value(item: Any, *keys: str) -> Any:
         if hasattr(item, key):
             return getattr(item, key)
     return None
+
+
+def load_json_config(file_path: str, is_list: bool = False) -> Any:
+    """Lädt eine JSON-Konfigurationsdatei sicher."""
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return [] if is_list else {}
+
+
+def save_json_config(file_path: str, data: Any) -> None:
+    """Speichert Daten sicher als JSON."""
+    try:
+        folder = os.path.dirname(file_path)
+        if folder and not os.path.exists(folder):
+            os.makedirs(folder, exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (ValueError, TypeError):
+        return float(default)
+
+
+def to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        val = value.strip().lower()
+        if val in ("1", "true", "yes", "y", "ja", "on"):
+            return True
+        if val in ("0", "false", "no", "n", "nein", "off"):
+            return False
+    return bool(default)
+
+
+def safe_positive_float(val: Any, default: float = 0.0) -> float:
+    """Konvertiert zu Float und stellt sicher, dass der Wert positiv ist."""
+    try:
+        f = float(val)
+        return f if f > 0 else float(default)
+    except (ValueError, TypeError):
+        return float(default)
+
+
+def normalize_weights(*weights: Any) -> Tuple[float, ...]:
+    """Normalisiert eine beliebige Anzahl an Gewichten auf die Summe 1.0."""
+    vals = [max(0.0, to_float(w)) for w in weights]
+    total = sum(vals)
+    if total <= 0:
+        return tuple(1.0 / len(vals) for _ in vals)
+    return tuple(v / total for v in vals)
+
+
+def calc_momentum(series: pd.Series, curr_price: float, lookback: int) -> Optional[float]:
+    """Berechnet das Momentum über einen Zeitraum unter Berücksichtigung von Fehlwerten."""
+    if lookback <= 0 or len(series) < lookback:
+        return None
+    past_price = float(series.iloc[-lookback])
+    if past_price <= 0:
+        return None
+    return (curr_price / past_price) - 1.0
+
+
+def load_watchlist_symbols(file_path: str) -> set:
+    path = str(file_path or "").strip()
+    if not path:
+        return set()
+    try:
+        if not os.path.exists(path):
+            return set()
+        if path.lower().endswith(".json"):
+            items = load_json_config(path, is_list=True)
+            return {str(x).strip().upper() for x in items if str(x).strip()}
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        for sep in [",", ";"]:
+            raw = raw.replace(sep, "\n")
+        symbols = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            symbols.append(line)
+        return {s.strip().upper() for s in symbols if s.strip()}
+    except Exception:
+        return set()
 
 
 def parse_tokens(value: Any) -> Set[str]:
@@ -45,11 +145,11 @@ def parse_etf_selection_input(inp: str, opts: Dict[str, Any]) -> List[str]:
     if not inp:
         return []
     if inp.lower() == "all":
-        return list(opts.keys())
-    keys = list(opts.keys())
+        return list(opts.keys()) + ["XETRA", "FRA"]
+    keys = list(opts.keys()) + ["XETRA", "FRA"]
     selected: List[str] = []
     for part in (p.strip().upper() for p in inp.replace(",", " ").split()):
-        if part in opts:
+        if part in opts or part in ("XETRA", "FRA"):
             selected.append(part)
             continue
         if part.isdigit():
@@ -291,6 +391,7 @@ def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr: Any, results
         return 0
 
     by_symbol: Dict[str, Any] = {}
+    by_isin: Dict[str, Any] = {}
     by_name: Dict[str, List[Any]] = defaultdict(list)
     for stock in results or []:
         original = str(getattr(stock, "original_ticker", "") or "").strip().upper()
@@ -299,6 +400,11 @@ def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr: Any, results
             by_symbol[original] = stock
         if yahoo_symbol:
             by_symbol[yahoo_symbol] = stock
+        
+        isin = str(getattr(stock, "isin", "") or "").strip().upper()
+        if isin and len(isin) > 5 and isin not in ("NAN", "NONE"):
+            by_isin[isin] = stock
+
         name_key = normalize_name_for_dedup_key(getattr(stock, "name", ""))
         if name_key:
             by_name[name_key].append(stock)
@@ -307,6 +413,7 @@ def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr: Any, results
     for item in portfolio_mgr.current_portfolio:
         current_symbol = str(item.get("Yahoo_Symbol", "") or "").strip().upper()
         original_ticker = str(item.get("Original_Ticker", "") or "").strip().upper()
+        isin = str(item.get("ISIN", item.get("isin", "")) or "").strip().upper()
         name_key = normalize_name_for_dedup_key(item.get("Name", ""))
 
         match = None
@@ -314,6 +421,8 @@ def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr: Any, results
             match = by_symbol[original_ticker]
         elif current_symbol and current_symbol in by_symbol:
             match = by_symbol[current_symbol]
+        elif isin and isin in by_isin:
+            match = by_isin[isin]
         elif name_key and len(by_name.get(name_key, [])) == 1:
             match = by_name[name_key][0]
 
