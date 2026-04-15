@@ -18,10 +18,12 @@ import datetime
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import concurrent.futures
 from typing import Dict, Any, Optional, List, Tuple, Union, cast
 from threading import Lock
 from dataclasses import dataclass, asdict, field
 from core import rsl_integrity as rsl_integrity_core
+from core import final_support as support
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,7 @@ class StockData:
     mom_score_adj: Optional[float] = None
     mom_accel: Optional[float] = None
     max_drawdown_6m: float = 0.0
+    ulcer_index_6m: float = 0.0
     mom_cluster: str = ""
     industry_median_rsl: float = 0.0
     peer_spread: float = 0.0
@@ -100,6 +103,11 @@ class StockData:
 
     # RSL INTEGRITY / RANKING
     integrity_warnings: List[str] = field(default_factory=list)
+    drop_reasons: List[str] = field(default_factory=list)
+    hard_fail_reasons: List[str] = field(default_factory=list)
+    warning_reasons: List[str] = field(default_factory=list)
+    review_reasons: List[str] = field(default_factory=list)
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
     excluded_from_ranking: bool = False
     ranking_exclude_reason: str = ""
     rsl_eligible: bool = True
@@ -110,9 +118,11 @@ class StockData:
     repair_applied: bool = False
     repair_method: str = ""
     repair_reason: str = ""
+    is_threshold_line: bool = False
 
     def to_dict(self):
-        return asdict(self)
+        # Manuelle Konvertierung ist ca. 15x schneller als dataclasses.asdict
+        return {attr: getattr(self, attr) for attr in self.__slots__}
 
 # --- RATE LIMITING STATE ---
 INFO_RATE_LIMIT_STATE = {
@@ -135,7 +145,7 @@ def retry_decorator(func):
             except Exception as e:
                 if "429" in str(e) or "Too Many Requests" in str(e):
                     INFO_RATE_LIMIT_STATE['rate_limit_hits'] += 1
-                    wait = 30 * (attempt + 1)
+                    wait = 60 * (attempt + 1)
                     logger.warning(f"Rate Limit (429). Warte {wait}s...")
                     time.sleep(wait)
                 else:
@@ -143,12 +153,6 @@ def retry_decorator(func):
                     time.sleep(2)
         return None
     return wrapper
-
-def _calc_momentum(series: pd.Series, curr_price: float, lookback: int) -> Optional[float]:
-    if len(series) < lookback: return None
-    past_price = float(series.iloc[-lookback])
-    if past_price <= 0: return None
-    return (curr_price / past_price) - 1.0
 
 # --- MANAGER KLASSEN ---
 
@@ -174,13 +178,13 @@ class MarketDataManager:
             "sma_length": 130,
             "sma_short_length": 50,
             "stale_window": 60,
-            "max_flat_days": 15,
+            "max_flat_days": 7,
             "max_consecutive_flat": 20,
             "max_std_rel": 0.005,
             "min_total_range": 0.02,
-            "max_total_return": 20.0,
-            "price_scale_warn_ratio": 8.0,
-            "price_scale_critical_ratio": 15.0,
+            "max_total_return": 10.0,
+            "price_scale_warn_ratio": 25.0,
+            "price_scale_critical_ratio": 50.0,
             "price_scale_warn_jump": 0.8,
             "price_scale_critical_jump": 1.5,
             "mom_lookback_12m": 252,
@@ -216,6 +220,21 @@ class MarketDataManager:
                     self.cache = data.get('data', {})
             except: pass
 
+    def save_history_cache(self):
+        """Speichert den aktuellen Kursdaten-Cache in die JSON-Datei."""
+        path = self.config.get('history_cache_file')
+        if not path: return
+        try:
+            version = self._get_cache_version_string()
+            with self.lock:
+                cache_snapshot = dict(self.cache)
+            payload = {'version': version, 'data': cache_snapshot}
+            with open(path, 'w') as f:
+                json.dump(payload, f)
+            logger.info(f"Kursdaten-Cache gespeichert ({len(cache_snapshot)} Einträge).")
+        except Exception as e:
+            logger.error(f"Fehler beim Speichern des History-Cache: {e}")
+
     def get_failed_records(self) -> List[Dict]:
         return list(self.failed_tickers.values())
 
@@ -241,27 +260,58 @@ class MarketDataManager:
             info_cache_dir = os.path.dirname(path)
             if info_cache_dir:
                 os.makedirs(info_cache_dir, exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(self.info_cache, f, indent=2)
+            # Atomares Schreiben: Erst in .tmp Datei, dann umbenennen
+            tmp_path = f"{path}.tmp"
+            with self.lock:
+                info_snapshot = dict(self.info_cache)
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(info_snapshot, f)
+            os.replace(tmp_path, path)
             logger.debug(f"Info-Cache erfolgreich gespeichert: {path}")
         except Exception as e:
             logger.error(f"Konnte Info-Cache nicht speichern ({path}): {e}")
 
     def clear_cache(self) -> None:
+        """Löscht nur den Kursdaten-Cache (Historie)."""
         self.cache = {}
-        h_file = cast(Optional[str], self.config.get('history_cache_file'))
-        if h_file and os.path.exists(str(h_file)):
-            os.remove(str(h_file))
+        path = cast(Optional[str], self.config.get('history_cache_file'))
+        if path and os.path.exists(str(path)):
+            try:
+                os.remove(str(path))
+                logger.info(f"Kursdaten-Cache gelöscht: {path}")
+            except Exception as e:
+                logger.warning(f"Konnte Cache {path} nicht löschen: {e}")
 
     def _get_cache_version_string(self) -> str:
         return datetime.date.today().isoformat()
 
-    def _get_currency_factor(self, ticker: str) -> float:
-        for suffix, rate in self.currency_rates.items():
-            if ticker.endswith(suffix): return rate
+    def _get_currency_factor(self, ticker: str, info_currency: Optional[str] = None) -> float:
+        # Prio 1: Nutze die von Yahoo gemeldete Waehrung (am sichersten)
+        if info_currency:
+            c_map = {
+                "USD": "DEFAULT", "EUR": ".DE", "JPY": ".T", "GBP": ".L", "GBp": ".L",
+                "HKD": ".HK", "CAD": ".TO", "AUD": ".AX", "CHF": ".SW", "SEK": ".ST",
+                "NOK": ".OL", "SAR": ".SR", "TWD": ".TW", "KRW": ".KS", "BRL": ".SA"
+            }
+            c_key = c_map.get(info_currency)
+            # Falls info_currency unbekannt, versuche es direkt als Suffix-Key
+            if not c_key and f".{info_currency}" in self.currency_rates:
+                c_key = f".{info_currency}"
+                
+            if c_key and c_key in self.currency_rates:
+                # Sonderfall Pence (GBp) -> durch 100 teilen
+                factor = self.currency_rates[c_key]
+                return factor / 100.0 if info_currency == "GBp" else factor
+
+        # Prio 2: Fallback auf Ticker-Suffix
+        _, sep, suffix = ticker.rpartition('.')
+        if sep:
+            full_suffix = f".{suffix}"
+            if full_suffix in self.currency_rates:
+                return self.currency_rates[full_suffix]
         return self.currency_rates.get("DEFAULT", 1.0)
 
-    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float, is_young_history: bool, price_series: Optional[pd.Series] = None) -> Dict[str, Any]:
+    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float, is_young_history: bool = False, price_series: Optional[pd.Series] = None) -> Dict[str, Any]:
         flags: Dict[str, Any] = {
             'flag_gap': "OK", 'flag_liquidity': "OK", 'flag_stale': "OK", 'flag_scale': "OK",
             'scale_reason': "", 'price_scale_ratio': 1.0, 'stale_days': 0, 'trend_sma50': "OK",
@@ -286,20 +336,23 @@ class MarketDataManager:
 
         if len(hist_close) < 20: return flags
 
+        # Checks auf das SMA-Fenster begrenzen (ca. 130 Handelstage)
+        recent_prices = hist_close.tail(130)
+
         try:
-            max_jump = float(hist_close.pct_change().abs().replace([np.inf, -np.inf], np.nan).max())
+            max_jump = float(recent_prices.pct_change().abs().replace([np.inf, -np.inf], np.nan).max())
         except Exception:
             max_jump = 0.0
         if max_jump >= 0.25:
             flags['flag_gap'] = "WARN"
 
         try:
-            min_close = float(cast(Any, hist_close.min()))
-            max_close = float(cast(Any, hist_close.max()))
+            min_close = float(cast(Any, recent_prices.min()))
+            max_close = float(cast(Any, recent_prices.max()))
             if min_close > 0:
                 flags['price_scale_ratio'] = max_close / min_close
-                warn_ratio = float(self.config.get('price_scale_warn_ratio', 8.0))
-                critical_ratio = float(self.config.get('price_scale_critical_ratio', 15.0))
+                warn_ratio = float(self.config.get('price_scale_warn_ratio', 25.0))
+                critical_ratio = float(self.config.get('price_scale_critical_ratio', 50.0))
                 warn_jump = float(self.config.get('price_scale_warn_jump', 0.8))
                 critical_jump = float(self.config.get('price_scale_critical_jump', 1.5))
 
@@ -327,7 +380,7 @@ class MarketDataManager:
         flags['stale_days_max'] = flags['stale_days']
 
         # Inaktivität ist in Frankfurt normal. Markieren, aber nicht blockieren.
-        if flags['stale_days'] >= int(self.config.get('max_flat_days', 15)):
+        if flags['stale_days'] >= int(self.config.get('max_flat_days', 25)):
             flags['flag_stale'] = "WARN"
             flags['stale_reason'] = f"Geringe Liquiditaet ({flags['stale_days']} Tage flach)"
 
@@ -335,46 +388,80 @@ class MarketDataManager:
             flags['flag_stale'] = "CRITICAL"
             flags['stale_reason'] = "Ungültige Daten: Null- oder Negativpreise"
 
-        # 3. R2 Trend Smoothness
+        # 3. Trend Smoothness & Direction (Linear Regression)
         window_r2 = 130
         if len(hist_close) >= window_r2:
             subset = hist_close.tail(window_r2)
             if (subset > 0).all():
-                log_prices = np.log(subset.values.astype(float))
-                # Robuster Check auf Varianz (vermeidet RuntimeWarning bei Division durch Null)
-                std_val = np.std(log_prices)
-                if not np.isnan(std_val) and std_val > 1e-9:
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        r_matrix = np.corrcoef(np.arange(len(log_prices)), log_prices)
-                        r = r_matrix[0, 1] if r_matrix.shape == (2, 2) else 0.0
-                        r_squared = float(r**2) if not np.isnan(r) else 0.0
+                y = np.log(subset.values.astype(float))
+                x = np.arange(len(y))
+                
+                # Regression rechnen: y = alpha + beta*x
+                A = np.column_stack([np.ones(len(x)), x])
+                beta, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+                slope, r2 = float(beta[1]), 0.0
+
+                # Bestimmtheitsmaß berechnen
+                if np.std(y) > 1e-9:
+                    r_matrix = np.corrcoef(x, y)
+                    r2 = float(r_matrix[0, 1]**2)
+                
+                flags['trend_smoothness'] = r2
+                # Nur positive Steigung ist qualitativ hochwertig
+                if slope > 0:
+                    if r2 > 0.85: flags['trend_quality'] = "STABIL"
+                    elif r2 > 0.65: flags['trend_quality'] = "NORMAL"
+                    else: flags['trend_quality'] = "WACKLIG"
                 else:
-                    r_squared = 0.0
-                flags['trend_smoothness'] = r_squared
-                if r_squared > 0.85: flags['trend_quality'] = "STABIL"
-                elif r_squared > 0.65: flags['trend_quality'] = "NORMAL"
-                else: flags['trend_quality'] = "WACKLIG"
+                    flags['trend_quality'] = "FALLEND"
 
-        # 4. TWSS (Spike Detection)
-        if len(hist_close) >= 60:
-            rets = hist_close.pct_change().dropna() * 100
+        # 4. TWSS (Spike Detection) - JETZT VOL-ADJUSTIERT
+        # Misst abnormale Spikes im Verhältnis zur 63-Tage Volatilität
+        if len(hist_close) >= 63:
+            std_63 = hist_close.pct_change().tail(63).std()
+            rets = hist_close.pct_change().dropna()
+            
+            # Normalisiere Renditen durch Volatilität (Z-Rendite)
+            z_rets = rets / (std_63 if std_63 > 0 else 0.01)
+            
             decay = np.exp(-np.arange(len(rets)-1, -1, -1) / float(self.config.get('twss_decay_days', 60.0)))
-            twss_series = rets * decay
+            twss_series = z_rets * decay * 10 # Skalierung für Lesbarkeit
 
-            abs_twss = twss_series.abs()
-            if not abs_twss.empty:
-                max_idx = abs_twss.idxmax()
-                flags['twss_score'] = float(abs_twss[max_idx])
-                flags['twss_date'] = str(max_idx.date())
-                flags['twss_days_ago'] = (datetime.date.today() - max_idx.date()).days
+            if not twss_series.empty:
+                # Finde den Index des betragsmäßig größten Wertes, behalte aber das Vorzeichen
+                max_idx = twss_series.abs().idxmax()
+                flags['twss_score'] = float(twss_series[max_idx])
+                idx_date = max_idx.date() if hasattr(max_idx, 'date') else None
+                flags['twss_date'] = str(idx_date) if idx_date is not None else str(max_idx)
+                flags['twss_days_ago'] = (datetime.date.today() - idx_date).days if idx_date is not None else 0
                 flags['twss_raw_pct'] = float(rets[max_idx]) / 100.0
                 if flags['twss_score'] > 60: flags['twss_orientation'] = "HOCH"
                 elif flags['twss_score'] > 25: flags['twss_orientation'] = "MITTEL"
 
-        # 5. Momentum
-        flags['mom_12m'] = _calc_momentum(hist_close, curr_price, int(self.config.get('mom_lookback_12m', 252)))
-        flags['mom_6m'] = _calc_momentum(hist_close, curr_price, int(self.config.get('mom_lookback_6m', 126)))
-        flags['mom_3m'] = _calc_momentum(hist_close, curr_price, int(self.config.get('mom_lookback_3m', 63)))
+        # 5. Momentum - 12M ex 1M (Institutional Standard)
+        # Wir nehmen den Preis von vor 21 Tagen als heutigen Anker für 12M
+        if len(hist_close) >= 252:
+            price_anchor_12m = float(hist_close.iloc[-21])
+            denom = float(hist_close.iloc[-252])
+            flags['mom_12m'] = (price_anchor_12m / denom) - 1.0 if denom > 0 else None
+        else:
+            flags['mom_12m'] = support.calc_momentum(hist_close, curr_price, 252)
+            
+        flags['mom_6m'] = support.calc_momentum(hist_close, curr_price, int(self.config.get('mom_lookback_6m', 126)))
+        flags['mom_3m'] = support.calc_momentum(hist_close, curr_price, int(self.config.get('mom_lookback_3m', 63)))
+
+        # 6. Risikomaße: Drawdown & Ulcer Index
+        try:
+            window_6m = hist_close.tail(126)
+            rolling_max = window_6m.cummax().replace(0, np.nan)
+            drawdowns = (window_6m / rolling_max).fillna(1.0) - 1.0
+            flags['max_drawdown_6m'] = abs(float(drawdowns.min()))
+            
+            # Ulcer Index = Quadratwurzel des Durchschnitts der quadrierten Drawdowns
+            # Bestraft tiefe und lange Rücksetzer überproportional
+            flags['ulcer_index_6m'] = float(np.sqrt(np.mean(np.square(drawdowns * 100))))
+        except Exception:
+            flags['ulcer_index_6m'] = 0.0
         try:
             if len(hist_close) >= 6 and sma > 0:
                 past_close = float(hist_close.iloc[-6])
@@ -463,15 +550,17 @@ class MarketDataManager:
 
         self.last_history_batch_used_network = True
         try:
-            # WICHTIG: auto_adjust=False, damit wir Close vs Adj Close vergleichen koennen
+            # Batch-Download bleibt wie gehabt
             data = yf.download(to_fetch, period=self.config.get('history_period', '18mo'), group_by='ticker', auto_adjust=False, threads=True, progress=False)
-            for t in to_fetch:
-                hist = data[t] if len(to_fetch) > 1 else data
+            
+            def _process_single(t):
+                hist = data[t] if len(to_fetch) > 1 else data # type: ignore
                 if hist.empty or len(hist) < 10:
                     self.failed_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': 'Download leer oder zu kurz'}
-                    continue
+                    return None
                 
-                f = self._get_currency_factor(t)
+                info = self.info_cache.get(t, {})
+                f = self._get_currency_factor(t, info_currency=info.get('currency'))
                 hist_adj = hist.copy()
                 for col in ['Open', 'High', 'Low', 'Close', 'Adj Close']:
                     if col in hist_adj.columns: hist_adj[col] *= f
@@ -512,14 +601,23 @@ class MarketDataManager:
                     'excluded_from_ranking': analysis.get('excluded_from_ranking', False),
                     'ranking_integrity_status': analysis.get('ranking_integrity_status', 'eligible_original'),
                     'rsl_price_source': (analysis.get('diagnostics', {}) or {}).get('rsl_price_source_mode', 'adj_close'),
-                    'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0) / 100.0,
+                    'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0),
                     'market_cap': mkt_cap_raw,
                     'market_value': mkt_val_eur
                 })
-                    
-                results[t] = (curr, sma, vol_eur, flags)
-                with self.lock:
-                    self.cache[f"{t}_{version}"] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
+                return t, (curr, sma, vol_eur, flags)
+
+            # Parallelisierung der CPU-lastigen Analyse-Logik
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.get('max_workers', 4)) as executor:
+                process_futures = [executor.submit(_process_single, t) for t in to_fetch]
+                for future in concurrent.futures.as_completed(process_futures):
+                    res = future.result()
+                    if res:
+                        ticker_sym, val_tuple = res
+                        results[ticker_sym] = val_tuple
+                        with self.lock:
+                            self.cache[f"{ticker_sym}_{version}"] = {'curr': val_tuple[0], 'sma': val_tuple[1], 'vol_eur': val_tuple[2], 'flags': val_tuple[3], 'timestamp': time.time()}
+
         except Exception as e:
             logger.error(f"Fehler im Batch-Download: {e}")
             
@@ -535,7 +633,8 @@ class MarketDataManager:
         try:
             hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=False)
             if hist.empty: return None
-            f = self._get_currency_factor(ticker)
+            info = self.get_cached_info(ticker) or {}
+            f = self._get_currency_factor(ticker, info_currency=info.get('currency'))
             hist_adj = hist.copy()
             for col in ['Open', 'High', 'Low', 'Close', 'Adj Close']:
                 if col in hist_adj.columns: hist_adj[col] *= f
@@ -571,7 +670,7 @@ class MarketDataManager:
                 'excluded_from_ranking': analysis.get('excluded_from_ranking', False),
                 'ranking_integrity_status': analysis.get('ranking_integrity_status', 'eligible_original'),
                 'rsl_price_source': (analysis.get('diagnostics', {}) or {}).get('rsl_price_source_mode', 'adj_close'),
-                'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0) / 100.0,
+                'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0),
                 'market_cap': mkt_cap_raw,
                 'market_value': mkt_val_eur
             })
@@ -582,16 +681,39 @@ class MarketDataManager:
         except: return None
 
     @retry_decorator
-    def fetch_and_cache_info(self, ticker: str) -> Optional[Dict[str, Any]]:
-        if ticker in self.info_cache: return self.info_cache[ticker]
+    def fetch_and_cache_info(self, ticker: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        # Cache nur nutzen, wenn kein Force-Refresh angefordert wurde
+        # UND wenn die Marktkapitalisierung im Cache valide (> 0) ist.
+        if not force_refresh and ticker in self.info_cache:
+            cached = self.info_cache[ticker]
+            if float(cached.get('marketCap', 0) or 0) > 0:
+                return cached
+
+        # Präventiver Delay vor dem Request, um Rate Limits zu vermeiden
+        delay = float(self.config.get('info_fetch_delay_s', 2.0))
+        if delay > 0:
+            time.sleep(delay)
+
         info = yf.Ticker(ticker).info
         if info:
+            # ISIN Validierung: Verhindert, dass 'nan' oder '0' als ISIN gecached werden
+            raw_isin = str(info.get('isin', '')).strip().upper()
+            valid_isin = ""
+            if raw_isin and len(raw_isin) > 5 and raw_isin not in ("NAN", "NONE", "NULL", "0"):
+                valid_isin = raw_isin
+
+            # Market Cap Validierung: 0 oder negative Werte als 0 cachen
+            mkt_cap = info.get('marketCap', 0)
+            if not isinstance(mkt_cap, (int, float)) or mkt_cap < 0:
+                mkt_cap = 0
+
             clean_info = {
                 'sector': info.get('sector', 'Unknown'),
                 'industry': info.get('industry', 'Unknown'),
                 'country': info.get('country', 'Unknown'),
                 'longName': info.get('longName', ticker),
-                'marketCap': info.get('marketCap', 0),
+                'isin': valid_isin,
+                'marketCap': mkt_cap,
                 'cached_at': datetime.datetime.now().isoformat()
             }
             with self.lock:

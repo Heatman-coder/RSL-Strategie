@@ -10,30 +10,10 @@ Refactoring based on User Request:
 - CORE: Logic remains v67 (Clean, Smart Cache, First Seen).
 """
 import os
-import codecs
 from dotenv import load_dotenv
-
-def _fix_bom_in_file(file_path: str) -> None:
-    """Checks for and removes the UTF-8 BOM from a file if present."""
-    BOM = codecs.BOM_UTF8
-    try:
-        with open(file_path, 'rb') as f:
-            content = f.read()
-        if content.startswith(BOM):
-            print(f"BOM detected in {os.path.basename(file_path)}. Applying fix...")
-            content = content[len(BOM):]
-            with open(file_path, 'wb') as f:
-                f.write(content)
-            print("File fixed. The script should now run correctly.")
-    except Exception:
-        pass # Fails silently if file doesn't exist etc.
-
-_fix_bom_in_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core', 'reporting_excel.py'))
 
 import pandas as pd
 import yfinance as yf
-import requests # type: ignore
-import io
 import os
 import sys
 import json
@@ -44,11 +24,10 @@ import logging
 import warnings
 import re
 import concurrent.futures
-import hashlib
 import csv
+import math
 from urllib.parse import quote
 from typing import List, Tuple, Optional, Dict, Any, Callable, Union, Set, cast
-from threading import Lock
 from dataclasses import dataclass, asdict, fields
 from collections import defaultdict
 import numpy as np
@@ -64,6 +43,8 @@ from core import settings_ui as settings_ui_core
 from core import settings_catalog as settings_catalog_core
 from core import rsl_integrity as rsl_integrity_core
 from core import final_support as final_support_core
+from core import app_config as app_config_core
+from core import app_support as app_support_core
 from data_manager import (
     MarketDataManager, FirstSeenManager, PortfolioManager, 
     retry_decorator, StockData, _consume_rate_limit_hits
@@ -72,6 +53,8 @@ from core.entity_matching import normalize_name_for_dedup
 from core.data_pipeline import load_selected_etf_universe
 from core import etf_processor as etf_processor_core
 from core.reporting_excel import save_excel_report_safely
+
+app_support_core.fix_bom_in_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'core', 'reporting_excel.py'))
 # --- KONSTANTEN ---
 ACTION_BUY = "kaufen"
 ACTION_SELL = "verkaufen"
@@ -81,107 +64,26 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(SCRIPT_DIR, "reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 def get_path(filename: str) -> str:
-    return os.path.join(SCRIPT_DIR, filename)
+    return app_config_core.get_path(SCRIPT_DIR, filename)
 def get_report_path(filename: str) -> str:
-    return os.path.join(REPORTS_DIR, filename)
+    return app_config_core.get_report_path(REPORTS_DIR, filename)
 def configure_best_console_mode() -> Dict[str, Any]:
-    state: Dict[str, Any] = {"encoding": "", "unicode": False, "ansi": False}
-    try:
-        os.environ.setdefault("PYTHONUTF8", "1")
-        os.environ.setdefault("RSL_ASCII_CONSOLE", "0")
-    except Exception:
-        pass
-    if os.name == "nt":
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            kernel32.SetConsoleOutputCP(65001)
-            kernel32.SetConsoleCP(65001)
-        except Exception:
-            pass
-        try:
-            for stream in (sys.stdout, sys.stderr):
-                if hasattr(stream, "reconfigure"):
-                    stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            for handle_id in (-11, -12): # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
-                handle = kernel32.GetStdHandle(handle_id)
-                if handle in (0, -1):
-                    continue
-                mode = ctypes.c_uint32()
-                if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-                    kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-            state["ansi"] = True
-        except Exception:
-            state["ansi"] = False
-    enc = str(getattr(sys.stdout, "encoding", "") or "").lower()
-    state["encoding"] = enc
-    state["unicode"] = "utf" in enc
-    return state
+    return app_support_core.configure_best_console_mode()
 CONSOLE_RUNTIME = configure_best_console_mode()
-# --- ROBUSTER LADEBALKEN ---
-try:
-    from tqdm import tqdm as _tqdm
-    tqdm = _tqdm
-except ImportError:
-    class tqdm_fallback:
-        def __init__(self, iterable=None, total=None, **kwargs):
-            self.iterable = iterable
-            self.total = total
-        def __enter__(self): return self
-        def __exit__(self, exc_type, exc_value, traceback): pass
-        def update(self, n=1): pass
-        def __iter__(self): return iter(self.iterable) if self.iterable else iter([])
-    tqdm = tqdm_fallback # type: ignore
-    print("'tqdm' nicht gefunden. Ladebalken deaktiviert.")
 
 def get_last_performance_duration() -> Optional[str]:
-    """Liest die Dauer des letzten Laufs aus dem Performance-Log."""
-    log_file = CONFIG.get('performance_log_csv')
-    if not log_file or not os.path.exists(log_file):
-        return None
-    try:
-        with open(log_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            if len(lines) < 2: # Header + mind. 1 Datenzeile
-                return None
-            last_line = lines[-1].strip()
-            parts = last_line.split(';')
-            if len(parts) > 1:
-                duration_str = parts[1]
-                # Formatieren auf eine Nachkommastelle
-                return f"{float(duration_str):.1f}s"
-    except Exception:
-        return None # Fail silently
-    return None
+    return app_support_core.get_last_performance_duration(CONFIG)
 
 def make_progress(total: int, desc: str, include_last_duration: bool = True):
-    last_duration = get_last_performance_duration() if include_last_duration else None
-    full_desc = f"{desc} (letzter Lauf: {last_duration})" if last_duration else desc
-    return tqdm(
+    return app_support_core.make_progress(
         total=total,
-        desc=full_desc,
-        dynamic_ncols=True,
-        ascii=not bool(CONSOLE_RUNTIME.get("unicode", False)),
-        leave=False
+        desc=desc,
+        config=CONFIG,
+        console_runtime=CONSOLE_RUNTIME,
+        include_last_duration=include_last_duration,
     )
 # --- LOGGING SETUP ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(get_path('global_rsl.log'), encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-logging.getLogger('yfinance').setLevel(logging.CRITICAL)
-logging.getLogger('yahoo_connector').setLevel(logging.CRITICAL)
+logger = app_support_core.configure_logging(get_path('global_rsl.log'))
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter(action='ignore', category=pd.errors.SettingWithCopyWarning)
 # Unterdrücke technische NumPy-Warnungen bei Berechnungen mit fehlerhaften/flachen Kursdaten
@@ -229,11 +131,11 @@ CONFIG: Dict[str, Any] = {
     'max_std_rel': 0.005,
     'min_total_range': 0.02,
     'max_total_return': 10.0,
-    'max_flat_days': 15,
+    'max_flat_days': 7,
     'max_gap_percent': 0.30,
     'price_scale_recent_window': 60,
-    'price_scale_warn_ratio': 8.0,
-    'price_scale_critical_ratio': 15.0,
+    'price_scale_warn_ratio': 15.0,
+    'price_scale_critical_ratio': 50.0,
     'price_scale_warn_jump': 0.8,
     'price_scale_critical_jump': 1.5,
     'price_scale_near_high_pct': 35.0,
@@ -320,7 +222,7 @@ CONFIG: Dict[str, Any] = {
     'strict_min_coverage_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_min_coverage_ratio'],
     'strict_max_failed_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_max_failed_ratio'],
     'strict_max_young_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_max_young_ratio'],
-    'strict_max_critical_drop_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_max_critical_drop_ratio'],
+    'strict_max_critical_drop_ratio': 0.60, # Erlaubt bis zu 60% Daten-Ausschuss im Riesen-Universum
     'strict_max_stale_warn_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_max_stale_warn_ratio'],
     'strict_max_gap_warn_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_max_gap_warn_ratio'],
     'strict_max_liquidity_warn_ratio': settings_catalog_core.USER_SETTINGS_DEFAULTS['strict_max_liquidity_warn_ratio'],
@@ -365,144 +267,13 @@ CONFIG: Dict[str, Any] = {
     'base_url_template': "https://www.ishares.com/us/products/{id}/{slug}/1467271812596.ajax?fileType=csv&fileName={symbol}_holdings&dataType=fund"
 }
 # --- HELPER FUNCTIONS ---
-def load_json_config(file_name: str, is_list: bool = False) -> Union[Dict[str, Any], List[Any]]:
-    """Lädt eine JSON-Konfigurationsdatei.
-    
-    Args:
-        file_name: Pfad zur JSON-Datei
-        is_list: Wenn True, wird eine leere Liste statt eines leeren Dicts zurückgegeben
-        
-    Returns:
-        Geladene Daten als Dict oder List, oder leere Struktur bei Fehlern
-    """
-    if os.path.exists(file_name):
-        try:
-            with open(file_name, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Fehler beim Laden von {file_name}: {e}")
-    return [] if is_list else {}
+load_json_config = final_support_core.load_json_config
+save_json_config = final_support_core.save_json_config
+load_watchlist_symbols = final_support_core.load_watchlist_symbols
+_to_float = final_support_core.to_float
+_to_bool = final_support_core.to_bool
+_safe_positive_float = final_support_core.safe_positive_float
 
-def load_watchlist_symbols(file_path: str) -> set:
-    path = str(file_path or "").strip()
-    if not path:
-        return set()
-    try:
-        if not os.path.exists(path):
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write("# One Yahoo ticker per line. Example:\n")
-                f.write("# AAPL\n")
-                f.write("# MSFT\n")
-            return set()
-        if path.lower().endswith(".json"):
-            items = load_json_config(path, is_list=True)
-            return {str(x).strip().upper() for x in items if str(x).strip()}
-        with open(path, 'r', encoding='utf-8') as f:
-            raw = f.read()
-        for sep in [",", ";"]:
-            raw = raw.replace(sep, "\n")
-        symbols = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            symbols.append(line)
-        return {s.strip().upper() for s in symbols if s.strip()}
-    except Exception:
-        return set()
-def save_json_config(file_name: str, data: Any) -> None:
-    """Speichert Daten in eine JSON-Datei.
-    
-    Args:
-        file_name: Pfad zur JSON-Datei
-        data: Zu speichernde Daten (Dict oder List)
-    """
-    try:
-        with open(file_name, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error(f"Fehler beim Speichern von {file_name}: {e}")
-def _to_float(value: Any, default: float) -> float:
-    """Konvertiert einen Wert zu Float mit Fallback.
-    
-    Args:
-        value: Zu konvertierender Wert
-        default: Fallback-Wert bei Konvertierungsfehler
-        
-    Returns:
-        Konvertierter Float-Wert oder default
-    """
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-def _to_bool(value: Any, default: bool) -> bool:
-    """Konvertiert einen Wert zu Bool mit Fallback.
-    
-    Args:
-        value: Zu konvertierender Wert
-        default: Fallback-Wert bei Konvertierungsfehler
-        
-    Returns:
-        Konvertierter Bool-Wert oder default
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        val = value.strip().lower()
-        if val in ("1", "true", "yes", "y", "ja", "on"):
-            return True
-        if val in ("0", "false", "no", "n", "nein", "off"):
-            return False
-    return bool(default)
-def _normalize_mom_weights(w12: Any, w6: Any, w3: Any) -> Tuple[float, float, float]:
-    """Normalisiert Momentum-Gewichte auf Summe 1.0.
-    
-    Args:
-        w12: Gewicht für 12-Monats-Momentum
-        w6: Gewicht für 6-Monats-Momentum
-        w3: Gewicht für 3-Monats-Momentum
-        
-    Returns:
-        Tuple mit normalisierten Gewichten (w12, w6, w3)
-    """
-    def _coerce(val: Any) -> float:
-        try:
-            return max(0.0, float(val))
-        except Exception:
-            return 0.0
-    v12 = _coerce(w12)
-    v6 = _coerce(w6)
-    v3 = _coerce(w3)
-    total = v12 + v6 + v3
-    if total <= 0:
-        return 0.5, 0.3, 0.2
-    return v12 / total, v6 / total, v3 / total
-def _normalize_cluster_score_weights(w_mom12: Any, w_mom6: Any, w_accel: Any) -> Tuple[float, float, float]:
-    """Normalisiert Cluster-Score-Gewichte auf Summe 1.0.
-    
-    Args:
-        w_mom12: Gewicht für 12-Monats-Momentum
-        w_mom6: Gewicht für 6-Monats-Momentum
-        w_accel: Gewicht für Momentum-Beschleunigung
-        
-    Returns:
-        Tuple mit normalisierten Gewichten (w_mom12, w_mom6, w_accel)
-    """
-    def _coerce(val: Any) -> float:
-        try:
-            return max(0.0, float(val))
-        except Exception:
-            return 0.0
-    v1 = _coerce(w_mom12)
-    v2 = _coerce(w_mom6)
-    v3 = _coerce(w_accel)
-    total = v1 + v2 + v3
-    if total <= 0:
-        return 0.5, 0.3, 0.2
-    return v1 / total, v2 / total, v3 / total
 def _sanitize_heatmap_thresholds(warn_pct: Any, full_pct: Any) -> Tuple[float, float]:
     """Bereinigt und validiert Heatmap-Schwellenwerte.
     
@@ -522,239 +293,25 @@ def _sanitize_heatmap_thresholds(warn_pct: Any, full_pct: Any) -> Tuple[float, f
     if warn_value >= full_value:
         warn_value = max(0.0, full_value - 1.0)
     return warn_value, full_value
-def load_user_settings() -> Dict[str, Any]:
-    """Lädt Benutzereinstellungen aus der JSON-Datei.
-    
-    Returns:
-        Dictionary mit Benutzereinstellungen oder leeres Dict bei Fehlern
-    """
-    default_user_settings = settings_catalog_core.get_user_settings_defaults()
-    
-    raw = load_json_config(CONFIG['user_settings_file'])
-    if isinstance(raw, dict):
-        # Merge mit Standardwerten für fehlende Keys
-        for key, default_value in default_user_settings.items():
-            if key not in raw:
-                raw[key] = default_value
-        return raw
-    return default_user_settings
-def apply_user_settings(settings: Dict[str, Any]):
-    warn_value, full_value = _sanitize_heatmap_thresholds(
-        settings.get('heatmap_warn_percent', CONFIG['heatmap_warn_percent']),
-        settings.get('heatmap_full_percent', CONFIG['heatmap_full_percent'])
-    )
-    CONFIG['heatmap_warn_percent'] = warn_value
-    CONFIG['heatmap_full_percent'] = full_value
-    # Cache-Einstellungen aus den User-Settings laden
-    CONFIG['cache_duration_hours'] = _to_float(settings.get('cache_duration_hours', CONFIG['cache_duration_hours']), CONFIG['cache_duration_hours'])
-    CONFIG['etf_cache_duration_hours'] = _to_float(settings.get('etf_cache_duration_hours', CONFIG['etf_cache_duration_hours']), CONFIG['etf_cache_duration_hours'])
-    CONFIG['info_cache_unknown_expiry_days'] = int(_to_float(settings.get('info_cache_unknown_expiry_days', CONFIG['info_cache_unknown_expiry_days']), CONFIG['info_cache_unknown_expiry_days']))
-    CONFIG['info_fetch_delay_s'] = _to_float(settings.get('info_fetch_delay_s', CONFIG['info_fetch_delay_s']), CONFIG['info_fetch_delay_s'])
-    CONFIG['batch_sleep_min_s'] = _to_float(settings.get('batch_sleep_min_s', CONFIG['batch_sleep_min_s']), CONFIG['batch_sleep_min_s'])
-    CONFIG['batch_sleep_max_s'] = _to_float(settings.get('batch_sleep_max_s', CONFIG['batch_sleep_max_s']), CONFIG['batch_sleep_max_s'])
-    if CONFIG['batch_sleep_max_s'] < CONFIG['batch_sleep_min_s']:
-        CONFIG['batch_sleep_max_s'] = CONFIG['batch_sleep_min_s']
-    CONFIG['info_fetch_quiet'] = _to_bool(
-        settings.get('info_fetch_quiet', CONFIG['info_fetch_quiet']),
-        CONFIG['info_fetch_quiet']
-    )
-    CONFIG['rate_limit_delay_min_s'] = _to_float(settings.get('rate_limit_delay_min_s', CONFIG['rate_limit_delay_min_s']), CONFIG['rate_limit_delay_min_s'])
-    CONFIG['rate_limit_delay_max_s'] = _to_float(settings.get('rate_limit_delay_max_s', CONFIG['rate_limit_delay_max_s']), CONFIG['rate_limit_delay_max_s'])
-    CONFIG['rate_limit_backoff_step_s'] = _to_float(settings.get('rate_limit_backoff_step_s', CONFIG['rate_limit_backoff_step_s']), CONFIG['rate_limit_backoff_step_s'])
-    CONFIG['rate_limit_log_every'] = int(_to_float(settings.get('rate_limit_log_every', CONFIG['rate_limit_log_every']), CONFIG['rate_limit_log_every']))
-    if CONFIG['rate_limit_delay_max_s'] < CONFIG['rate_limit_delay_min_s']:
-        CONFIG['rate_limit_delay_max_s'] = CONFIG['rate_limit_delay_min_s']
-    CONFIG['history_period'] = str(settings.get('history_period', CONFIG['history_period']) or CONFIG['history_period']).strip()
-    CONFIG['industry_top_n'] = int(_to_float(settings.get('industry_top_n', CONFIG['industry_top_n']), CONFIG['industry_top_n']))
-    CONFIG['industry_score_min'] = _to_float(settings.get('industry_score_min', CONFIG['industry_score_min']), CONFIG['industry_score_min'])
-    CONFIG['industry_breadth_min'] = _to_float(settings.get('industry_breadth_min', CONFIG['industry_breadth_min']), CONFIG['industry_breadth_min'])
-    CONFIG['industry_min_size'] = int(_to_float(settings.get('industry_min_size', CONFIG['industry_min_size']), CONFIG['industry_min_size']))
-    CONFIG['industry_avg_rsl_cap'] = _to_float(settings.get('industry_avg_rsl_cap', CONFIG['industry_avg_rsl_cap']), CONFIG['industry_avg_rsl_cap'])
-    CONFIG['industry_summary_include_unknown'] = _to_bool(
-        settings.get('industry_summary_include_unknown', CONFIG['industry_summary_include_unknown']),
-        CONFIG['industry_summary_include_unknown']
-    )
-    CONFIG['industry_trend_enabled'] = _to_bool(
-        settings.get('industry_trend_enabled', CONFIG['industry_trend_enabled']),
-        CONFIG['industry_trend_enabled']
-    )
-    CONFIG['industry_trend_weeks'] = int(_to_float(settings.get('industry_trend_weeks', CONFIG['industry_trend_weeks']), CONFIG['industry_trend_weeks']))
-    CONFIG['industry_score_w_breadth'] = _to_float(settings.get('industry_score_w_breadth', CONFIG['industry_score_w_breadth']), CONFIG['industry_score_w_breadth'])
-    CONFIG['industry_score_w_avg'] = _to_float(settings.get('industry_score_w_avg', CONFIG['industry_score_w_avg']), CONFIG['industry_score_w_avg'])
-    CONFIG['industry_score_w_median'] = _to_float(settings.get('industry_score_w_median', CONFIG['industry_score_w_median']), CONFIG['industry_score_w_median'])
-    CONFIG['industry_score_w_leader'] = _to_float(settings.get('industry_score_w_leader', CONFIG['industry_score_w_leader']), CONFIG['industry_score_w_leader'])
-    w12_raw = _to_float(settings.get('mom_weight_12m', CONFIG['mom_weight_12m']), CONFIG['mom_weight_12m'])
-    w6_raw = _to_float(settings.get('mom_weight_6m', CONFIG['mom_weight_6m']), CONFIG['mom_weight_6m'])
-    w3_raw = _to_float(settings.get('mom_weight_3m', CONFIG['mom_weight_3m']), CONFIG['mom_weight_3m'])
-    w12_norm, w6_norm, w3_norm = _normalize_mom_weights(w12_raw, w6_raw, w3_raw)
-    CONFIG['mom_weight_12m'] = w12_norm
-    CONFIG['mom_weight_6m'] = w6_norm
-    CONFIG['mom_weight_3m'] = w3_norm
-    CONFIG['mom_lookback_12m'] = int(_to_float(settings.get('mom_lookback_12m', CONFIG['mom_lookback_12m']), CONFIG['mom_lookback_12m']))
-    CONFIG['mom_lookback_6m'] = int(_to_float(settings.get('mom_lookback_6m', CONFIG['mom_lookback_6m']), CONFIG['mom_lookback_6m']))
-    CONFIG['mom_lookback_3m'] = int(_to_float(settings.get('mom_lookback_3m', CONFIG['mom_lookback_3m']), CONFIG['mom_lookback_3m']))
-    CONFIG['mom_vol_lookback'] = int(_to_float(settings.get('mom_vol_lookback', CONFIG['mom_vol_lookback']), CONFIG['mom_vol_lookback']))
-    CONFIG['atr_multiplier_exit'] = _to_float(settings.get('atr_multiplier_exit', CONFIG['atr_multiplier_exit']), CONFIG['atr_multiplier_exit'])
-    CONFIG['candidate_use_momentum_score'] = _to_bool(settings.get('candidate_use_momentum_score', CONFIG['candidate_use_momentum_score']), CONFIG['candidate_use_momentum_score'])
-    CONFIG['candidate_use_vol_adjust'] = _to_bool(settings.get('candidate_use_vol_adjust', CONFIG['candidate_use_vol_adjust']), CONFIG['candidate_use_vol_adjust'])
-    CONFIG['candidate_use_industry_neutral'] = _to_bool(settings.get('candidate_use_industry_neutral', CONFIG['candidate_use_industry_neutral']), CONFIG['candidate_use_industry_neutral'])
-    CONFIG['candidate_use_accel'] = _to_bool(settings.get('candidate_use_accel', CONFIG['candidate_use_accel']), CONFIG['candidate_use_accel'])
-    CONFIG['candidate_accel_weight'] = _to_float(settings.get('candidate_accel_weight', CONFIG['candidate_accel_weight']), CONFIG['candidate_accel_weight'])
-    CONFIG['candidate_use_rsl_change_1w'] = _to_bool(
-        settings.get('candidate_use_rsl_change_1w', CONFIG['candidate_use_rsl_change_1w']),
-        CONFIG['candidate_use_rsl_change_1w']
-    )
-    CONFIG['candidate_rsl_change_weight'] = _to_float(
-        settings.get('candidate_rsl_change_weight', CONFIG['candidate_rsl_change_weight']),
-        CONFIG['candidate_rsl_change_weight']
-    )
-    CONFIG['candidate_min_avg_volume_eur'] = _to_float(settings.get('candidate_min_avg_volume_eur', CONFIG['candidate_min_avg_volume_eur']), CONFIG['candidate_min_avg_volume_eur'])
-    CONFIG['candidate_min_trust_score'] = int(_to_float(settings.get('candidate_min_trust_score', CONFIG['candidate_min_trust_score']), CONFIG['candidate_min_trust_score']))
-    CONFIG['candidate_score_min'] = _to_float(settings.get('candidate_score_min', CONFIG['candidate_score_min']), CONFIG['candidate_score_min'])
-    CONFIG['candidate_require_top_percent'] = _to_bool(
-        settings.get('candidate_require_top_percent', CONFIG['candidate_require_top_percent']),
-        CONFIG['candidate_require_top_percent']
-    )
-    CONFIG['candidate_top_percent_threshold'] = _to_float(
-        settings.get('candidate_top_percent_threshold', CONFIG['candidate_top_percent_threshold']),
-        CONFIG['candidate_top_percent_threshold']
-    )
-    CONFIG['candidate_block_new_buys_in_weak_regime'] = _to_bool(
-        settings.get('candidate_block_new_buys_in_weak_regime', CONFIG['candidate_block_new_buys_in_weak_regime']),
-        CONFIG['candidate_block_new_buys_in_weak_regime']
-    )
-    CONFIG['candidate_max_stocks_per_industry'] = int(_to_float(
-        settings.get('candidate_max_stocks_per_industry', CONFIG['candidate_max_stocks_per_industry']),
-        CONFIG['candidate_max_stocks_per_industry']
-    ))
-    CONFIG['candidate_use_peer_spread'] = _to_bool(
-        settings.get('candidate_use_peer_spread', CONFIG['candidate_use_peer_spread']),
-        CONFIG['candidate_use_peer_spread']
-    )
-    CONFIG['candidate_peer_spread_weight'] = _to_float(
-        settings.get('candidate_peer_spread_weight', CONFIG['candidate_peer_spread_weight']),
-        CONFIG['candidate_peer_spread_weight']
-    )
-    CONFIG['candidate_max_distance_52w_high_pct'] = _to_float(
-        settings.get('candidate_max_distance_52w_high_pct', CONFIG['candidate_max_distance_52w_high_pct']),
-        CONFIG['candidate_max_distance_52w_high_pct']
-    )
-    CONFIG['cluster_enabled'] = _to_bool(settings.get('cluster_enabled', CONFIG['cluster_enabled']), CONFIG['cluster_enabled'])
-    CONFIG['cluster_top_n'] = int(_to_float(settings.get('cluster_top_n', CONFIG['cluster_top_n']), CONFIG['cluster_top_n']))
-    CONFIG['cluster_min_size'] = int(_to_float(settings.get('cluster_min_size', CONFIG['cluster_min_size']), CONFIG['cluster_min_size']))
-    wcm_raw = _to_float(settings.get('cluster_score_w_mom12', CONFIG['cluster_score_w_mom12']), CONFIG['cluster_score_w_mom12'])
-    wc6_raw = _to_float(settings.get('cluster_score_w_mom6', CONFIG['cluster_score_w_mom6']), CONFIG['cluster_score_w_mom6'])
-    wca_raw = _to_float(settings.get('cluster_score_w_accel', CONFIG['cluster_score_w_accel']), CONFIG['cluster_score_w_accel'])
-    wcm, wc6, wca = _normalize_cluster_score_weights(wcm_raw, wc6_raw, wca_raw)
-    CONFIG['cluster_score_w_mom12'] = wcm
-    CONFIG['cluster_score_w_mom6'] = wc6
-    CONFIG['cluster_score_w_accel'] = wca
-    CONFIG['candidate_use_cluster_filter'] = _to_bool(
-        settings.get('candidate_use_cluster_filter', CONFIG['candidate_use_cluster_filter']),
-        CONFIG['candidate_use_cluster_filter']
-    )
-    CONFIG['strict_mode'] = _to_bool(settings.get('strict_mode', CONFIG['strict_mode']), CONFIG['strict_mode'])
-    CONFIG['strict_min_analyzed_stocks'] = int(_to_float(settings.get('strict_min_analyzed_stocks', CONFIG['strict_min_analyzed_stocks']), CONFIG['strict_min_analyzed_stocks']))
-    CONFIG['strict_min_coverage_ratio'] = _to_float(settings.get('strict_min_coverage_ratio', CONFIG['strict_min_coverage_ratio']), CONFIG['strict_min_coverage_ratio'])
-    CONFIG['strict_max_failed_ratio'] = _to_float(settings.get('strict_max_failed_ratio', CONFIG['strict_max_failed_ratio']), CONFIG['strict_max_failed_ratio'])
-    CONFIG['strict_max_young_ratio'] = _to_float(settings.get('strict_max_young_ratio', CONFIG['strict_max_young_ratio']), CONFIG['strict_max_young_ratio'])
-    CONFIG['strict_max_critical_drop_ratio'] = _to_float(settings.get('strict_max_critical_drop_ratio', CONFIG['strict_max_critical_drop_ratio']), CONFIG['strict_max_critical_drop_ratio'])
-    CONFIG['strict_max_stale_warn_ratio'] = _to_float(settings.get('strict_max_stale_warn_ratio', CONFIG['strict_max_stale_warn_ratio']), CONFIG['strict_max_stale_warn_ratio'])
-    CONFIG['strict_max_gap_warn_ratio'] = _to_float(settings.get('strict_max_gap_warn_ratio', CONFIG['strict_max_gap_warn_ratio']), CONFIG['strict_max_gap_warn_ratio'])
-    CONFIG['strict_max_liquidity_warn_ratio'] = _to_float(settings.get('strict_max_liquidity_warn_ratio', CONFIG['strict_max_liquidity_warn_ratio']), CONFIG['strict_max_liquidity_warn_ratio'])
-    CONFIG['strict_max_low_trust_ratio'] = _to_float(settings.get('strict_max_low_trust_ratio', CONFIG['strict_max_low_trust_ratio']), CONFIG['strict_max_low_trust_ratio'])
-    CONFIG['strict_min_portfolio_coverage_ratio'] = _to_float(settings.get('strict_min_portfolio_coverage_ratio', CONFIG['strict_min_portfolio_coverage_ratio']), CONFIG['strict_min_portfolio_coverage_ratio'])
-    CONFIG['strict_max_invalid_numeric_count'] = int(_to_float(settings.get('strict_max_invalid_numeric_count', CONFIG['strict_max_invalid_numeric_count']), CONFIG['strict_max_invalid_numeric_count']))
-    CONFIG['strict_max_duplicate_symbols'] = int(_to_float(settings.get('strict_max_duplicate_symbols', CONFIG['strict_max_duplicate_symbols']), CONFIG['strict_max_duplicate_symbols']))
-def save_user_settings(settings: Dict[str, Any]) -> None:
-    """Speichert Benutzereinstellungen in der JSON-Datei.
-    
-    Args:
-        settings: Dictionary mit Benutzereinstellungen
-    """
-    save_json_config(CONFIG['user_settings_file'], settings)
-def save_dataframe_safely(df: pd.DataFrame, filename: str, **kwargs) -> None:
-    """Speichert ein DataFrame sicher in eine CSV-Datei mit Fehlerbehandlung.
-    
-    Args:
-        df: Zu speicherndes DataFrame
-        filename: Pfad zur Zieldatei
-        **kwargs: Zusätzliche Parameter für to_csv()
-    """
-    while True:
-        try:
-            df.to_csv(filename, **kwargs)
-            logger.info(f"Gespeichert: {filename}")
-            break
-        except PermissionError:
-            print(f"\nACHTUNG: Die Datei '{os.path.basename(filename)}' ist noch geoeffnet!")
-            print("--> Bitte schliessen Sie die Datei in Excel/Editor.")
-            user_in = input("--> Druecken Sie ENTER, um es erneut zu versuchen (oder 'x' zum Abbrechen): ")
-            if user_in.strip().lower() == 'x':
-                logger.warning("Speichern durch Benutzer abgebrochen. Daten sind verloren.")
-                break
-        except Exception as e:
-            logger.error(f"Kritischer Fehler beim Speichern von {filename}: {e}")
-            break
-def normalize_sector_name(raw_sector: Any) -> str:
-    """Normalisiert Sektor-Namen auf ein einheitliches Format.
-    
-    Args:
-        raw_sector: Rohwert des Sektors (kann None, String oder andere Typen sein)
-        
-    Returns:
-        Normalisierter Sektorname oder 'Unbekannt' bei Fehlern
-    """
-    # Konfigurierbare Standardwerte
-    DEFAULT_SECTOR_NAME = "Unbekannt"
-    SECTOR_MAP = {
-        'industrials': 'Industrials',
-        'industrial': 'Industrials',
-        'financials': 'Financials',
-        'financialinstitutions': 'Financials',
-        'consumerdefensive': 'Consumer Staples',
-        'consumerdiscretionary': 'Consumer Discretionary',
-        'healthcare': 'Health Care',
-        'informationtechnology': 'Information Technology',
-        'materials': 'Materials',
-        'realestate': 'Real Estate',
-        'consumerstaples': 'Consumer Staples',
-        'communication': 'Communication',
-        'communicationservices': 'Communication',
-        'energy': 'Energy',
-        'utilities': 'Utilities',
-        'utility': 'Utilities',
-        'agency': 'Other',
-        'other': 'Other',
-        'otherunknown': 'Other'
-    }
-    
-    if raw_sector is None:
-        return DEFAULT_SECTOR_NAME
-    sector_name = str(raw_sector).strip()
-    if not sector_name:
-        return DEFAULT_SECTOR_NAME
-    key = re.sub(r"[^a-z0-9]+", "", sector_name.lower())
-    return SECTOR_MAP.get(key, sector_name)
-def build_yahoo_quote_url(yahoo_symbol: str) -> str:
-    """Erstellt eine Yahoo Finance URL für ein Ticker-Symbol.
-    
-    Args:
-        yahoo_symbol: Yahoo Ticker-Symbol
-        
-    Returns:
-        Vollständige Yahoo Finance URL oder leerer String bei Fehler
-    """
-    symbol = str(yahoo_symbol or "").strip()
-    if not symbol:
-        return ""
-    if symbol.isalnum():
-        path_symbol = quote(symbol, safe=".-_")
-        query_symbol = quote(symbol, safe=".-_")
-        return f"https://finance.yahoo.com/quote/{path_symbol}/?p={query_symbol}"
 
-    search_query = quote(f'site:finance.yahoo.com/quote "{symbol}"', safe="")
-    return f"https://www.google.com/search?q={search_query}"
+load_user_settings = lambda: {**settings_catalog_core.get_user_settings_defaults(), **load_json_config(CONFIG['user_settings_file'])}
+
+def apply_user_settings(settings: Dict[str, Any]):
+    app_config_core.apply_user_settings(
+        config=CONFIG,
+        settings=settings,
+        to_float=_to_float,
+        to_bool=_to_bool,
+        normalize_weights=final_support_core.normalize_weights,
+    )
+def save_user_settings(settings: Dict[str, Any]) -> None:
+    app_config_core.save_user_settings(CONFIG, settings, save_json_config)
+def save_dataframe_safely(df: pd.DataFrame, filename: str, **kwargs) -> None:
+    app_support_core.save_dataframe_safely(df, filename, logger, **kwargs)
+def normalize_sector_name(raw_sector: Any) -> str:
+    return app_support_core.normalize_sector_name(raw_sector)
+def build_yahoo_quote_url(yahoo_symbol: str) -> str:
+    return app_support_core.build_yahoo_quote_url(yahoo_symbol)
 
 
 def _calc_momentum(series: pd.Series, curr_price: float, lookback: int) -> Optional[float]:
@@ -781,11 +338,13 @@ def _safe_positive_float(val: Any) -> float:
         return 0.0
 
 def _resolve_market_cap_from_info(info: Dict) -> float:
+    return app_support_core.resolve_market_cap_from_info(info, _safe_positive_float)
     if not info: return 0.0
     return _safe_positive_float(info.get('marketCap', 0.0))
 
 def get_currency_rate_for_ticker(ticker: str) -> float:
     """Ermittelt den korrekten Umrechnungsfaktor zu EUR basierend auf dem Ticker-Suffix."""
+    return app_support_core.get_currency_rate_for_ticker(ticker, CURRENCY_RATES)
     t = str(ticker or "").strip().upper()
     # Prüfe auf bekannte Suffixe in der globalen CURRENCY_RATES
     for suffix, rate in CURRENCY_RATES.items():
@@ -795,6 +354,13 @@ def get_currency_rate_for_ticker(ticker: str) -> float:
     return float(CURRENCY_RATES.get("DEFAULT", 1.0))
 
 def _resolve_market_value_from_sources(row: pd.Series, info: Dict, ticker: str = "") -> float:
+    return app_support_core.resolve_market_value_from_sources(
+        row=row,
+        info=info,
+        ticker=ticker,
+        currency_rates=CURRENCY_RATES,
+        safe_positive_float=_safe_positive_float,
+    )
     val = _safe_positive_float(row.get('Market_Value'))
     if val <= 0:
         val = _safe_positive_float(row.get('Market Value'))
@@ -806,6 +372,8 @@ def _resolve_market_value_from_sources(row: pd.Series, info: Dict, ticker: str =
 
 def apply_primary_liquidity_context(results: List[StockData]):
     """Berechnet die primäre Liquidität über verschiedene Listings hinweg."""
+    app_support_core.apply_primary_liquidity_context(results, CURRENCY_RATES, _to_float)
+    return
     # Safety: Namen-Normalisierung fuer Snapshots
     # Safety: Sicherstellen, dass Namen immer Strings sind (verhindert float/NaN Fehler aus Snapshots)
     for s in results:
@@ -816,22 +384,20 @@ def apply_primary_liquidity_context(results: List[StockData]):
     groups = defaultdict(list)
     
     # ISIN-Backfilling
-    # 1. Schritt: ISIN-Backfilling 
-    # Falls ein Listing eine ISIN hat, merken wir uns den (bereinigten) Namen.
     name_to_isin = {}
     for s in results:
         isin = str(s.isin or "").strip().upper()
         if isin and len(isin) > 5 and isin != 'NAN':
-            # Aggressiver Name-Key: Nur erste 15 Zeichen, keine Sonderzeichen
-            name_key = re.sub(r'[^A-Z0-9]', '', s.name.upper())[:15]
-            if name_key: name_to_isin[name_key] = isin
+            # Nutze die robuste Normalisierung aus entity_matching
+            name_key = normalize_name_for_dedup(s.name)
+            if name_key and len(name_key) > 3:
+                name_to_isin[name_key] = isin
             
     # Fehlende ISINs ergaenzen, falls wir den Namen schonmal mit ISIN hatten
     for s in results:
         isin = str(s.isin or "").strip().upper()
         if not isin or len(isin) <= 5 or isin == 'NAN':
-            name_key = re.sub(r'[^A-Z0-9]', '', s.name.upper())[:15]
-            if name_key in name_to_isin: s.isin = name_to_isin[name_key]
+            name_key = normalize_name_for_dedup(s.name)
             if name_key in name_to_isin:
                 s.isin = name_to_isin[name_key]
 
@@ -844,37 +410,28 @@ def apply_primary_liquidity_context(results: List[StockData]):
         if not items: continue
         # Das Listing mit dem hoechsten Umsatz gewinnt
         best = max(items, key=lambda x: _to_float(x.avg_volume_eur, -1.0))
+        
+        # NEU: Die beste verfügbare Market Cap in der Gruppe finden
+        best_mkt_obj = max(items, key=lambda x: _to_float(getattr(x, "market_cap", 0.0), -1.0))
+        best_mkt_cap = _to_float(getattr(best_mkt_obj, "market_cap", 0.0), 0.0)
+
         for s in items:
             s.primary_liquidity_eur = best.avg_volume_eur
             s.primary_liquidity_symbol = best.yahoo_symbol
             s.primary_liquidity_basis = "ISIN" if (s.isin and len(s.isin) > 5) else "Name"
 
-def suggest_portfolio_candidates(*args, **kwargs):
-    """Kompatibilitaets-Wrapper fuer alte und neue Candidate-Engine-Aufrufe."""
-    if "config" in kwargs:
-        return candidate_core.suggest_portfolio_candidates(*args, **kwargs)
-
-    # Legacy-Signatur aus frueheren Refactorings:
-    if len(args) >= 2 and isinstance(args[1], dict):
-        stock_results = args[0]
-        config = args[1]
-        industry_summary = kwargs.pop("industry_summary", args[2] if len(args) > 2 else None)
-        cluster_summary = kwargs.pop("cluster_summary", args[3] if len(args) > 3 else None)
-        return candidate_core.suggest_portfolio_candidates(
-            stock_results=stock_results,
-            industry_summary=industry_summary,
-            cluster_summary=cluster_summary,
-            config=config,
-            **kwargs,
-        )
-
-    return candidate_core.suggest_portfolio_candidates(*args, **kwargs)
+            # Falls dieses Listing keine Market Cap hat, nimm die beste aus der Gruppe
+            if _to_float(getattr(s, "market_cap", 0.0), 0.0) <= 0 and best_mkt_cap > 0:
+                s.market_cap = best_mkt_cap
+                rate = get_currency_rate_for_ticker(s.yahoo_symbol)
+                s.market_value = best_mkt_cap * rate
 
 def update_live_currency_rates():
     """Holt aktuelle Wechselkurse von Yahoo Finance für eine genauere Umrechnung."""
-    global CURRENCY_RATES
+    app_support_core.update_live_currency_rates(CURRENCY_RATES, logger, yf)
+    return
     logger.info("Aktualisiere Wechselkurse via Yahoo Finance...")
-    pairs = {"EURUSD=X": "DEFAULT", "EURJPY=X": ".T", "EURGBP=X": ".L"}
+    pairs = {"EURUSD=X": "DEFAULT", "EURJPY=X": ".T", "EURGBP=X": ".L", "EURHKD=X": ".HK"}
     try:
         # Wir laden die Kehrwerte, da yfinance Kurse meist als 1 EUR = X USD angibt
         data = yf.download(list(pairs.keys()), period="1d", interval="1m", progress=False)
@@ -894,53 +451,19 @@ def update_live_currency_rates():
         CURRENCY_RATES[euro_sfx] = 1.0
     CURRENCY_RATES["EUR"] = 1.0
 
-def sanitize_ticker_symbol(s: Any) -> str:
-    return final_support_core.sanitize_ticker_symbol(s)
-
-def is_plausible_ticker(s: str) -> bool:
-    return final_support_core.is_plausible_ticker(s)
-
-def generate_candidates(orig: str, land: str, exchange: str) -> List[str]:
-    return final_support_core.generate_candidates(
-        orig=orig,
-        land=land,
-        exchange=exchange,
-        unsupported_exchanges=UNSUPPORTED_EXCHANGES,
-        exchange_suffix_map=EXCHANGE_SUFFIX_MAP,
-        location_suffix_map=LOCATION_SUFFIX_MAP,
-    )
-
-def download_ishares_csv(url: str, log_label: bool = True) -> pd.DataFrame:
-    return final_support_core.download_ishares_csv(url, logger=logger, log_label=log_label)
-
-def _log_info_fetch_summary(msg: str, mgr: Any) -> None:
-    final_support_core.log_info_fetch_summary(msg, mgr, logger)
-
-def _parse_etf_selection_input(inp: str, opts: Dict) -> List[str]:
-    return final_support_core.parse_etf_selection_input(inp, opts)
-
-def parse_ishares_url(url: str):
-    return final_support_core.parse_ishares_url(url)
-
-def _merge_tokens(series: pd.Series) -> str:
-    return final_support_core.merge_tokens(series)
-
-def _parse_source_tokens(value: Any) -> Set[str]:
-    """Zerlegt einen kommagetrennten String in ein Set von bereinigten Tokens."""
-    if not value:
-        return set()
-    return {p.strip() for p in str(value).split(",") if p and p.strip()}
-
-def _history_priority_score(item: Any) -> int:
-    return final_support_core.history_priority_score(item, LOCATION_SUFFIX_MAP)
+sanitize_ticker_symbol = final_support_core.sanitize_ticker_symbol
+is_plausible_ticker = final_support_core.is_plausible_ticker
+generate_candidates = lambda orig, land, exchange: final_support_core.generate_candidates(orig, land, exchange, UNSUPPORTED_EXCHANGES, EXCHANGE_SUFFIX_MAP, LOCATION_SUFFIX_MAP)
+download_ishares_csv = lambda url, log_label=True: final_support_core.download_ishares_csv(url, logger, log_label)
+_log_info_fetch_summary = lambda msg, mgr: final_support_core.log_info_fetch_summary(msg, mgr, logger)
+_parse_etf_selection_input = final_support_core.parse_etf_selection_input
+parse_ishares_url = final_support_core.parse_ishares_url
+_merge_tokens = final_support_core.merge_tokens
+_parse_source_tokens = final_support_core.parse_tokens
+_history_priority_score = lambda item: final_support_core.history_priority_score(item, LOCATION_SUFFIX_MAP)
 
 def _stock_history_priority_score(s: StockData) -> int:
     return final_support_core.stock_history_priority_score(s, LOCATION_SUFFIX_MAP)
-
-def get_rsl_integrity_drop_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
-    return rsl_integrity_core.get_rsl_integrity_drop_reasons(
-        item, LOCATION_SUFFIX_MAP, CONFIG, raw_rsl=raw_rsl
-    )
 
 def get_rsl_integrity_reasons(item: Any, raw_rsl: Any = None) -> List[str]:
     return rsl_integrity_core.get_rsl_integrity_reasons(
@@ -956,36 +479,166 @@ def synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results):
     return final_support_core.synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, results)
 
 def build_home_market_rsl_audit(results):
-    return rsl_integrity_core.build_home_market_rsl_audit(results, LOCATION_SUFFIX_MAP)
+    base_df = rsl_integrity_core.build_home_market_rsl_audit(results, LOCATION_SUFFIX_MAP)
+    rows = []
+    by_symbol = {str(getattr(stock, "yahoo_symbol", "")).upper(): stock for stock in results}
+    for _, row in base_df.iterrows():
+        symbol = str(row.get("ticker", "")).upper()
+        stock = by_symbol.get(symbol)
+        original_ticker = str(getattr(stock, "original_ticker", symbol) or symbol)
+        primary_symbol = str(getattr(stock, "primary_liquidity_symbol", "") or "")
+        history_matches_home = bool(primary_symbol) and symbol == primary_symbol.upper()
+        history_status = "OVERRIDDEN_TO_HOME" if history_matches_home else ("SECONDARY_HISTORY_ACTIVE" if primary_symbol else "UNKNOWN")
+        review_reasons = [x for x in str(row.get("review_reasons", "") or "").split(",") if x]
+        if primary_symbol and not history_matches_home:
+            review_reasons.extend(["secondary_without_override", "secondary_history_active"])
+        if _to_float(getattr(stock, "rsl", 0.0), 0.0) >= 1.5 and _to_float(getattr(stock, "mom_6m", 0.0), 0.0) < 0.05:
+            review_reasons.append("high_rsl_vs_weak_6m")
+        merged = dict(row)
+        merged.update(
+            {
+                "original_ticker": original_ticker,
+                "yahoo_symbol": symbol,
+                "primary_liquidity_symbol": primary_symbol,
+                "rsl_rank": getattr(stock, "rsl_rang", row.get("rsl_rank")),
+                "history_status": history_status,
+                "history_matches_home": history_matches_home,
+                "needs_review": bool(review_reasons),
+                "review_reasons": ",".join(dict.fromkeys(review_reasons)),
+            }
+        )
+        rows.append(merged)
+    return pd.DataFrame(rows)
 
 def build_home_market_rsl_review_shortlist(
     audit_df: pd.DataFrame, top_rank: int = 300
 ) -> pd.DataFrame:
-    return rsl_integrity_core.build_home_market_rsl_review_shortlist(
-        audit_df, top_rank=top_rank
-    )
+    work = audit_df.copy()
+    rank_col = "rsl_rank" if "rsl_rank" in work.columns else "RSL-Rang"
+    if rank_col in work.columns:
+        work = work[work[rank_col].fillna(999999) <= top_rank]
+    if "needs_review" in work.columns:
+        work = work[work["needs_review"] == True]
+    return work.reset_index(drop=True)
 
 def save_home_market_rsl_audit(results):
-    audit_df = build_home_market_rsl_audit(results)
-    shortlist_df = build_home_market_rsl_review_shortlist(
-        audit_df,
-        top_rank=int(CONFIG.get("home_market_rsl_review_top_rank", 300) or 300),
+    return app_support_core.save_home_market_rsl_audit(
+        results=results,
+        config=CONFIG,
+        location_suffix_map=LOCATION_SUFFIX_MAP,
+        save_dataframe_safely_func=save_dataframe_safely,
     )
-    save_dataframe_safely(
-        audit_df,
-        CONFIG["home_market_rsl_audit_file"],
-        sep=';',
-        index=False,
-        encoding='utf-8-sig',
-    )
-    save_dataframe_safely(
-        shortlist_df,
-        CONFIG["home_market_rsl_review_file"],
-        sep=';',
-        index=False,
-        encoding='utf-8-sig',
-    )
-    return audit_df
+
+
+def run_fundamental_data_download(data_mgr: MarketDataManager) -> None:
+    """Lädt gezielt Fundamentaldaten für das Universum nach, priorisiert auf Primär-Listings."""
+    print("\n\033[94m" + "="*70)
+    print(" FUNDAMENTALDATEN-DOWNLOAD (Market Cap, ISIN, Sektor)")
+    print("="*70 + "\033[0m")
+    
+    # 1. Universum bestimmen
+    etf_config = load_json_config(CONFIG['etf_config_file'])
+    selected_syms = etf_config.get('selected_symbols', [])
+    etf_options = etf_config.get('options', {})
+    
+    if not selected_syms:
+        print("Keine ETFs ausgewählt. Bitte zuerst Auswahl treffen.")
+        selected_syms, etf_options = select_etf_interactive()
+        if not selected_syms: return
+
+    df = _prepare_ticker_universe(selected_syms, etf_options)
+    if df.empty: return
+    
+    # Gruppierung für Qualitäts-Optimierung: Wir laden nur den "besten" Ticker pro Firma
+    # (z.B. NASDAQ vor Frankfurt), da dort die Market Cap Daten bei Yahoo verlässlicher sind.
+    from core.data_pipeline import _get_ticker_priority
+    
+    df['_prio'] = df['Ticker'].apply(_get_ticker_priority)
+    if 'ISIN' in df.columns and _has_meaningful_isin_data(df):
+        df['_group_id'] = df['ISIN'].fillna(df['Ticker'])
+    else:
+        df['_group_id'] = df['Name'].apply(normalize_name_for_dedup)
+        
+    # Besten Ticker pro Gruppe finden (Deduplizierung für den Download)
+    best_tickers_df = df.sort_values('_prio').drop_duplicates(subset=['_group_id'], keep='first')
+    unique_firms = sorted(list(set(best_tickers_df['Ticker'].astype(str).unique())))
+    total_firms = len(unique_firms)
+    
+    # 2. Status Quo prüfen
+    to_update_delta = []
+    to_update_old = []
+    has_data = 0
+    now = datetime.datetime.now()
+    three_months_ago = now - datetime.timedelta(days=90)
+    
+    for t in unique_firms:
+        info = data_mgr.get_cached_info(t)
+        if info and _to_float(info.get('marketCap', 0), 0) > 0:
+            has_data += 1
+            # Check age
+            try:
+                cached_at = datetime.datetime.fromisoformat(info.get('cached_at', ""))
+                if cached_at < three_months_ago:
+                    to_update_old.append(t)
+            except:
+                to_update_old.append(t)
+        else:
+            to_update_delta.append(t)
+            
+    coverage = (has_data / total_firms * 100) if total_firms > 0 else 0
+    print(f"\nStatus des Universums ({total_firms} Firmen/Gruppen):")
+    print(f" - Abdeckung (Market Cap > 0): \033[92m{coverage:.1f}%\033[0m")
+    print(f" - Fehlende Daten (Delta):      {len(to_update_delta)}")
+    print(f" - Veraltete Daten (> 3 Mon.):  {len(to_update_old)}")
+    
+    if not to_update_delta and not to_update_old:
+        print("\n\033[92mDatenbestand ist perfekt und aktuell!\033[0m")
+        return
+
+    print("\nOptionen:")
+    print(" [1] Nur Delta laden (fehlende/0)")
+    print(" [2] Delta + Veraltete laden (> 3 Monate)")
+    print(" [0] Abbrechen")
+    
+    mode_in = input("Wahl [1]: ").strip()
+    if mode_in == "0": return
+    mode = mode_in if mode_in else "1"
+    
+    targets = to_update_delta if mode == "1" else sorted(list(set(to_update_delta + to_update_old)))
+    
+    print(f"\nStarte Download für {len(targets)} Primär-Ticker (Batch-Drosselung aktiv)...")
+    with make_progress(total=len(targets), desc="Fundamental Download", include_last_duration=False) as pbar, \
+         concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            # Im Refresh-Modus (2) müssen wir den Cache-Eintrag löschen, damit yfinance neu abfragt
+            if mode == "2":
+                for t in to_update_old:
+                    if t in data_mgr.info_cache:
+                        with data_mgr.lock: del data_mgr.info_cache[t]
+
+            # Einreichen in kleineren Sub-Batches, um Rate-Limits besser zu managen
+            sub_batch_size = 50
+            for j in range(0, len(targets), sub_batch_size):
+                sub_targets = targets[j : j + sub_batch_size]
+                futures = {executor.submit(data_mgr.fetch_and_cache_info, sym, force_refresh=True): sym for sym in sub_targets}
+                
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    future.result()
+                    pbar.update(1)
+                    
+                    # Notfall-Bremse: Wenn zu viele Rate-Limits auftreten
+                    if _consume_rate_limit_hits() > 3:
+                        print("\n\033[93mHohe Rate-Limit Aktivitaet erkannt. Kurze Abkuehlphase...\033[0m")
+                        time.sleep(30)
+                
+                # Regelmäßiges Zwischenspeichern
+                data_mgr.save_info_cache()
+                
+        except KeyboardInterrupt:
+            print("\nDownload abgebrochen.")
+        finally:
+            data_mgr.save_info_cache()
+            print(f"\n\033[92mDownload beendet. Datenqualität wurde optimiert.\033[0m")
 
 
 def refresh_market_caps_for_relevant_exchange_stocks(stock_results: List[StockData], data_mgr: Any) -> int:
@@ -1077,18 +730,20 @@ if not CURRENCY_RATES:
     "DEFAULT": 0.95,  # USD -> EUR
     ".DE": 1.0,       # EUR (Basis)
     ".F": 1.0,        # EUR (Frankfurt)
+    ".HK": 0.12,
+    ".L": 1.20,
+    ".T": 0.006,
+    ".TO": 0.68,
+    ".AX": 0.61,
+    ".SR": 0.25,
+    ".TW": 0.029,
+    ".KS": 0.00068,
+    ".SA": 0.16,
     # Weitere wichtige Währungen sollten in currency_rates.json gepflegt werden
     # Die Live-Update-Funktion holt EURUSD, EURJPY, EURGBP
 }
 def get_user_input(prompt: str, default: Optional[str] = None, valid_options: Optional[List[str]] = None) -> str:
-    while True:
-        user_in = input(prompt).strip().lower()
-        if not user_in and default is not None:
-            return default
-        if valid_options and user_in not in valid_options:
-            print(f"Bitte waehle eine der Optionen: {', '.join(valid_options)}")
-            continue
-        return user_in
+    return app_support_core.get_user_input(prompt, default=default, valid_options=valid_options)
 def _cache_age_hours(file_path: str) -> Optional[float]:
     try:
         if not file_path or not os.path.exists(file_path):
@@ -1217,7 +872,7 @@ def _configure_user_settings_legacy():
         mom_w12_raw = _to_float(settings.get('mom_weight_12m', CONFIG['mom_weight_12m']), CONFIG['mom_weight_12m'])
         mom_w6_raw = _to_float(settings.get('mom_weight_6m', CONFIG['mom_weight_6m']), CONFIG['mom_weight_6m'])
         mom_w3_raw = _to_float(settings.get('mom_weight_3m', CONFIG['mom_weight_3m']), CONFIG['mom_weight_3m'])
-        mom_w12, mom_w6, mom_w3 = _normalize_mom_weights(mom_w12_raw, mom_w6_raw, mom_w3_raw)
+        mom_w12, mom_w6, mom_w3 = final_support_core.normalize_weights(mom_w12_raw, mom_w6_raw, mom_w3_raw)
         mom_lb12 = int(_to_float(settings.get('mom_lookback_12m', CONFIG['mom_lookback_12m']), CONFIG['mom_lookback_12m']))
         mom_lb6 = int(_to_float(settings.get('mom_lookback_6m', CONFIG['mom_lookback_6m']), CONFIG['mom_lookback_6m']))
         mom_lb3 = int(_to_float(settings.get('mom_lookback_3m', CONFIG['mom_lookback_3m']), CONFIG['mom_lookback_3m']))
@@ -1254,7 +909,7 @@ def _configure_user_settings_legacy():
         c_w_mom_raw = _to_float(settings.get('cluster_score_w_mom12', CONFIG['cluster_score_w_mom12']), CONFIG['cluster_score_w_mom12'])
         c_w_mom6_raw = _to_float(settings.get('cluster_score_w_mom6', CONFIG['cluster_score_w_mom6']), CONFIG['cluster_score_w_mom6'])
         c_w_acc_raw = _to_float(settings.get('cluster_score_w_accel', CONFIG['cluster_score_w_accel']), CONFIG['cluster_score_w_accel'])
-        c_w_mom, c_w_mom6, c_w_acc = _normalize_cluster_score_weights(c_w_mom_raw, c_w_mom6_raw, c_w_acc_raw)
+        c_w_mom, c_w_mom6, c_w_acc = final_support_core.normalize_weights(c_w_mom_raw, c_w_mom6_raw, c_w_acc_raw)
         cand_use_cluster = _to_bool(
             settings.get('candidate_use_cluster_filter', CONFIG['candidate_use_cluster_filter']),
             CONFIG['candidate_use_cluster_filter']
@@ -1617,7 +1272,7 @@ def _configure_user_settings_legacy():
             print("Ungueltige Auswahl.")
             continue
         if made_change:
-            nw12, nw6, nw3 = _normalize_mom_weights(
+            nw12, nw6, nw3 = final_support_core.normalize_weights(
                 settings.get('mom_weight_12m', CONFIG['mom_weight_12m']),
                 settings.get('mom_weight_6m', CONFIG['mom_weight_6m']),
                 settings.get('mom_weight_3m', CONFIG['mom_weight_3m'])
@@ -1625,7 +1280,7 @@ def _configure_user_settings_legacy():
             settings['mom_weight_12m'] = nw12
             settings['mom_weight_6m'] = nw6
             settings['mom_weight_3m'] = nw3
-            c_w_mom_norm, c_w_mom6_norm, c_w_acc_norm = _normalize_cluster_score_weights(
+            c_w_mom_norm, c_w_mom6_norm, c_w_acc_norm = final_support_core.normalize_weights(
                 settings.get('cluster_score_w_mom12', CONFIG['cluster_score_w_mom12']),
                 settings.get('cluster_score_w_mom6', CONFIG['cluster_score_w_mom6']),
                 settings.get('cluster_score_w_accel', CONFIG['cluster_score_w_accel'])
@@ -1705,108 +1360,33 @@ def save_analysis_snapshot(
     stock_results: List["StockData"],
     selected_syms: List[str],
     etf_options: Dict[str, Dict[str, Any]],
-    integrity_drops_df: pd.DataFrame = None
+    integrity_drops_df: pd.DataFrame = None,
+    universe_audit_df: pd.DataFrame = None
 ):
-    payload = {
-        'saved_at': datetime.datetime.now().isoformat(timespec='seconds'),
-        'selected_syms': list(selected_syms),
-        'etf_options': etf_options,
-        'stock_results': [asdict(s) for s in stock_results],
-        'integrity_drops': integrity_drops_df.to_dict(orient='records') if integrity_drops_df is not None else []
-    }
-    save_json_config(CONFIG['last_analysis_snapshot_file'], payload)
+    return app_support_core.save_analysis_snapshot(
+        snapshot_file=CONFIG['last_analysis_snapshot_file'],
+        stock_results=stock_results,
+        selected_syms=selected_syms,
+        etf_options=etf_options,
+        save_json_config=save_json_config,
+        integrity_drops_df=integrity_drops_df,
+        universe_audit_df=universe_audit_df,
+    )
 def load_analysis_snapshot() -> Optional[Dict[str, Any]]:
-    snapshot = load_json_config(CONFIG['last_analysis_snapshot_file'])
-    if not snapshot or 'stock_results' not in snapshot:
-        return None
-    field_names = {f.name for f in fields(StockData)}
-    stocks: List[StockData] = []
-    for item in snapshot.get('stock_results', []):
-        if not isinstance(item, dict):
-            continue
-        row = {k: v for k, v in item.items() if k in field_names}
-
-        # Namen-Integritaet sicherstellen (Schutz gegen float/NaN beim Snapshot-Laden)
-        if pd.isna(row.get('name')) or row.get('name') == '' or row.get('name') is None:
-            row['name'] = 'Unknown'
-        row['name'] = str(row['name'])
-
-        # Fallback fuer alte Snapshots ohne Industry
-        if 'industry' not in row:
-            row['industry'] = 'Unknown'
-        if 'isin' not in row:
-            row['isin'] = ''
-        if 'listing_source' not in row:
-            row['listing_source'] = ''
-        if 'flag_scale' not in row:
-            row['flag_scale'] = 'OK'
-        if 'scale_reason' not in row:
-            row['scale_reason'] = ''
-        # Vorhandene Flags und Gruende priorisieren
-        row['flag_stale'] = str(row.get('flag_stale', 'OK'))
-        row['stale_reason'] = str(row.get('stale_reason', ''))
-        row['flag_history_length'] = str(row.get('flag_history_length', 'OK'))
-        row['history_length_reason'] = str(row.get('history_length_reason', ''))
-
-        if 'stale_reason' not in row:
-            row['stale_reason'] = ''
-        if 'flag_history_length' not in row:
-            row['flag_history_length'] = 'OK'
-        if 'history_length_reason' not in row:
-            row['history_length_reason'] = ''
-        if 'price_scale_ratio' not in row:
-            row['price_scale_ratio'] = 1.0
-        
-        # Datentypen sicherstellen fuer optionale Felder (inkl. alter Namen)
-        if 'avg_volume_eur' not in row:
-            row['avg_volume_eur'] = row.get('avg_volume_usd', 0.0)
-        if 'avg_volume_usd' in row:
-            del row['avg_volume_usd']
-        if 'primary_liquidity_eur' not in row:
-            row['primary_liquidity_eur'] = row.get('avg_volume_eur', 0.0)
-        if 'primary_liquidity_symbol' not in row:
-            row['primary_liquidity_symbol'] = ''
-        if 'primary_liquidity_basis' not in row:
-            row['primary_liquidity_basis'] = ''
-        if 'trust_score' not in row: row['trust_score'] = 0
-        if str(row.get('isin', '')).strip().lower() in ('nan', 'none'):
-            row['isin'] = ''
-        if str(row.get('listing_source', '')).strip().lower() in ('nan', 'none'):
-            row['listing_source'] = ''
-        source_parts = [p.strip() for p in str(row.get('source_etf', '') or '').split(',') if p and p.strip()]
-        listing_parts = [p.strip() for p in str(row.get('listing_source', '') or '').split(',') if p and p.strip()]
-        moved_listing_parts = [p for p in source_parts if p in {'FRA', 'XETRA'}]
-        if moved_listing_parts:
-            source_parts = [p for p in source_parts if p not in {'FRA', 'XETRA'}]
-            listing_parts = sorted(set(listing_parts + moved_listing_parts))
-            row['source_etf'] = ", ".join(source_parts)
-            row['listing_source'] = ", ".join(listing_parts)
-
-        try:
-            stocks.append(StockData(**row))
-        except TypeError:
-            continue
-    if not stocks:
-        return None
-    integrity_drops_raw = snapshot.get('integrity_drops', [])
-    integrity_drops_df = pd.DataFrame(integrity_drops_raw)
-
-    apply_primary_liquidity_context(stocks)
-    stocks.sort(key=lambda x: (x.rsl if not pd.isna(x.rsl) else -1.0), reverse=True)
-    for i, s in enumerate(stocks):
-        s.rsl_rang = i + 1
-    stocks.sort(key=lambda x: (x.market_value if not pd.isna(x.market_value) else -1.0), reverse=True)
-    for i, s in enumerate(stocks):
-        s.mktcap_rang = i + 1
-    stocks.sort(key=lambda x: (x.rsl if not pd.isna(x.rsl) else -1.0), reverse=True)
-    return {
-        'saved_at': snapshot.get('saved_at', ''),
-        'selected_syms': snapshot.get('selected_syms', []),
-        'etf_options': snapshot.get('etf_options', {}),
-        'stock_results': stocks,
-        'integrity_drops_df': integrity_drops_df
-    }
+    return app_support_core.load_analysis_snapshot(
+        snapshot_file=CONFIG['last_analysis_snapshot_file'],
+        load_json_config=load_json_config,
+        currency_rates=CURRENCY_RATES,
+        to_float=_to_float,
+    )
 def select_etf_interactive() -> Tuple[List[str], Dict[str, Any]]:
+    return app_support_core.select_etf_interactive(
+        config=CONFIG,
+        load_json_config=load_json_config,
+        save_json_config=save_json_config,
+        parse_etf_selection_input=_parse_etf_selection_input,
+        parse_ishares_url=parse_ishares_url,
+    )
     etf_config = load_json_config(CONFIG['etf_config_file'])
     if not etf_config or 'options' not in etf_config or 'selected_symbols' not in etf_config:
         etf_config = {'selected_symbols': [], 'options': {}}
@@ -1834,9 +1414,11 @@ def select_etf_interactive() -> Tuple[List[str], Dict[str, Any]]:
         opts = list(etf_options.keys())
         for i, sym in enumerate(opts, 1):
             print(f"{i}. {sym} - {etf_options[sym]['name']}")
+        print(f"{len(opts)+1}. XETRA - Deutsche Börse Xetra")
+        print(f"{len(opts)+2}. FRA   - Deutsche Börse Frankfurt")
         
-        print("\nOder 'add' um einen neuen hinzuzufuegen, 'remove' zum Entfernen, '?' fuer Hilfe.")
-        choice = input("Wahl: ").strip().lower()
+        print("\nOder 'all' für alles, 'add' zum Hinzufügen, 'remove' zum Entfernen, '?' für Hilfe.")
+        choice = input("Wahl (z.B. 1,2,FRA): ").strip().lower()
         if choice == '?':
             print("\nHilfe ETF-Auswahl:")
             print(" - Nummern: Auswahl per Index, z.B. 1,3,5")
@@ -1883,9 +1465,10 @@ def select_etf_interactive() -> Tuple[List[str], Dict[str, Any]]:
             continue
        
         elif choice == 'all':
-             etf_config['selected_symbols'] = opts
+             full_selection = opts + ["XETRA", "FRA"]
+             etf_config['selected_symbols'] = full_selection
              save_json_config(CONFIG['etf_config_file'], etf_config)
-             return opts, etf_options
+             return full_selection, etf_options
         else:
             try:
                 new_selection = _parse_etf_selection_input(choice, etf_options)
@@ -1908,36 +1491,30 @@ def render_analysis_output(
     suggest_portfolio_candidates: Optional[Callable] = None,
     market_regime: Optional[Dict[str, Any]] = None,
     integrity_drops_df: Optional[pd.DataFrame] = None,
+    universe_audit_df: Optional[pd.DataFrame] = None,
     watchlist_symbols: Optional[set] = None
 ):
-    return console_ui_core.render_analysis_output(
+    return app_support_core.render_analysis_output(
         stock_results=stock_results,
         portfolio_mgr=portfolio_mgr,
         selected_syms=selected_syms,
         etf_options=etf_options,
-        update_last_run_cfg=update_last_run_cfg,
-        data_mgr=data_mgr,
         config=CONFIG,
         logger=logger,
-        build_multiscope_status_map=ranking_core.build_multiscope_status_map,
-        sort_portfolio_items_by_rank=ranking_core.sort_portfolio_items_by_rank,
-        _format_percent_value=ranking_core.format_percent_value,
-        _format_percent_bar=ranking_core.format_percent_bar,
-        _risk_bucket=ranking_core.risk_bucket,
-        _shorten_text=ranking_core.shorten_text,
-        build_yahoo_quote_url=build_yahoo_quote_url,
-        build_etf_rsl_summary=summary_core.build_etf_rsl_summary,
-        build_sector_rsl_summary=summary_core.build_sector_rsl_summary,
+        save_json_config=save_json_config,
+        save_dataframe_safely_func=save_dataframe_safely,
+        save_excel_report_safely=save_excel_report_safely,
+        build_console_symbols=console_core.build_console_symbols,
+        build_yahoo_quote_url_func=build_yahoo_quote_url,
+        data_mgr=data_mgr,
+        update_last_run_cfg=update_last_run_cfg,
         industry_summary_df=industry_summary_df,
         cluster_summary_df=cluster_summary_df,
         suggest_portfolio_candidates=suggest_portfolio_candidates,
-        save_json_config=save_json_config,
-        build_console_symbols=console_core.build_console_symbols,
-        save_excel_report_safely=save_excel_report_safely,
-        save_dataframe_safely=save_dataframe_safely,
         market_regime=market_regime,
         integrity_drops_df=integrity_drops_df,
-        watchlist_symbols=watchlist_symbols
+        universe_audit_df=universe_audit_df,
+        watchlist_symbols=watchlist_symbols,
     )
 def rerender_last_analysis() -> bool:
     """
@@ -1962,20 +1539,8 @@ def rerender_last_analysis() -> bool:
         return False
     stock_results = snapshot['stock_results']
 
-    # NEU: Wir kombinieren Hauptliste und Drops, um sie neu zu filtern (falls Regeln geaendert wurden)
-    main_stocks = snapshot['stock_results']
-    dropped_raw = snapshot.get('integrity_drops_df')
-    
-    # Konvertiere rohe Drops zurueck in StockData Objekte (falls moeglich)
-    # (Hier verkuerzt: Wir nutzen die Hauptliste als Basis fuer die Filter-Demo)
-    all_candidates = main_stocks # In einer vollen Implementierung wuerden hier auch die Drops geladen
-
-    # Dynamische Neu-Filterung mit aktuellen CONFIG-Werten
-    stock_results, integrity_issues_df = filter_stock_results_for_rsl_integrity(all_candidates)
-    
     selected_syms = snapshot.get('selected_syms', [])
     etf_options = snapshot.get('etf_options', {})
-    integrity_issues_df = snapshot.get('integrity_drops_df', pd.DataFrame())
 
     saved_at = snapshot.get('saved_at', '')
     logger.info(f"Nutze letzten Analysesnapshot ohne neuen Download. Stand: {saved_at or 'unbekannt'}")
@@ -1984,11 +1549,29 @@ def rerender_last_analysis() -> bool:
     print(f"\nLetzter Datenstand geladen: {saved_at or 'unbekannt'}")
     print(f"Analyse wird ohne neuen Download mit {len(stock_results)} gespeicherten Werten neu aufgebaut.")
 
-    # NEU: Dynamische Re-Filterung ermöglicht CONFIG-Anpassungen (z.B. sma_length) ohne Download
-    stock_results, re_issues_df = filter_stock_results_for_rsl_integrity(stock_results)
-    if not re_issues_df.empty:
-        integrity_issues_df = pd.concat([integrity_issues_df, re_issues_df], ignore_index=True).drop_duplicates(subset=['yahoo_symbol'])
+    # Daten aus Snapshot extrahieren (Fallback auf verschiedene Keys für Abwärtskompatibilität)
+    integrity_drops_df = snapshot.get('integrity_drops_df')
+    if integrity_drops_df is None or (isinstance(integrity_drops_df, pd.DataFrame) and integrity_drops_df.empty):
+        integrity_drops_df = pd.DataFrame(snapshot.get('integrity_drops', []))
+        
+    universe_audit_df = snapshot.get('universe_audit_df')
+    if universe_audit_df is None or (isinstance(universe_audit_df, pd.DataFrame) and universe_audit_df.empty):
+        universe_audit_df = pd.DataFrame(snapshot.get('universe_audit', []))
+
+    # Re-Evaluation der validen Stocks (erlaubt CONFIG-Anpassungen für Warnungen)
+    stock_results, new_warnings_df = filter_stock_results_for_rsl_integrity(stock_results)
     
+    # Kombinieren mit den gespeicherten Fehlern (Wichtig: Snapshot-Daten mit excluded=True müssen erhalten bleiben)
+    if not new_warnings_df.empty:
+        if integrity_drops_df.empty:
+            integrity_drops_df = new_warnings_df
+        else:
+            integrity_drops_df = pd.concat([integrity_drops_df, new_warnings_df], ignore_index=True).drop_duplicates(subset=['ticker'], keep='first')
+
+    if not integrity_drops_df.empty:
+        integrity_summary = quality_core.summarize_integrity_flags(integrity_drops_df)
+        print(f"\nIntegritaets-Check Ergebnis: {quality_core.quality_gate_status(integrity_summary)}")
+
     # --- NEU: Metadata-Repair fuer Snapshots ---
     # Wir laden die Caches, um leere Felder im Snapshot on-the-fly zu füllen
     raw_countries = load_json_config(CONFIG['country_cache_file'])
@@ -1996,6 +1579,24 @@ def rerender_last_analysis() -> bool:
     raw_info = load_json_config(CONFIG['ticker_info_cache_file'])
     info_cache = cast(Dict[str, Any], raw_info) if isinstance(raw_info, dict) else {}
     
+    # Globalen ISIN-Lookup und Ticker-ISIN-Map für Reparatur bauen
+    # Globalen ISIN-Lookup, Ticker-ISIN-Map und Name-ISIN-Map für Reparatur bauen
+    global_isin_map = {}
+    ticker_to_isin_cache = {}
+    name_to_isin_cache = {}
+    for t_sym, t_info in info_cache.items():
+        isin = t_info.get('isin')
+        if isin and len(isin) > 5 and isin not in ("NAN", "NONE"):
+            ticker_to_isin_cache[t_sym.upper()] = isin
+            # Namens-Brücke bauen: Normalisierte Namen zu ISIN mappen
+            n_key = normalize_name_for_dedup(t_info.get('longName', ''))
+            if n_key and len(n_key) > 3:
+                name_to_isin_cache[n_key] = isin
+
+            mkt_cap = _to_float(t_info.get('marketCap', 0), 0)
+            if isin not in global_isin_map or mkt_cap > _to_float(global_isin_map[isin].get('marketCap', 0), 0):
+                global_isin_map[isin] = t_info
+
     repaired_count = 0
     for s in stock_results:
         y_sym = str(s.yahoo_symbol).strip().upper()
@@ -2013,8 +1614,23 @@ def rerender_last_analysis() -> bool:
             if y_sym in info_cache:
                 s.industry = info_cache[y_sym].get('industry', 'Unknown')
                 s.sector = info_cache[y_sym].get('sector', 'Unknown')
-        if _safe_positive_float(getattr(s, 'market_value', 0.0)) <= 0 and y_sym in info_cache:
-            repaired_market_cap = _resolve_market_cap_from_info(cast(Dict, info_cache.get(y_sym, {})))
+
+        # 3. Marktwert reparieren via ISIN-Map (Primär-Listing-Daten nutzen)
+        if _safe_positive_float(getattr(s, 'market_value', 0.0)) <= 0:
+            isin_s = getattr(s, 'isin', '')
+            if not isin_s or isin_s.lower() in ('nan', 'none'):
+                isin_s = ticker_to_isin_cache.get(y_sym, '')
+            
+            # Letzte Rettung: Namens-Abgleich falls ISIN fehlt
+            if not isin_s:
+                isin_s = name_to_isin_cache.get(normalize_name_for_dedup(s.name), '')
+            
+            info_to_use = info_cache.get(y_sym, {})
+            found_cap = _resolve_market_cap_from_info(info_to_use)
+            if found_cap <= 0 and isin_s in global_isin_map:
+                info_to_use = global_isin_map[isin_s]
+            
+            repaired_market_cap = _resolve_market_cap_from_info(info_to_use)
             if repaired_market_cap > 0:
                 rate = get_currency_rate_for_ticker(y_sym)
                 s.market_cap = repaired_market_cap
@@ -2056,173 +1672,68 @@ def rerender_last_analysis() -> bool:
         etf_options=etf_options,
         update_last_run_cfg=False,
         data_mgr=None,
-        suggest_portfolio_candidates=suggest_portfolio_candidates,
+        suggest_portfolio_candidates=candidate_core.suggest_portfolio_candidates,
         industry_summary_df=industry_summary_df,
         cluster_summary_df=cluster_summary_df,
         market_regime=market_regime,
-        integrity_drops_df=integrity_issues_df,
+        integrity_drops_df=integrity_drops_df,
+        universe_audit_df=universe_audit_df,
         watchlist_symbols=watchlist_symbols
     )
     return True
 
 def show_ticker_history_interactive():
-    """Interaktive Anzeige der historischen Kursdaten inkl. Dividenden."""
-    ticker = input("\n[?] Yahoo Ticker (z.B. AAPL, SAP.DE): ").strip().upper()
-    if not ticker:
-        return
-    
-    days_in = input("[?] Anzahl Tage (Standard 130, ENTER): ").strip()
-    try:
-        days = int(days_in) if days_in else 130
-    except ValueError:
-        days = 130
-        
-    print(f"Lade Daten fuer {ticker}...")
-    try:
-        # Zeitraum dynamisch wählen, um genug Daten für die Trading-Tage zu haben
-        period = "2y" if days > 250 else "1y"
-        t = yf.Ticker(ticker)
-        # auto_adjust=False, um sowohl den rohen Close als auch den bereinigten Adj Close zu erhalten
-        df = t.history(period=period, actions=True, auto_adjust=False)
-        
-        if df.empty:
-            print(f"\033[91mFehler: Keine Daten fuer {ticker} gefunden.\033[0m")
-            return
-            
-        df = df.tail(days)
-        
-        # Header formatting
-        print("\n" + "="*115)
-        print(f" HISTORIE: {ticker} (letzte {len(df)} Handelstage)")
-        print("="*115)
-        header = f"{'Datum':<12} | {'Open':>9} | {'High':>9} | {'Low':>9} | {'Close':>9} | {'Adj Close':>9} | {'Volume':>12} | {'Dividende'}"
-        print(header)
-        print("-" * 115)
-        
-        for dt, row in df.iterrows():
-            div = row.get('Dividends', 0.0)
-            # Dividende hervorheben wenn > 0
-            div_str = f"\033[92m{div:>10.3f} \U0001F4B0\033[0m" if div > 0 else f"{'-':>10}"
-            
-            # Zeile gelb färben wenn Dividende vorhanden
-            color = "\033[93m" if div > 0 else ""
-            reset = "\033[0m" if div > 0 else ""
-            
-            adj_c = row.get('Adj Close', row['Close'])
-            print(f"{color}{dt.strftime('%Y-%m-%d'):<12} | {row['Open']:>9.2f} | {row['High']:>9.2f} | {row['Low']:>9.2f} | {row['Close']:>9.2f} | {adj_c:>9.2f} | {int(row['Volume']):>12,d} | {div_str}{reset}")
-        
-        print("="*115)
-        print(f"Info: {len(df)} Zeilen angezeigt. Dividenden-Tage sind markiert.")
-        
-    except Exception as e:
-        print(f"\033[91mFehler beim Abrufen der Historie: {e}\033[0m")
+    app_support_core.show_ticker_history_interactive(yf)
 
 def _auto_adjust_delays() -> None:
-    """
-    Passt die Request-Delays basierend auf den Rate-Limit-Hits des letzten Laufs an.
-    """
-    try:
-        stats = load_json_config(CONFIG['run_stats_file'])
-        last_hits = int(stats.get('last_rate_limit_hits', -1))
-
-        if last_hits == -1:
-            return # Keine Statistik vorhanden, nichts tun
-
-        min_s = float(CONFIG.get('batch_sleep_min_s', 0.5))
-        max_s = float(CONFIG.get('batch_sleep_max_s', 1.5))
-        info_s = float(CONFIG.get('info_fetch_delay_s', 0.7))
-
-        if last_hits == 0:
-            # Zu vorsichtig, beschleunigen
-            factor = 0.95 # 5% schneller
-            min_s = max(0.05, min_s * factor)
-            max_s = max(0.1, max_s * factor)
-            info_s = max(0.05, info_s * factor)
-            logger.info(f"AUTO-OPTIMIZE: Keine Rate-Limits im letzten Lauf. Delays werden verkuerzt (Faktor {factor}).")
-        elif last_hits > 10:
-            # Zu aggressiv, verlangsamen
-            factor = 1.10 # 10% langsamer
-            min_s = min(2.0, min_s * factor)
-            max_s = min(3.0, max_s * factor)
-            info_s = min(2.5, info_s * factor)
-            logger.info(f"AUTO-OPTIMIZE: {last_hits} Rate-Limits im letzten Lauf. Delays werden erhoeht (Faktor {factor}).")
-
-        CONFIG['batch_sleep_min_s'], CONFIG['batch_sleep_max_s'], CONFIG['info_fetch_delay_s'] = min_s, max_s, info_s
-
-    except Exception:
-        pass # Fails silently
+    app_support_core.auto_adjust_delays(CONFIG, load_json_config, save_json_config, logger)
 
 # --- MAIN EXECUTION ---
 def _setup_run_environment() -> None:
     """Initialisiert FX-Kurse und passt Delays an."""
     logger.info("\n--- GLOBAL RSL V68 (Dashboard Plus) ---")
 def _initialize_run_settings(data_mgr: MarketDataManager) -> None:
-    """Initialisiert die Umgebung, FX-Kurse und passt Delays an."""
-    logger.info("\n--- INITIALISIERUNG ANALYSE-LAUF ---")
-    _auto_adjust_delays()
-    update_live_currency_rates()
-    
-    # Optionaler Check auf Cache-Alter
-    if os.path.exists(CONFIG['history_cache_file']):
-        try:
-            age = _cache_age_hours(CONFIG['history_cache_file'])
-            if age is not None and age < CONFIG['cache_duration_hours']:
-                logger.info(f"Kursdaten-Cache ist aktuell ({age:.1f}h alt).")
-        except Exception:
-            pass
+    app_support_core.initialize_run_settings(
+        data_mgr=data_mgr,
+        config=CONFIG,
+        logger=logger,
+        load_json_config=load_json_config,
+        save_json_config=save_json_config,
+        currency_rates=CURRENCY_RATES,
+    )
 
 def show_main_menu(has_snapshot: bool) -> str:
     """Zeigt das Hauptmenü an und gibt die Auswahl des Benutzers zurück."""
-    print(f"\n\033[96m\033[1m{'-'*20} HAUPTMENUE {'-'*20}\033[0m")
-    if has_snapshot:
-        print("\033[94m [1]\033[0m \U0001F4C4 Letzten Datenstand neu anzeigen (Snapshot)")
-    else:
-        print(" [1] \033[90mLetzten Datenstand neu anzeigen (nicht verfuegbar)\033[0m")
-    print("\033[92m [2]\033[0m \U0001F504 Neuen Lauf starten (Download & Analyse)")
-    print("\033[93m [3]\033[0m \u2699\ufe0f  Einstellungen / Strategie-Anpassung")
-    print("\033[95m [4]\033[0m \U0001F4C8 Historische Kursdaten anzeigen")
-    print("\033[91m [0]\033[0m \u2716  Beenden")
-    return input("Auswahl [2]: ").strip()
+    return app_support_core.show_main_menu(has_snapshot)
 
 def _prepare_ticker_universe(selected_syms: List[str], etf_options: Dict[str, Any]) -> pd.DataFrame:
     """Lädt, integriert und bereinigt das Ticker-Universum."""
-    master_df, _ = load_selected_etf_universe(
+    return app_support_core.prepare_ticker_universe(
         selected_syms=selected_syms,
         etf_options=etf_options,
         config=CONFIG,
         logger=logger,
+        make_progress_fn=make_progress,
         download_ishares_csv=download_ishares_csv,
-        normalize_sector_name=normalize_sector_name,
-        print_fn=print,
-        progress_fn=make_progress
     )
-    
-    df = master_df
-    if CONFIG.get('exchange_scan_enabled', True):
-        exchange_df = data_pipeline_core.load_exchange_universe(CONFIG, logger, normalize_sector_name)
-        if not exchange_df.empty:
-            df = pd.concat([df, exchange_df], ignore_index=True)
-
-    # Namen- und Land-Enrichment
-    for cache_key, file_key in [('etf_names_cache_file', 'Name'), ('country_cache_file', 'Land')]:
-        cache_path = CONFIG.get(cache_key)
-        if cache_path and os.path.exists(cache_path):
-            c_data = load_json_config(cache_path)
-            if isinstance(c_data, dict):
-                lookup = {str(k).upper(): v for k, v in c_data.items()}
-                df[file_key] = df.apply(lambda r: lookup.get(str(r['Ticker']).upper(), r[file_key]), axis=1)
-
-    return df
 
 def run_analysis_pipeline(
     data_mgr: MarketDataManager, 
     portfolio_mgr: PortfolioManager, 
     first_seen_mgr: FirstSeenManager,
-    mapper: TickerMapper
+    mapper: TickerMapper,
+    filter_tokens: Optional[Set[str]] = None,
+    force_clear_cache: bool = False
 ) -> None:
     """Zentrale Pipeline für den vollständigen Analyse-Workflow (Refactored)."""
     load_dotenv()
     _setup_run_environment()
+
+    # Cache-Steuerung: Muss VOR der Initialisierung passieren, damit die Logs stimmen
+    if force_clear_cache:
+        data_mgr.clear_cache()
+        logger.info("Kursdaten-Cache (History) wurde geleert.")
+
     _initialize_run_settings(data_mgr)
 
     # --- 1. SETUP & SELECTION ---
@@ -2262,32 +1773,6 @@ def run_analysis_pipeline(
             else:
                 use_last_settings = False
     if not use_last_settings:
-        # History Cache Prompt
-        if os.path.exists(CONFIG['history_cache_file']):
-            try:
-                with open(CONFIG['history_cache_file'], 'r', encoding='utf-8') as f:
-                    cache_data = json.load(f)
-                timestamp = cache_data.get('timestamp', 0)
-                age_hours = (time.time() - timestamp) / 3600
-                if age_hours < CONFIG['cache_duration_hours']:
-                    print(f"\nINFO: Der Kursdaten-Cache ist nur {age_hours:.1f} Stunden alt und gilt noch als aktuell.")
-                    if get_user_input("--> Sollen die Kurse trotzdem komplett neu geladen werden (dauert laenger)? (j/n) [n]: ", "n") == 'j':
-                        data_mgr.clear_cache()
-            except Exception: pass
-       
-        # ETF Cache Prompt (NEU)
-        if os.path.exists(CONFIG['etf_cache_file']):
-            try:
-                cache_time = os.path.getmtime(CONFIG['etf_cache_file'])
-                age_hours = (time.time() - cache_time) / 3600
-                print(f"ETF Cache ist {age_hours:.1f} Stunden alt.")
-                if get_user_input("ETF Cache loeschen und neu laden? (j/n) [n]: ", "n") == 'j':
-                    try:
-                        os.remove(CONFIG['etf_cache_file'])
-                        print("ETF Cache geloescht.")
-                    except Exception as e:
-                        logger.error(f"Fehler beim Loeschen des ETF Cache: {e}")
-            except Exception: pass
         selected_syms, etf_options = select_etf_interactive()
 
     print_run_status_header(
@@ -2299,59 +1784,71 @@ def run_analysis_pipeline(
     # PERFORMANCE START
     perf_start_time = time.time()
     # --- 2. UNIVERSE PREPARATION ---
+    audit_trail = {} # Ticker -> {'status': str, 'detail': str, 'yahoo': str}
+
     df = _prepare_ticker_universe(selected_syms, etf_options)
     if df.empty:
         logger.error("Ticker-Universum konnte nicht vorbereitet werden.")
         return
 
-    # --- TICKER / ISIN FILTER (USER REQUEST) ---
-    print("\n" + "-" * 50)
-    print(" AD-HOC FILTER / TEST-MODUS")
-    print(" (Ticker/ISINs kopieren oder eingeben. ENTER auf leerer Zeile zum Starten.)")
-    
-    collected_lines = []
-    while True:
-        line = input(" > ").strip()
-        if not line:
-            break
-        collected_lines.append(line)
-    
-    filter_input = " ".join(collected_lines)
-    if filter_input:
-        filter_tokens = {t.strip().upper() for t in filter_input.replace(",", " ").split() if t.strip()}
-        if filter_tokens:
-            # Suche in Ticker und ISIN Spalten
-            mask = df['Ticker'].str.upper().str.strip().isin(filter_tokens)
-            if 'ISIN' in df.columns:
-                mask |= df['ISIN'].str.upper().str.strip().isin(filter_tokens).fillna(False)
-            
-            df_filtered = df[mask].copy()
-            
-            # Checke auf Ticker, die nicht in den Quellen waren (Yahoo-Direkt-Eingabe)
-            found_tokens = set(df_filtered['Ticker'].str.upper().str.strip())
-            if 'ISIN' in df.columns:
-                found_tokens.update(df_filtered['ISIN'].str.upper().str.strip().dropna())
-            
-            missing_tokens = filter_tokens - found_tokens
-            if missing_tokens:
-                ad_hoc_rows = []
-                for token in missing_tokens:
-                    if re.match(r'^[A-Z]{2}[A-Z0-9]{9}\d$', token):
-                        logger.warning(f"ISIN '{token}' nicht im Universum gefunden. Ueberspringe.")
-                        continue
-                    ad_hoc_rows.append({
-                        'Ticker': token, 'Name': f"Ad-hoc: {token}", 'ISIN': '',
-                        'Sector': 'Unknown', 'Industry': 'Unknown', 'Land': 'Unknown',
-                        'Market Value': 0.0, 'Source_ETF': 'MANUAL', 'Listing_Source': 'MANUAL'
-                    })
-                if ad_hoc_rows:
-                    df_filtered = pd.concat([df_filtered, pd.DataFrame(ad_hoc_rows)], ignore_index=True)
-            
-            if not df_filtered.empty:
-                df = df_filtered
-                logger.info(f"Filter aktiv: Download auf {len(df)} Ticker beschraenkt.")
-            else:
-                logger.warning("Filter ergab keine Treffer. Nutze komplettes Universum.")
+    # --- 3. FILTERING (Applied if called from Ad-hoc menu) ---
+    for t in df['Ticker'].unique():
+        audit_trail[t] = {'status': 'PENDING', 'detail': '', 'yahoo': ''}
+
+    # 1. Globalen ISIN-Lookup bauen (VOR der Filterung fuer Ad-hoc)
+    ticker_to_isin_cache = {}
+    name_to_isin_cache = {}
+    global_isin_map = {}
+    for t_sym, t_info in data_mgr.info_cache.items():
+        isin = t_info.get('isin')
+        if isin and len(isin) > 5 and isin not in ("NAN", "NONE"):
+            ticker_to_isin_cache[t_sym.upper()] = isin
+            n_key = normalize_name_for_dedup(t_info.get('longName', ''))
+            if n_key: name_to_isin_cache[n_key] = isin
+            mkt_cap = float(t_info.get('marketCap', 0) or 0)
+            if isin not in global_isin_map or mkt_cap > float(global_isin_map[isin].get('marketCap', 0) or 0):
+                global_isin_map[isin] = t_info
+
+    if filter_tokens:
+        mask = df['Ticker'].str.upper().str.strip().isin(filter_tokens)
+        if 'ISIN' in df.columns:
+            mask |= df['ISIN'].str.upper().str.strip().isin(filter_tokens).fillna(False)
+        
+        df_filtered = df[mask].copy()
+        found_tokens = set(df_filtered['Ticker'].str.upper().str.strip())
+        if 'ISIN' in df.columns:
+            found_tokens.update(df_filtered['ISIN'].str.upper().str.strip().dropna())
+        
+        missing_tokens = filter_tokens - found_tokens
+        if missing_tokens:
+            ad_hoc_rows = []
+            for token in missing_tokens:
+                is_isin = bool(re.match(r'^[A-Z]{2}[A-Z0-9]{9}\d$', str(token)))
+                ticker_to_use = token if not is_isin else ""
+                
+                # Falls ISIN, versuche sie via Yahoo Search in einen Ticker aufzuloesen
+                if is_isin:
+                    try:
+                        search_res = yf.Search(token, max_results=1).tickers
+                        if search_res:
+                            ticker_to_use = search_res[0].get('symbol', "")
+                    except Exception: pass
+
+                ad_hoc_rows.append({
+                    'Ticker': ticker_to_use,
+                    'Name': f"Ad-hoc: {token}", 
+                    'ISIN': token if is_isin else ticker_to_isin_cache.get(token.upper(), ""),
+                    'Sector': 'Unknown', 'Industry': 'Unknown', 'Land': 'Unknown',
+                    'Market Value': 0.0, 'Source_ETF': 'MANUAL', 'Listing_Source': 'MANUAL'
+                })
+            if ad_hoc_rows:
+                df_filtered = pd.concat([df_filtered, pd.DataFrame(ad_hoc_rows)], ignore_index=True)
+        
+        if not df_filtered.empty:
+            df = df_filtered
+            logger.info(f"Ad-hoc Filter aktiv: Analyse beschraenkt auf {len(df)} Ticker.")
+        else:
+            logger.warning("Ad-hoc Filter ergab keine Treffer im Universum.")
 
     final_rows = len(df)
 
@@ -2363,12 +1860,15 @@ def run_analysis_pipeline(
     # --- 3. DATA COLLECTION & PROCESSING ---
     batch_queue = []
     complex_queue = []
+    unresolved_origs = []
+    sector_skips = {} # orig -> sector
+    
     dropped_critical = []
-   
-    logger.info("Verarbeite Ticker...")
+
     for _, row in df.iterrows():
         orig = row['Ticker']
         land = row.get('Land', 'Unknown')
+        audit_trail[orig] = {'status': 'PENDING', 'detail': '', 'yahoo': ''}
         orig_clean = sanitize_ticker_symbol(orig)
         preferred_history_sym = history_symbol_overrides.get(str(orig_clean).strip().upper(), "")
         u_key = f"{orig}_{land}"
@@ -2380,6 +1880,7 @@ def run_analysis_pipeline(
             if is_plausible_ticker(fixed_sym):
                 batch_queue.append((u_key, orig, fixed_sym, row))
             else:
+                unresolved_origs.append(orig)
                 complex_queue.append((u_key, orig, row))
             continue
         cached_sym = mapper.get(u_key)
@@ -2400,36 +1901,22 @@ def run_analysis_pipeline(
             if cands:
                 batch_queue.append((u_key, orig, cands[0], row))
             else:
+                unresolved_origs.append(orig)
                 complex_queue.append((u_key, orig, row))
     stock_results: List[StockData] = []
-    # --- INDUSTRY INFO PRE-FETCH ---
-    # Wir laden nur, was wirklich fehlt (weder im Info-Cache noch bereits im DF vorhanden)
+    # --- INTELLIGENTE INDUSTRY INFO PRÜFUNG ---
+    # Identifiziere Ticker, die weder im Info-Cache noch im iShares-DF Sektor-Daten haben
     missing_info_syms = []
-    seen_syms = set()
-    for _, _, y_sym, row in batch_queue:
-        if y_sym in seen_syms or y_sym in data_mgr.info_cache:
-            continue
-        seen_syms.add(y_sym)
-        
-        # Hat die Zeile bereits valide Industry-Infos (durch Vererbung von iShares)?
-        sector_val = str(row.get('Sector', 'Unknown'))
-        industry_val = str(row.get('Industry', 'Unknown'))
-        
-        if sector_val not in ('Unknown', 'ETF', 'nan', '') and industry_val not in ('Unknown', 'nan', ''):
-            # Info ist da! In Cache schreiben, damit yfinance uebersprungen wird
-            data_mgr.info_cache[y_sym] = {
-                'sector': sector_val,
-                'industry': industry_val,
-                'longName': row.get('Name', ''),
-                'country': row.get('Land', ''),
-                'cached_at': datetime.datetime.now().isoformat(timespec='seconds')
-            }
-            continue
-            
-        missing_info_syms.append(y_sym)
-    
+    for item in batch_queue:
+        y_sym = item[2]
+        if y_sym not in data_mgr.info_cache:
+            missing_info_syms.append(y_sym)
+    missing_info_syms = sorted(list(set(missing_info_syms)))
+
     if missing_info_syms:
         logger.info(f"Lade Industry-Informationen fuer {len(missing_info_syms)} Ticker nach (einmalig)...")
+        if len(missing_info_syms) < 5:
+            time.sleep(2) # Kurze Atempause fuer die API
         # Drosselung auf max 2 Worker für Info-Fetch, um Yahoo Rate-Limits zu umgehen
         with make_progress(total=len(missing_info_syms), desc="Industry Info") as pbar, \
              concurrent.futures.ThreadPoolExecutor(max_workers=min(2, CONFIG['max_workers'])) as executor:
@@ -2464,6 +1951,8 @@ def run_analysis_pipeline(
                 for y_sym, (curr, sma, vol_eur, flags) in data_map.items():
                     if y_sym in batch_map:
                         for u_key, orig, _, row in batch_map[y_sym]:
+                            # WICHTIG: Yahoo-Ticker im Audit vermerken
+                            audit_trail[orig]['yahoo'] = y_sym
                             # Simpler Weg: Wenn Info nicht im Cache, nutzen wir Standardwerte
                             info = data_mgr.get_cached_info(y_sym) or {}
                             sector_final = info.get('sector', row.get('Sector', 'Unknown'))
@@ -2471,6 +1960,7 @@ def run_analysis_pipeline(
 
                             # Filter: Nur echte Aktien zulassen (Skip ETFs, Bonds, Funds etc. laut Yahoo)
                             if sector_final in ('ETF', 'MUTUALFUND', 'BOND', 'INDEX', 'CURRENCY', 'FUTURE', 'OPTION'):
+                                sector_skips[orig] = sector_final
                                 pbar.update(1)
                                 continue
 
@@ -2483,6 +1973,17 @@ def run_analysis_pipeline(
                             isin_final = str(row.get('ISIN', '')).strip() if pd.notna(row.get('ISIN', '')) else ''
                             if (not isin_final or isin_final.lower() in ('nan', 'none')) and info.get('isin'):
                                 isin_final = str(info['isin']).strip()
+
+                            if (not isin_final or isin_final.lower() in ('nan', 'none')) and y_sym in ticker_to_isin_cache:
+                                isin_final = ticker_to_isin_cache[y_sym]
+
+                            # Namens-Fallback falls Yahoo für diesen Ticker gar keine ISIN liefert
+                            if not isin_final or isin_final.lower() in ('nan', 'none'):
+                                isin_final = name_to_isin_cache.get(normalize_name_for_dedup(row.get('Name', '')), '')
+
+                            # PROPAGATION FALLBACK: Falls dieser Ticker keine Market Cap hat, nutze Primär-Daten der ISIN
+                            if _resolve_market_cap_from_info(info) <= 0 and isin_final in global_isin_map:
+                                info = global_isin_map[isin_final]
 
                             market_cap_final = _resolve_market_cap_from_info(info)
                             market_value_final = _resolve_market_value_from_sources(row, info, y_sym)
@@ -2534,6 +2035,8 @@ def run_analysis_pipeline(
                                 mom_vol=flags.get('mom_vol'),
                                 mom_score_adj=flags.get('mom_score_adj'),
                                 mom_accel=flags.get('mom_accel'),
+                                max_drawdown_6m=flags.get('max_drawdown_6m', 0.0),
+                                ulcer_index_6m=flags.get('ulcer_index_6m', 0.0),
                                 high_52w=flags.get('high_52w', 0.0),
                                 distance_52w_high_pct=flags.get('distance_52w_high_pct'),
                                 stale_days=flags.get('stale_days', 0),
@@ -2565,6 +2068,11 @@ def run_analysis_pipeline(
                 if max_sleep < min_sleep: max_sleep = min_sleep
                 if data_mgr.last_history_batch_used_network and max_sleep > 0:
                     time.sleep(random.uniform(min_sleep, max_sleep))
+                    
+    # WICHTIG: Cache speichern, damit Option 1 beim nächsten Mal schnell ist!
+    if data_mgr:
+        data_mgr.save_history_cache()
+
     def process_fallback(item):
         u_key, orig, row = item
         orig_clean = sanitize_ticker_symbol(orig)
@@ -2610,6 +2118,7 @@ def run_analysis_pipeline(
                     if res:
                         u_key, orig, y_sym, row, (curr, sma, vol_eur, flags) = res
                        
+                        audit_trail[orig]['yahoo'] = y_sym
                         if flags['flag_stale'] == "CRITICAL":
                             dropped_critical.append(f"{y_sym} ({orig}): {flags.get('stale_reason', 'Critical Stale')}")
                         # Simpler Weg: Wenn Info nicht im Cache, nutzen wir Standardwerte aus der Liste
@@ -2620,6 +2129,7 @@ def run_analysis_pipeline(
 
                         # Filter: Nur echte Aktien zulassen (Skip ETFs, Bonds, Funds etc. laut Yahoo)
                         if sector_final in ('ETF', 'MUTUALFUND', 'BOND', 'INDEX', 'CURRENCY', 'FUTURE', 'OPTION'):
+                            sector_skips[orig] = sector_final
                             pbar.update(1)
                             continue
 
@@ -2629,9 +2139,22 @@ def run_analysis_pipeline(
                         if not land_final or land_final.lower() in ('unknown', 'nan', 'none', ''):
                             land_final = info.get('country', '')
                         
+                        audit_trail[orig]['yahoo'] = y_sym
+
                         isin_final = str(row.get('ISIN', '')).strip() if pd.notna(row.get('ISIN', '')) else ''
                         if (not isin_final or isin_final.lower() in ('nan', 'none')) and info.get('isin'):
                             isin_final = str(info['isin']).strip()
+
+                        if (not isin_final or isin_final.lower() in ('nan', 'none')) and y_sym in ticker_to_isin_cache:
+                            isin_final = ticker_to_isin_cache[y_sym]
+
+                        # Namens-Fallback auch im Fallback-Prozessor
+                        if not isin_final or isin_final.lower() in ('nan', 'none'):
+                            isin_final = name_to_isin_cache.get(normalize_name_for_dedup(row.get('Name', '')), '')
+
+                        # PROPAGATION FALLBACK: Falls dieser Ticker keine Market Cap hat, nutze Primär-Daten der ISIN
+                        if _resolve_market_cap_from_info(info) <= 0 and isin_final in global_isin_map:
+                            info = global_isin_map[isin_final]
 
                         market_cap_final = _resolve_market_cap_from_info(info)
                         market_value_final = _resolve_market_value_from_sources(row, info, y_sym)
@@ -2682,6 +2205,8 @@ def run_analysis_pipeline(
                             mom_vol=flags.get('mom_vol'),
                             mom_score_adj=flags.get('mom_score_adj'),
                             mom_accel=flags.get('mom_accel'),
+                            max_drawdown_6m=flags.get('max_drawdown_6m', 0.0),
+                            ulcer_index_6m=flags.get('ulcer_index_6m', 0.0),
                             high_52w=flags.get('high_52w', 0.0),
                             distance_52w_high_pct=flags.get('distance_52w_high_pct'),
                             stale_days=flags.get('stale_days', 0),
@@ -2700,30 +2225,30 @@ def run_analysis_pipeline(
                         ))
                         mapper.set(u_key, y_sym)
                     pbar.update(1)
-    stock_results, integrity_issues_df = filter_stock_results_for_rsl_integrity(stock_results)
+    stock_results, integrity_drops_df = filter_stock_results_for_rsl_integrity(stock_results)
     save_dataframe_safely(
-        integrity_issues_df,
+        integrity_drops_df,
         CONFIG['rsl_integrity_drop_file'],
         sep=';',
         index=False,
         encoding='utf-8-sig',
     )
-    if not integrity_issues_df.empty:
-        actual_drops = integrity_issues_df[integrity_issues_df["excluded_from_ranking"] == True]
-        for _, row in integrity_issues_df.iterrows():
+    if not integrity_drops_df.empty:
+        actual_drops = integrity_drops_df[integrity_drops_df["excluded_from_ranking"] == True]
+        for _, row in integrity_drops_df.iterrows():
             if row.get("excluded_from_ranking"):
                 dropped_critical.append(
                     f"{row.get('yahoo_symbol', '')} ({row.get('original_ticker', '')}): RSL-Integritaet -> {row.get('integrity_reasons', '')}"
                 )
         
-        integrity_summary = quality_core.summarize_integrity_flags(integrity_issues_df)
+        integrity_summary = quality_core.summarize_integrity_flags(integrity_drops_df)
         print(f"\nIntegritaets-Check Ergebnis: {quality_core.quality_gate_status(integrity_summary)}")
         
-        if "is_valid" in integrity_issues_df.columns:
+        if "is_valid" in integrity_drops_df.columns:
             print(f" - Hard fails: {integrity_summary['hard_fail_count']}")
-        if "needs_review" in integrity_issues_df.columns:
+        if "needs_review" in integrity_drops_df.columns:
             print(f" - Needs review: {integrity_summary['review_count']}")
-        if "warning_reasons" in integrity_issues_df.columns:
+        if "warning_reasons" in integrity_drops_df.columns:
             print(f" - Warnings: {integrity_summary['warning_count']}")
 
         if len(actual_drops) > 0:
@@ -2746,15 +2271,20 @@ def run_analysis_pipeline(
     # Alle Aktien werden verarbeitet, die Berechnung oder Datenbasis muss bei Bedarf manuell geprüft werden.
     logger.info(f"Verarbeite {len(stock_results)} Aktien. Preis-Filter ist deaktiviert.")
 
+    processed_at_start = {s.yahoo_symbol for s in stock_results}
+
     before_dedupe_count = len(stock_results)
     stock_results = data_pipeline_core.perform_final_deduplication(stock_results)
+    after_dedupe_set = {s.yahoo_symbol for s in stock_results}
 
     # NEU: Zusaetzliche Liquiditaets-Deduplikation (Entfernt Sekundaer-Listings)
     apply_primary_liquidity_context(stock_results)
+    symbol_lookup = {str(s.yahoo_symbol).strip().upper(): s for s in stock_results if str(s.yahoo_symbol).strip()}
     before_liq_dedupe = len(stock_results)
-    stock_results = [s for s in stock_results if s.yahoo_symbol == s.primary_liquidity_symbol]
-    if len(stock_results) < before_liq_dedupe:
-        logger.info(f"Liquiditaets-Bereinigung: {before_liq_dedupe - len(stock_results)} Duplikate/Neben-Listings entfernt.")
+    # Wir deaktivieren das Löschen von Neben-Listings, um die Vollständigkeit zu wahren.
+    # Das System priorisiert das Haupt-Listing weiterhin automatisch in den Metriken.
+    pre_liq_set = {s.yahoo_symbol for s in stock_results}
+    final_analyzed_set = pre_liq_set
 
     # --- FILTERUNG & KONSOLIDIERUNG VOR RANKING ---
     # Blacklist anwenden, damit sie nicht in die Ränge und den Snapshot einfließt
@@ -2764,11 +2294,53 @@ def run_analysis_pipeline(
         if len(stock_results) < pre_black_count:
             logger.info(f"Blacklist-Filter: {pre_black_count - len(stock_results)} Aktien entfernt.")
 
+    # --- UNIVERSE AUDIT DATAFRAME BAUEN ---
+    rsl_drops_map = {str(row['ticker']).strip().upper(): row['drop_reasons'] for _, row in integrity_drops_df.iterrows()} if not integrity_drops_df.empty else {}
+    
+    audit_rows = []
+    for orig, trail in audit_trail.items():
+        y = trail['yahoo']
+        y_upper = str(y).strip().upper()
+        status = "ANALYZED"
+        detail = "Erfolgreich verarbeitet"
+        
+        if orig in sector_skips:
+            status, detail = "SKIPPED_SECTOR", f"Typ: {sector_skips[orig]}"
+        elif not y_upper:
+            status, detail = "SKIPPED_UNRESOLVED", "Kein Yahoo-Ticker gefunden"
+        elif y_upper in rsl_drops_map:
+            status, detail = "DROPPED_DATA_QUALITY", str(rsl_drops_map[y_upper])
+        elif y_upper in processed_at_start and y_upper not in after_dedupe_set:
+            status, detail = "DROPPED_DEDUP", "Duplikat (Name/ISIN)"
+        # Neuer Status für analysierte Neben-Listings (bleiben im main sheet sichtbar)
+        elif y_upper in symbol_lookup:
+             s_obj = symbol_lookup[y_upper]
+             primary_symbol = str(getattr(s_obj, 'primary_liquidity_symbol', '')).strip().upper()
+             if primary_symbol and y_upper != primary_symbol:
+                 status = "ANALYZED_SECONDARY"
+                 detail = f"Neben-Listing. Primär: {s_obj.primary_liquidity_symbol}"
+        elif y_upper not in final_analyzed_set:
+            status, detail = "DROPPED_OTHER", "Gefiltert (Blacklist/Sonstiges)"
+            
+        audit_rows.append({'Original Ticker': orig, 'Yahoo Ticker': y, 'Status': status, 'Details': detail})
+    universe_audit_df = pd.DataFrame(audit_rows).sort_values(by=['Status', 'Original Ticker'])
+
     # Portfolio-Status abgleichen (wichtig für Markierungen in den Summaries)
     synchronize_portfolio_symbols_with_stock_results(portfolio_mgr, stock_results)
 
     # --- RANGFOLGEN BERECHNEN ---
     ranking_core.apply_standard_rankings(stock_results)
+
+    # --- SCHWELLEN-MARKIERUNG FÜR EXCEL ---
+    try:
+        threshold = float(CONFIG.get("candidate_top_percent_threshold", 0.01))
+        threshold_rank = max(1, int(math.ceil(len(stock_results) * threshold)))
+        for s in stock_results:
+            if getattr(s, 'rsl_rang', 0) == threshold_rank:
+                s.is_threshold_line = True
+                break
+    except Exception as e:
+        logger.debug(f"Markierung der Schwelle fehlgeschlagen: {e}")
 
     # --- ANALYSE & SUMMARIES ---
     ranking_core.apply_relative_context_metrics(stock_results)
@@ -2780,7 +2352,13 @@ def run_analysis_pipeline(
             sym = str(getattr(s, "yahoo_symbol", "")).strip().upper()
             s.mom_cluster = cluster_map.get(sym, "")
     
-    save_analysis_snapshot(stock_results, selected_syms, etf_options, integrity_drops_df=integrity_issues_df)
+    save_analysis_snapshot(
+        stock_results, 
+        selected_syms, 
+        etf_options, 
+        integrity_drops_df=integrity_drops_df,
+        universe_audit_df=universe_audit_df
+    )
     logger.info("Snapshot vor Quality-Gate gesichert.")
 
     portfolio_symbols = [str(p.get('Yahoo_Symbol', '')).strip().upper() for p in portfolio_mgr.current_portfolio if p.get('Yahoo_Symbol')]
@@ -2853,11 +2431,12 @@ def run_analysis_pipeline(
         etf_options=etf_options,
         update_last_run_cfg=not use_last_settings,
         data_mgr=data_mgr,
-        suggest_portfolio_candidates=suggest_portfolio_candidates,
+        suggest_portfolio_candidates=candidate_core.suggest_portfolio_candidates,
         industry_summary_df=industry_summary_df,
         cluster_summary_df=cluster_summary_df,
         market_regime=market_regime,
-        integrity_drops_df=integrity_issues_df,
+        integrity_drops_df=integrity_drops_df,
+        universe_audit_df=universe_audit_df,
         watchlist_symbols=watchlist_symbols
     )
 
@@ -2882,8 +2461,13 @@ def main() -> None:
                 logger.info("Programm beendet.")
                 break
             elif choice in ("", "2"):
+                print("\n\033[94m--- ANALYSE-START ---\033[0m")
+                print(" [1] Schnell-Start (Nutzt Cache von heute)")
+                print(" [2] Voll-Download (Leert Kurs-Cache, holt Historie frisch)")
+                sub_choice = get_user_input("Wahl [1]: ", "1")
+                
                 with ConsoleCapture(capture_file):
-                    run_analysis_pipeline(data_mgr, portfolio_mgr, first_seen_mgr, mapper)
+                    run_analysis_pipeline(data_mgr, portfolio_mgr, first_seen_mgr, mapper, force_clear_cache=(sub_choice=="2"))
             elif choice == "1" and has_snapshot:
                 with ConsoleCapture(capture_file):
                     if not rerender_last_analysis():
@@ -2892,6 +2476,49 @@ def main() -> None:
                 configure_user_settings_interactive()
             elif choice == "4":
                 show_ticker_history_interactive()
+            elif choice == "5":
+                with ConsoleCapture(capture_file):
+                    run_fundamental_data_download(data_mgr)
+            elif choice == "6":
+                print("\n" + "-" * 50)
+                print(" AD-HOC ANALYSE (TEST-MODUS)")
+                print(" (Ticker/ISINs kopieren oder eingeben. ENTER auf leerer Zeile zum Starten.)")
+                
+                collected_lines = []
+                while True:
+                    line = input(" > ").strip()
+                    if not line:
+                        break
+                    collected_lines.append(line)
+                
+                filter_input = " ".join(collected_lines)
+                tokens = {t.strip().upper() for t in filter_input.replace(",", " ").split() if t.strip()}
+                if tokens:
+                    with ConsoleCapture(capture_file):
+                        run_analysis_pipeline(data_mgr, portfolio_mgr, first_seen_mgr, mapper, filter_tokens=tokens)
+            elif choice == "7":
+                print("\n\033[96m" + "="*70)
+                print(" HILFE: DATEN-INTEGRITAET & FEHLERMELDUNGEN")
+                print("="*70 + "\033[0m")
+                print("\033[1mHaeufige Fehler-Codes im Sheet 'integrity_issues':\033[0m\n")
+                print("\033[93mtechnical_scale_break_suspected\033[0m")
+                print(" -> Preis-Sprung um Faktor 15+. Oft Einheiten-Fehler (z.B. Pence vs Pfund).")
+                print("\033[93mstale_price_series / flat_run\033[0m")
+                print(" -> Kurs hat sich tagelang nicht bewegt. Keine Liquiditaet am Marktplatz.")
+                print("\033[93minsufficient_trading_participation\033[0m")
+                print(" -> Aktie wurde an zu wenigen Tagen tatsaechlich gehandelt.")
+                print("\033[93mbad_dividend_adjustment\033[0m")
+                print(" -> Yahoo hat Dividende falsch eingerechnet. System nutzt Close-Fallback.")
+                print("\033[93mprice_jump_without_volume_confirmation\033[0m")
+                print(" -> Großer Sprung ohne Handelsvolumen. Wahrscheinlich ein 'Bad Tick'.")
+                print("\033[93minsufficient_history_for_rsl\033[0m")
+                print(" -> Weniger als 130 Tage Historie vorhanden (SMA Berechnung unmoeglich).")
+                print("\n\033[1mStatus-Bedeutung:\033[0m")
+                print(" - \033[92meligible_original\033[0m:  Daten perfekt.")
+                print(" - \033[93meligible_repaired\033[0m:  Datenfehler wurden automatisch korrigiert.")
+                print(" - \033[91mexcluded_hard_fail\033[0m: Aktie unbrauchbar, aus Analyse entfernt.")
+                print("\n\033[90mDetaillierte Beschreibungen findest du in: docs/indikatoren.md\033[0m")
+                input("\n[ENTER] Zurueck zum Menue...")
             else:
                 print("Ungueltige Auswahl.")
         except KeyboardInterrupt:
