@@ -207,7 +207,33 @@ def load_financedatabase_equities(
         return pd.DataFrame()
 
 
-def build_financedatabase_universe(
+def _collect_rejection_reasons(
+    row: pd.Series,
+    require_isin: bool,
+    require_metadata: bool,
+    allow_otc: bool,
+) -> str:
+    reasons: List[str] = []
+    if not bool(row.get("_is_supported_symbol")):
+        reasons.append("unsupported_symbol")
+    if bool(row.get("_known_by_ticker")):
+        reasons.append("known_by_ticker")
+    if bool(row.get("_known_by_ticker_norm")):
+        reasons.append("known_by_normalized_ticker")
+    if bool(row.get("_known_by_isin")):
+        reasons.append("known_by_isin")
+    if bool(row.get("_known_by_name")):
+        reasons.append("known_by_name")
+    if require_isin and not bool(row.get("_has_isin")):
+        reasons.append("missing_isin")
+    if require_metadata and not bool(row.get("_has_metadata")):
+        reasons.append("missing_metadata")
+    if not allow_otc and bool(row.get("_is_otc")):
+        reasons.append("otc_or_unsupported_market")
+    return ";".join(reasons) if reasons else ""
+
+
+def audit_financedatabase_universe(
     existing_df: pd.DataFrame,
     config: Dict[str, Any],
     logger_obj: Any,
@@ -216,9 +242,17 @@ def build_financedatabase_universe(
     unsupported_exchanges: List[str],
     normalize_sector_name: Optional[Any] = None,
     fd_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
+) -> Dict[str, Any]:
     if not bool(config.get("financedatabase_enabled", True)):
-        return pd.DataFrame()
+        return {
+            "base_universe_size": len(existing_df) if existing_df is not None else 0,
+            "fd_raw_size": 0,
+            "accepted_size": 0,
+            "after_universe_size": len(existing_df) if existing_df is not None else 0,
+            "accepted_df": pd.DataFrame(),
+            "rejected_df": pd.DataFrame(),
+            "audit_df": pd.DataFrame(),
+        }
 
     work = (
         _standardize_fd_frame(fd_df, normalize_sector_name=normalize_sector_name)
@@ -226,7 +260,16 @@ def build_financedatabase_universe(
         else load_financedatabase_equities(config, logger_obj, normalize_sector_name=normalize_sector_name)
     )
     if work.empty:
-        return pd.DataFrame()
+        base_size = len(existing_df) if existing_df is not None else 0
+        return {
+            "base_universe_size": base_size,
+            "fd_raw_size": 0,
+            "accepted_size": 0,
+            "after_universe_size": base_size,
+            "accepted_df": pd.DataFrame(),
+            "rejected_df": pd.DataFrame(),
+            "audit_df": pd.DataFrame(),
+        }
 
     existing_sets = _build_existing_identity_sets(existing_df)
     require_isin = bool(config.get("financedatabase_require_isin", True))
@@ -271,6 +314,15 @@ def build_financedatabase_universe(
         | work["_known_by_isin"]
         | work["_known_by_name"]
     )
+    work["_reject_reasons"] = work.apply(
+        lambda row: _collect_rejection_reasons(
+            row,
+            require_isin=require_isin,
+            require_metadata=require_metadata,
+            allow_otc=allow_otc,
+        ),
+        axis=1,
+    )
 
     keep_mask = work["_is_supported_symbol"] & ~work["_is_known"]
     if require_isin:
@@ -281,9 +333,26 @@ def build_financedatabase_universe(
         keep_mask &= ~work["_is_otc"]
 
     filtered = work[keep_mask].copy()
+    prefiltered_rejected = work[~keep_mask].copy()
+
     if filtered.empty:
         logger_obj.info("FinanceDatabase: Keine neuen, kompatiblen Kandidaten nach defensiver Filterung.")
-        return pd.DataFrame()
+        rejected_df = prefiltered_rejected.copy()
+        if not rejected_df.empty:
+            rejected_df["rejection_stage"] = "initial_filter"
+            rejected_df["rejection_reasons"] = rejected_df["_reject_reasons"].where(
+                rejected_df["_reject_reasons"].astype(str).str.len().gt(0),
+                "filtered_out",
+            )
+        return {
+            "base_universe_size": len(existing_df) if existing_df is not None else 0,
+            "fd_raw_size": len(work),
+            "accepted_size": 0,
+            "after_universe_size": len(existing_df) if existing_df is not None else 0,
+            "accepted_df": pd.DataFrame(),
+            "rejected_df": _build_rejected_view(rejected_df),
+            "audit_df": _build_audit_view(work),
+        }
 
     filtered["_fd_score"] = (
         filtered["_has_isin"].astype(int) * 100
@@ -302,13 +371,32 @@ def build_financedatabase_universe(
         ),
         axis=1,
     )
-    filtered = filtered.sort_values(
+    ranked = filtered.sort_values(
         by=["_fd_score", "_is_home_suffix", "_is_us_primary", "_is_market_suffix", "Ticker"],
         ascending=[False, False, False, False, True],
-    ).drop_duplicates(subset=["_dedup_id"], keep="first")
+    ).copy()
+    deduped = ranked.drop_duplicates(subset=["_dedup_id"], keep="first").copy()
+    duplicate_rejected = ranked[~ranked.index.isin(deduped.index)].copy()
+    if not duplicate_rejected.empty:
+        duplicate_rejected["rejection_stage"] = "dedup"
+        duplicate_rejected["rejection_reasons"] = "duplicate_fd_candidate"
 
     if max_additions > 0:
-        filtered = filtered.head(max_additions).copy()
+        accepted = deduped.head(max_additions).copy()
+        overflow_rejected = deduped.iloc[max_additions:].copy()
+        if not overflow_rejected.empty:
+            overflow_rejected["rejection_stage"] = "max_additions"
+            overflow_rejected["rejection_reasons"] = "over_max_additions"
+    else:
+        accepted = deduped.copy()
+        overflow_rejected = pd.DataFrame(columns=deduped.columns)
+
+    if not prefiltered_rejected.empty:
+        prefiltered_rejected["rejection_stage"] = "initial_filter"
+        prefiltered_rejected["rejection_reasons"] = prefiltered_rejected["_reject_reasons"].where(
+            prefiltered_rejected["_reject_reasons"].astype(str).str.len().gt(0),
+            "filtered_out",
+        )
 
     keep_columns = [
         "Ticker",
@@ -326,7 +414,12 @@ def build_financedatabase_universe(
         "Listing_Source",
         "Universe_Source",
     ]
-    result = filtered[keep_columns].copy()
+    result = accepted[keep_columns].copy()
+    rejected_df = pd.concat(
+        [prefiltered_rejected, duplicate_rejected, overflow_rejected],
+        ignore_index=True,
+        sort=False,
+    )
     logger_obj.info(
         "FinanceDatabase: %s neue Kandidaten integriert (Quelle=%s, require_isin=%s, require_metadata=%s).",
         len(result),
@@ -334,4 +427,89 @@ def build_financedatabase_universe(
         require_isin,
         require_metadata,
     )
-    return result
+    base_size = len(existing_df) if existing_df is not None else 0
+    return {
+        "base_universe_size": base_size,
+        "fd_raw_size": len(work),
+        "accepted_size": len(result),
+        "after_universe_size": base_size + len(result),
+        "accepted_df": result,
+        "rejected_df": _build_rejected_view(rejected_df),
+        "audit_df": _build_audit_view(work),
+    }
+
+
+def _build_rejected_view(rejected_df: pd.DataFrame) -> pd.DataFrame:
+    if rejected_df is None or rejected_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Ticker",
+                "Name",
+                "Land",
+                "Market",
+                "ISIN",
+                "rejection_stage",
+                "rejection_reasons",
+            ]
+        )
+    columns = [
+        "Ticker",
+        "Name",
+        "Land",
+        "Market",
+        "ISIN",
+        "rejection_stage",
+        "rejection_reasons",
+    ]
+    for column in columns:
+        if column not in rejected_df.columns:
+            rejected_df[column] = ""
+    return rejected_df[columns].copy()
+
+
+def _build_audit_view(work: pd.DataFrame) -> pd.DataFrame:
+    if work is None or work.empty:
+        return pd.DataFrame()
+    columns = [
+        "Ticker",
+        "Name",
+        "Land",
+        "Market",
+        "ISIN",
+        "_has_isin",
+        "_has_metadata",
+        "_is_supported_symbol",
+        "_is_otc",
+        "_known_by_ticker",
+        "_known_by_ticker_norm",
+        "_known_by_isin",
+        "_known_by_name",
+        "_reject_reasons",
+    ]
+    existing_columns = [column for column in columns if column in work.columns]
+    audit_df = work[existing_columns].copy()
+    rename_map = {"_reject_reasons": "reject_reasons"}
+    return audit_df.rename(columns=rename_map)
+
+
+def build_financedatabase_universe(
+    existing_df: pd.DataFrame,
+    config: Dict[str, Any],
+    logger_obj: Any,
+    location_suffix_map: Dict[str, str],
+    exchange_suffix_map: Dict[str, str],
+    unsupported_exchanges: List[str],
+    normalize_sector_name: Optional[Any] = None,
+    fd_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    audit = audit_financedatabase_universe(
+        existing_df=existing_df,
+        config=config,
+        logger_obj=logger_obj,
+        location_suffix_map=location_suffix_map,
+        exchange_suffix_map=exchange_suffix_map,
+        unsupported_exchanges=unsupported_exchanges,
+        normalize_sector_name=normalize_sector_name,
+        fd_df=fd_df,
+    )
+    return audit["accepted_df"]
