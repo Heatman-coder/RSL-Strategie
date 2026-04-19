@@ -17,7 +17,13 @@ def _safe_get_columns(data):
 def _get_ticker_priority(ticker: Any) -> int:
     t = str(ticker or "").strip().upper()
     # 1. Prio: US-Original (kein Punkt) oder Native Maerkte (z.B. .OL fuer Norwegen)
-    native_suffixes = [".T", ".L", ".HK", ".TO", ".AX", ".OL", ".ST", ".CO", ".KS", ".KQ", ".TW", ".TWO", ".SS", ".SZ", ".SN"]
+    native_suffixes = [
+        ".T", ".L", ".HK", ".TO", ".AX", ".OL", ".ST", ".CO", ".KS", ".KQ", 
+        ".TW", ".TWO", ".SS", ".SZ", ".SN", ".SW", ".PA", ".AS", ".BR", 
+        ".MI", ".MC", ".HE", ".WA", ".PR", ".VI", ".LS", ".IR", ".NS", 
+        ".BO", ".SI", ".JK", ".KL", ".BK", ".MX", ".SA", ".JO", ".QA", 
+        ".QA", ".BA", ".BC", ".BD"
+    ]
     if any(t.endswith(s) for s in native_suffixes):
         return 1
     if t and "." not in t: return 2
@@ -50,6 +56,20 @@ def _has_valid_isin_data(df: pd.DataFrame) -> bool:
         return False
     # Toleranterer Check: 2 Buchstaben + 10 alphanumerische Zeichen
     return bool((valid.str.match(r'^[A-Z]{2}[A-Z0-9]{10}$')).any())
+
+def _filter_equities_only(df: pd.DataFrame) -> pd.DataFrame:
+    """Filtert ein iShares-Holdings-DataFrame auf reine Aktien (Equities)."""
+    if df is None or df.empty:
+        return df
+    
+    # Spaltennamen fuer Asset-Klasse (US/DE Varianten)
+    ac_cols = [c for c in df.columns if str(c).strip() in ('Asset Class', 'Asset-Klasse', 'Anlageklasse')]
+    if ac_cols:
+        col = ac_cols[0]
+        # Erlaube nur Equity/Aktien. iShares nutzt diese Begriffe fuer echte Firmenanteile.
+        mask = df[col].astype(str).str.strip().str.upper().isin(['EQUITY', 'AKTIEN'])
+        return df[mask].copy()
+    return df
 
 
 def load_selected_etf_universe(
@@ -103,6 +123,7 @@ def load_selected_etf_universe(
                     try:
                         current_df = download_ishares_csv(csv_url, log_label=False)
                         if current_df is not None and not current_df.empty:
+                            current_df = _filter_equities_only(current_df)
                             current_df["Source_ETF"] = sym
                             new_data_df = pd.concat([new_data_df, current_df], ignore_index=True)
                         else:
@@ -120,6 +141,7 @@ def load_selected_etf_universe(
                 try:
                     current_df = download_ishares_csv(csv_url)
                     if current_df is not None and not current_df.empty:
+                        current_df = _filter_equities_only(current_df)
                         current_df["Source_ETF"] = sym
                         new_data_df = pd.concat([new_data_df, current_df], ignore_index=True)
                     else:
@@ -155,6 +177,16 @@ def load_selected_etf_universe(
         if master_df.empty:
             logger.error("Keine Daten fuer die gewaehlte Auswahl im Cache gefunden.")
             return pd.DataFrame(), 0
+
+    # Auch den geladenen Cache-Stand nochmals filtern, falls dieser noch ETFs enthielt
+    master_df = _filter_equities_only(master_df)
+
+    # Calculate original equity counts per ETF before global deduplication
+    if not master_df.empty and "Source_ETF" in master_df.columns:
+        raw_counts = master_df.groupby("Source_ETF").size().to_dict()
+        for sym, count in raw_counts.items():
+            if sym in etf_options:
+                etf_options[sym]["original_equity_count"] = int(count)
 
     # Spalten-Normalisierung: Symbol -> Ticker, Isin -> ISIN
     rename_map = {

@@ -17,7 +17,6 @@ MAIN_EXPORT_COLUMN_ORDER = [
     "ISIN",
     "Name",
     "St",
-    "Lk",
     "Sektor",
     "Branche",
     "Land",
@@ -254,11 +253,6 @@ def _build_main_export_dataframe(
             source_display_parts.append(f"Boerse: {listing_source_txt}")
         source_display = " | ".join(source_display_parts)
 
-        link_symbol = str(s.yahoo_symbol or "").strip()
-        link_mode = ""
-        if link_symbol:
-            link_mode = "D" if link_symbol.isalnum() else "S"
-
         row = {
             'RSL-Rang': s.rsl_rang,
             'RSL': d['rsl'],
@@ -267,7 +261,6 @@ def _build_main_export_dataframe(
             'ISIN': getattr(s, 'isin', ''),
             'Name': s.name,
             'St': status,
-            'Lk': link_mode,
             'MktCap-Rang': s.mktcap_rang,
             'Orig. Ticker': s.original_ticker,
             'Sektor': s.sector,

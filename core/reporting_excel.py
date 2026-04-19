@@ -259,7 +259,6 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
                 "RSL": 7,
                 "Tr": 5,
                 "Ticker": 12,
-                "Lk": 4,
                 "Name": 26,
                 "St": 4,
                 "Sektor": 16,

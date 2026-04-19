@@ -16,6 +16,7 @@ import yfinance as yf
 from data_manager import MarketDataManager, PortfolioManager, StockData
 from . import console_ui as console_ui_core
 from . import data_pipeline as data_pipeline_core
+from . import financedatabase_universe as financedatabase_universe_core
 from . import final_support as final_support_core
 from . import ranking as ranking_core
 from . import rsl_integrity as rsl_integrity_core
@@ -570,6 +571,7 @@ def select_etf_interactive(
             print(f"{index}. {symbol} - {etf_options[symbol]['name']}")
         print(f"{len(opts)+1}. XETRA - Deutsche Boerse Xetra")
         print(f"{len(opts)+2}. FRA   - Deutsche Boerse Frankfurt")
+        print(f"{len(opts)+3}. FDB   - FinanceDatabase Zusatzuniversum (defensiv gefiltert)")
         print("\nOder 'all' fuer alles, 'add' zum Hinzufuegen, 'remove' zum Entfernen, '?' fuer Hilfe.")
         choice = input("Wahl (z.B. 1,2,FRA): ").strip().lower()
         if choice == "?":
@@ -577,6 +579,7 @@ def select_etf_interactive(
             print(" - Nummern: Auswahl per Index, z.B. 1,3,5")
             print(" - Symbole: direkte Auswahl per Symbol, z.B. IVV oder IVV,SOXX")
             print(" - all: alle ETFs auswaehlen")
+            print(" - FDB: FinanceDatabase als Zusatzquelle aktivieren")
             print(" - add: ETF manuell oder per iShares-URL hinzufuegen")
             print(" - remove: ETF aus Liste entfernen")
             print(" - Enter: Eingabe wiederholen")
@@ -793,6 +796,7 @@ def show_main_menu(has_snapshot: bool) -> str:
     print("\033[94m [5]\033[0m \U0001F4E5 Fundamentaldaten-Download (Market Cap, etc.)")
     print("\033[95m [6]\033[0m \U0001F50D Ad-hoc Analyse (Gezielte Ticker)")
     print("\033[96m [7]\033[0m \u2139\ufe0f  Hilfe: Integritaets-Fehler verstehen")
+    print("\033[93m [8]\033[0m \u2b07\ufe0f  Original iShares CSV downloaden")
     print("\033[91m [0]\033[0m \u2716  Beenden")
     return input("Auswahl [2]: ").strip()
 
@@ -808,6 +812,7 @@ def prepare_ticker_universe(
     etf_selection = [symbol for symbol in selected_syms if symbol in etf_options]
     wants_xetra = "XETRA" in [symbol.upper() for symbol in selected_syms]
     wants_fra = "FRA" in [symbol.upper() for symbol in selected_syms]
+    wants_fd = "FDB" in [symbol.upper() for symbol in selected_syms]
     master_df = pd.DataFrame()
     if etf_selection:
         # Wir laden das Universum, behalten aber für das Audit die Roh-Daten im Hinterkopf
@@ -834,6 +839,25 @@ def prepare_ticker_universe(
             
             # Zusammenführen und Duplikate zwischen ETF und Exchange entfernen
             df = pd.concat([df, exchange_df], ignore_index=True)
+
+    if wants_fd:
+        location_suffix_map = final_support_core.load_json_config(config.get("location_suffix_map_file", ""))
+        exchange_suffix_map = final_support_core.load_json_config(config.get("exchange_suffix_map_file", ""))
+        unsupported_exchanges = final_support_core.load_json_config(
+            config.get("unsupported_exchanges_file", ""),
+            is_list=True,
+        )
+        fd_df = financedatabase_universe_core.build_financedatabase_universe(
+            existing_df=df,
+            config=config,
+            logger_obj=logger,
+            location_suffix_map=location_suffix_map if isinstance(location_suffix_map, dict) else {},
+            exchange_suffix_map=exchange_suffix_map if isinstance(exchange_suffix_map, dict) else {},
+            unsupported_exchanges=unsupported_exchanges if isinstance(unsupported_exchanges, list) else [],
+            normalize_sector_name=normalize_sector_name,
+        )
+        if not fd_df.empty:
+            df = pd.concat([df, fd_df], ignore_index=True)
 
     if not df.empty:
         # Diese Logik muss IMMER laufen, nicht nur beim Exchange-Scan!

@@ -97,6 +97,7 @@ def build_etf_rsl_summary(
         row = {
                 "ETF": etf_sym,
                 "ETF Name (voll)": etf_options.get(etf_sym, {}).get("name", etf_sym),
+                "Anzahl Werte": etf_options.get(etf_sym, {}).get("original_equity_count", n_values),
                 "ISIN": etf_options.get(etf_sym, {}).get("isin", ""),
                 "Sub Asset Class": etf_options.get(etf_sym, {}).get("sub_asset_class", ""),
                 "Region": etf_options.get(etf_sym, {}).get("region", ""),
@@ -167,6 +168,7 @@ def build_etf_rsl_summary(
             {
                 "ETF": "GESAMT",
                 "ETF Name (voll)": "Alle selektierten ETFs",
+                "Anzahl Werte": combined_n,
                 "ISIN": "",
                 "Sub Asset Class": "",
                 "Region": "",
@@ -219,6 +221,7 @@ def build_etf_rsl_summary(
         "Top RSL",
         "ETF",
         "ETF Name (voll)",
+        "Anzahl Werte",
         "ISIN",
         "Sub Asset Class",
         "Region",

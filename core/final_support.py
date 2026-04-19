@@ -146,10 +146,10 @@ def parse_etf_selection_input(inp: str, opts: Dict[str, Any]) -> List[str]:
         return []
     if inp.lower() == "all":
         return list(opts.keys()) + ["XETRA", "FRA"]
-    keys = list(opts.keys()) + ["XETRA", "FRA"]
+    keys = list(opts.keys()) + ["XETRA", "FRA", "FDB"]
     selected: List[str] = []
     for part in (p.strip().upper() for p in inp.replace(",", " ").split()):
-        if part in opts or part in ("XETRA", "FRA"):
+        if part in opts or part in ("XETRA", "FRA", "FDB"):
             selected.append(part)
             continue
         if part.isdigit():
