@@ -618,7 +618,7 @@ def select_etf_interactive(
                 print(f"'{user_in}' nicht in der Liste gefunden.")
             continue
         if choice == "all":
-            full_selection = opts + ["XETRA", "FRA"]
+            full_selection = opts + ["XETRA", "FRA", "FDB"]
             etf_config["selected_symbols"] = full_selection
             save_json_config(config["etf_config_file"], etf_config)
             return full_selection, etf_options
