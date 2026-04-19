@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import time
+import webbrowser
 import random
 import datetime
 import logging
@@ -561,6 +562,11 @@ def run_fundamental_data_download(data_mgr: MarketDataManager) -> None:
         
     # Besten Ticker pro Gruppe finden (Deduplizierung für den Download)
     best_tickers_df = df.sort_values('_prio').drop_duplicates(subset=['_group_id'], keep='first')
+    
+    # Mapping für Propagation vorbereiten
+    group_map = df.groupby('_group_id')['Ticker'].apply(list).to_dict()
+    best_ticker_of_group = best_tickers_df.set_index('_group_id')['Ticker'].to_dict()
+
     unique_firms = sorted(list(set(best_tickers_df['Ticker'].astype(str).unique())))
     total_firms = len(unique_firms)
     
@@ -634,6 +640,36 @@ def run_fundamental_data_download(data_mgr: MarketDataManager) -> None:
                 # Regelmäßiges Zwischenspeichern
                 data_mgr.save_info_cache()
                 
+            # 3. PROPAGATION: Daten auf Schwester-Listings verteilen
+            print(f"\n\033[94mStarte Daten-Propagation auf {len(df) - len(targets)} Schwester-Listings...\033[0m")
+            propagated_count = 0
+            with data_mgr.lock:
+                for gid, members in group_map.items():
+                    primary = best_ticker_of_group.get(gid)
+                    if not primary or primary not in data_mgr.info_cache:
+                        continue
+                    
+                    primary_info = data_mgr.info_cache[primary]
+                    if _to_float(primary_info.get('marketCap', 0)) <= 0:
+                        continue
+                    
+                    for m in members:
+                        if m == primary: continue
+                        
+                        # Daten kopieren, wenn Ziel noch keine oder 0-Daten hat
+                        existing = data_mgr.info_cache.get(m, {})
+                        if _to_float(existing.get('marketCap', 0)) <= 0:
+                            new_info = primary_info.copy()
+                            new_info['source_ticker'] = primary
+                            new_info['copied_from_primary'] = True
+                            # ISIN des Ziels erhalten, falls vorhanden
+                            if existing.get('isin'): new_info['isin'] = existing['isin']
+                            
+                            data_mgr.info_cache[m] = new_info
+                            propagated_count += 1
+            
+            print(f"Propagation beendet: {propagated_count} Ticker mit Primär-Daten aktualisiert.")
+
         except KeyboardInterrupt:
             print("\nDownload abgebrochen.")
         finally:
@@ -1730,9 +1766,21 @@ def run_analysis_pipeline(
     _setup_run_environment()
 
     # Cache-Steuerung: Muss VOR der Initialisierung passieren, damit die Logs stimmen
+    # -----------------------------------------------------------------------------------------
+    # ENTWICKLER-HINWEIS (KI): Bitte NIEMALS Logik hinzufügen, die JSON-Caches (außer History) 
+    # ohne explizite Rückfrage beim Anwender löscht. Der Info-Cache (Sektoren) ist persistent.
+    # -----------------------------------------------------------------------------------------
     if force_clear_cache:
-        data_mgr.clear_cache()
-        logger.info("Kursdaten-Cache (History) wurde geleert.")
+        # Kurs-Historien (JSON/Speicher) leeren, aber Branchen-Informationen (Info-Cache) erhalten.
+        # Dies verhindert, dass bei einem Voll-Download alle Sektor-Daten erneut von Yahoo geladen werden müssen.
+        if hasattr(data_mgr, 'history_cache'):
+            data_mgr.history_cache = {}
+            logger.info("Kursdaten-Cache (History) wurde geleert. Industry-Informationen bleiben erhalten.")
+        else:
+            # Fallback falls die Struktur des DataManagers abweicht. 
+            # data_mgr.clear_cache() ist so implementiert, dass nur die Historie gelöscht wird.
+            data_mgr.clear_cache()
+            logger.info("Kursdaten-Cache wurde geleert.")
 
     _initialize_run_settings(data_mgr)
 
@@ -1799,8 +1847,10 @@ def run_analysis_pipeline(
     ticker_to_isin_cache = {}
     name_to_isin_cache = {}
     global_isin_map = {}
+    global_name_map = {}
     for t_sym, t_info in data_mgr.info_cache.items():
         isin = t_info.get('isin')
+        mkt_cap = _to_float(t_info.get('marketCap', 0), 0)
         if isin and len(isin) > 5 and isin not in ("NAN", "NONE"):
             ticker_to_isin_cache[t_sym.upper()] = isin
             n_key = normalize_name_for_dedup(t_info.get('longName', ''))
@@ -1808,6 +1858,11 @@ def run_analysis_pipeline(
             mkt_cap = float(t_info.get('marketCap', 0) or 0)
             if isin not in global_isin_map or mkt_cap > float(global_isin_map[isin].get('marketCap', 0) or 0):
                 global_isin_map[isin] = t_info
+        
+        n_key = normalize_name_for_dedup(t_info.get('longName', ''))
+        if n_key and len(n_key) > 3:
+            if n_key not in global_name_map or mkt_cap > _to_float(global_name_map[n_key].get('marketCap', 0), 0):
+                global_name_map[n_key] = t_info
 
     if filter_tokens:
         mask = df['Ticker'].str.upper().str.strip().isin(filter_tokens)
@@ -1959,7 +2014,13 @@ def run_analysis_pipeline(
                             industry_final = info.get('industry', row.get('Industry', 'Unknown'))
 
                             # Filter: Nur echte Aktien zulassen (Skip ETFs, Bonds, Funds etc. laut Yahoo)
-                            if sector_final in ('ETF', 'MUTUALFUND', 'BOND', 'INDEX', 'CURRENCY', 'FUTURE', 'OPTION'):
+                            name_upper = str(row.get('Name', '')).upper()
+                            is_etf = (
+                                sector_final in ('ETF', 'MUTUALFUND', 'BOND', 'INDEX', 'CURRENCY', 'FUTURE', 'OPTION') or
+                                "EXCHANGE TRADED FUND" in str(industry_final).upper() or
+                                ("ISHARES" in name_upper and " ETF" in name_upper)
+                            )
+                            if is_etf:
                                 sector_skips[orig] = sector_final
                                 pbar.update(1)
                                 continue
@@ -1984,6 +2045,13 @@ def run_analysis_pipeline(
                             # PROPAGATION FALLBACK: Falls dieser Ticker keine Market Cap hat, nutze Primär-Daten der ISIN
                             if _resolve_market_cap_from_info(info) <= 0 and isin_final in global_isin_map:
                                 info = global_isin_map[isin_final]
+                            if _resolve_market_cap_from_info(info) <= 0:
+                                if isin_final in global_isin_map:
+                                    info = global_isin_map[isin_final]
+                                else:
+                                    n_key = normalize_name_for_dedup(row.get('Name', ''))
+                                    if n_key in global_name_map:
+                                        info = global_name_map[n_key]
 
                             market_cap_final = _resolve_market_cap_from_info(info)
                             market_value_final = _resolve_market_value_from_sources(row, info, y_sym)
@@ -2519,6 +2587,61 @@ def main() -> None:
                 print(" - \033[91mexcluded_hard_fail\033[0m: Aktie unbrauchbar, aus Analyse entfernt.")
                 print("\n\033[90mDetaillierte Beschreibungen findest du in: docs/indikatoren.md\033[0m")
                 input("\n[ENTER] Zurueck zum Menue...")
+            elif choice == "8":
+                print("\n\033[93m" + "="*70)
+                print(" ORIGINAL iSHARES CSV DOWNLOAD")
+                print("="*70 + "\033[0m")
+                
+                etf_config = load_json_config(CONFIG['etf_config_file'])
+                etf_options = etf_config.get('options', {})
+                if not etf_options:
+                    print("\033[91mKeine ETFs konfiguriert.\033[0m")
+                    continue
+                    
+                opts = sorted(list(etf_options.keys()))
+                for i, sym in enumerate(opts, 1):
+                    print(f" [{i:2}] {sym:<10} - {etf_options[sym]['name']}")
+                
+                user_in = input("\nETF Auswahl (Symbol oder Nummer): ").strip().upper()
+                target_sym = None
+                if user_in.isdigit():
+                    idx = int(user_in) - 1
+                    if 0 <= idx < len(opts): target_sym = opts[idx]
+                elif user_in in etf_options:
+                    target_sym = user_in
+                
+                if target_sym:
+                    info = etf_options[target_sym]
+                    if 'id' in info and 'slug' in info:
+                        url = CONFIG['base_url_template'].format(id=info['id'], slug=info['slug'], symbol=target_sym)
+                        
+                        fmt_in = input("\nFormat waehlen: [1] CSV (Standard) | [2] Excel (XLSX): ").strip()
+                        use_excel = (fmt_in == "2")
+                        ext = "xlsx" if use_excel else "csv"
+                        
+                        print(f"Starte Download: {url}")
+                        
+                        try:
+                            # download_ishares_csv bereinigt automatisch den iShares-Header
+                            df_ishares = download_ishares_csv(url, log_label=False)
+                            if not df_ishares.empty:
+                                target_path = os.path.join(REPORTS_DIR, f"ishares_{target_sym}_original.{ext}")
+                                if use_excel:
+                                    df_ishares.to_excel(target_path, index=False)
+                                else:
+                                    # Speichern mit Semikolon und UTF-8-BOM fuer perfekten Excel-Import
+                                    df_ishares.to_csv(target_path, index=False, encoding='utf-8-sig', sep=';')
+                                
+                                print(f"\n\033[92mErfolg! Datei gespeichert unter:\033[0m\n{target_path}")
+                                
+                                if input("\nSoll die Datei direkt geoeffnet werden? (j/n): ").strip().lower() in ("j", "ja", "y", "yes"):
+                                    webbrowser.open(os.path.abspath(target_path))
+                            else:
+                                print("\033[91mFehler: Datei geladen, aber keine Daten gefunden.\033[0m")
+                        except Exception as e:
+                            print(f"\033[91mFehler beim Download: {e}\033[0m")
+                    else:
+                        print(f"\033[91mFehler: Download-Metadaten (ID/Slug) fehlen fuer {target_sym}.\033[0m")
             else:
                 print("Ungueltige Auswahl.")
         except KeyboardInterrupt:

@@ -272,7 +272,12 @@ class MarketDataManager:
             logger.error(f"Konnte Info-Cache nicht speichern ({path}): {e}")
 
     def clear_cache(self) -> None:
-        """Löscht nur den Kursdaten-Cache (Historie)."""
+        """
+        Löscht ausschließlich den Kursdaten-Cache (Historie) von der Festplatte und aus dem Speicher.
+        
+        SICHERHEITSHINWEIS: Andere Cache-Dateien (z.B. ticker_info_cache.json) dürfen hier NIEMALS 
+        automatisch gelöscht werden, da sie wertvolle Metadaten enthalten.
+        """
         self.cache = {}
         path = cast(Optional[str], self.config.get('history_cache_file'))
         if path and os.path.exists(str(path)):
@@ -704,8 +709,14 @@ class MarketDataManager:
 
             # Market Cap Validierung: 0 oder negative Werte als 0 cachen
             mkt_cap = info.get('marketCap', 0)
-            if not isinstance(mkt_cap, (int, float)) or mkt_cap < 0:
-                mkt_cap = 0
+            if (not isinstance(mkt_cap, (int, float)) or mkt_cap <= 0):
+                # Fallback: sharesOutstanding * price
+                shares = info.get('sharesOutstanding', 0)
+                price = info.get('currentPrice') or info.get('regularMarketPreviousClose') or info.get('previousClose') or 0
+                if shares and price:
+                    mkt_cap = float(shares) * float(price)
+                else:
+                    mkt_cap = 0
 
             clean_info = {
                 'sector': info.get('sector', 'Unknown'),
@@ -714,7 +725,9 @@ class MarketDataManager:
                 'longName': info.get('longName', ticker),
                 'isin': valid_isin,
                 'marketCap': mkt_cap,
-                'cached_at': datetime.datetime.now().isoformat()
+                'cached_at': datetime.datetime.now().isoformat(),
+                'source_ticker': ticker,
+                'copied_from_primary': False
             }
             with self.lock:
                 self.info_cache[ticker] = clean_info
