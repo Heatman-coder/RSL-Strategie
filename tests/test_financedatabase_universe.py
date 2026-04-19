@@ -8,11 +8,11 @@ from core import financedatabase_universe as fd_universe
 from core import final_support as final_support_core
 
 
-def test_parse_etf_selection_input_supports_fdb_without_changing_all_behavior():
+def test_parse_etf_selection_input_supports_fdb_and_includes_it_in_all():
     opts = {"IVV": {"name": "iShares Core S&P 500 ETF"}}
 
     assert final_support_core.parse_etf_selection_input("FDB, FRA", opts) == ["FDB", "FRA"]
-    assert final_support_core.parse_etf_selection_input("all", opts) == ["IVV", "XETRA", "FRA"]
+    assert final_support_core.parse_etf_selection_input("all", opts) == ["IVV", "XETRA", "FRA", "FDB"]
 
 
 def test_build_financedatabase_universe_filters_known_otc_and_missing_isin_rows():

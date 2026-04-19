@@ -512,7 +512,7 @@ def test_parse_etf_selection_input_accepts_indices_and_all():
         "IWM": {"name": "iShares Russell 2000 ETF"},
     }
     assert final._parse_etf_selection_input("2,1", etf_options) == ["SOXX", "IVV"]
-    assert final._parse_etf_selection_input("all", etf_options) == ["IVV", "SOXX", "IWM"]
+    assert final._parse_etf_selection_input("all", etf_options) == ["IVV", "SOXX", "IWM", "XETRA", "FRA", "FDB"]
 
 
 def test_refresh_market_caps_for_relevant_exchange_stocks_uses_cached_marketcap():
