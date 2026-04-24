@@ -1,0 +1,18 @@
+{
+  "run_date": "2026-04-07",
+  "combo": "COMBO",
+  "unique_failed_tickers": 2,
+  "total_failed_events": 2,
+  "records": [
+    {
+      "ticker": "84I.F",
+      "count": 1,
+      "top_reason": "Keine verwertbare Preisserie"
+    },
+    {
+      "ticker": "T3O.F",
+      "count": 1,
+      "top_reason": "Keine verwertbare Preisserie"
+    }
+  ]
+}

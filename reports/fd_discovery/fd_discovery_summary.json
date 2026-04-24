@@ -1,0 +1,40 @@
+{
+  "project_universe": {
+    "cache_exists": true,
+    "snapshot_exists": true,
+    "cache_rows": 24732,
+    "snapshot_rows": 15503,
+    "total_rows": 40235,
+    "unique_tickers": 24732,
+    "unique_norm_tickers": 24713,
+    "unique_isins": 9540
+  },
+  "financedatabase": {
+    "rows": 160000
+  },
+  "candidates": {
+    "rows": 159999,
+    "new_candidates": 126673,
+    "known_by_ticker": 15757,
+    "known_by_normalized_ticker": 117,
+    "known_by_isin": 17452,
+    "has_isin": 39373,
+    "has_country": 79466,
+    "has_sector": 103954,
+    "has_industry": 71023,
+    "status_counts": {
+      "NEW_CANDIDATE": 126673,
+      "KNOWN_BY_ISIN": 17452,
+      "KNOWN_BY_TICKER": 15757,
+      "KNOWN_BY_NORMALIZED_TICKER": 117
+    }
+  },
+  "yfinance_sample": {
+    "rows": 300,
+    "yf_ok": 193,
+    "rsl_usable": 173,
+    "with_isin": 300,
+    "ok_rate": 64.33,
+    "rsl_rate": 57.67
+  }
+}

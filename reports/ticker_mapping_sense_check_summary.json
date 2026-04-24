@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-03-12T18:51:19",
+  "universe_unique_candidate_keys": 10542,
+  "mapping_entries": 9543,
+  "manual_fix_entries": 583,
+  "total_findings": 1126,
+  "high_confidence_findings": 1119,
+  "review_findings": 7,
+  "findings_by_issue": {
+    "UNMAPPED_UNIVERSE_KEY": 1119,
+    "MANY_KEYS_TO_ONE_MAPPED": 6,
+    "EXCHANGE_SUFFIX_MISMATCH": 1
+  },
+  "top_issue_counts": {
+    "UNMAPPED_UNIVERSE_KEY": 1119,
+    "MANY_KEYS_TO_ONE_MAPPED": 6,
+    "EXCHANGE_SUFFIX_MISMATCH": 1
+  },
+  "files": [
+    "reports\\ticker_mapping_sense_check_findings.csv",
+    "reports\\ticker_mapping_sense_check_high_confidence.csv",
+    "reports\\ticker_mapping_sense_check_review.csv"
+  ],
+  "generated_files": [
+    "reports\\ticker_mapping_sense_check_findings.csv",
+    "reports\\ticker_mapping_sense_check_high_confidence.csv",
+    "reports\\ticker_mapping_sense_check_review.csv"
+  ]
+}

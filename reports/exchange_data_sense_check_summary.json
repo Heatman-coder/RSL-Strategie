@@ -1,0 +1,26 @@
+{
+  ".DE": {
+    "rows": 828,
+    "history_gap_any": 132,
+    "info_gap_any": 45,
+    "avg_turnover_zero": 0,
+    "mom12_missing": 132,
+    "mom6_missing": 0,
+    "sector_unknown": 45,
+    "industry_unknown": 45,
+    "land_unknown": 0,
+    "market_value_zero": 743
+  },
+  ".F": {
+    "rows": 6618,
+    "history_gap_any": 2486,
+    "info_gap_any": 299,
+    "avg_turnover_zero": 1954,
+    "mom12_missing": 778,
+    "mom6_missing": 383,
+    "sector_unknown": 299,
+    "industry_unknown": 299,
+    "land_unknown": 0,
+    "market_value_zero": 6618
+  }
+}
