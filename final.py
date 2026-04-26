@@ -48,7 +48,7 @@ from core import app_config as app_config_core
 from core import app_support as app_support_core
 from data_manager import (
     MarketDataManager, FirstSeenManager, PortfolioManager, 
-    retry_decorator, StockData, _consume_rate_limit_hits
+    StockData
 )
 from core.entity_matching import normalize_name_for_dedup
 from core.data_pipeline import load_selected_etf_universe
@@ -631,11 +631,6 @@ def run_fundamental_data_download(data_mgr: MarketDataManager) -> None:
                 for i, future in enumerate(concurrent.futures.as_completed(futures)):
                     future.result()
                     pbar.update(1)
-                    
-                    # Notfall-Bremse: Wenn zu viele Rate-Limits auftreten
-                    if _consume_rate_limit_hits() > 3:
-                        print("\n\033[93mHohe Rate-Limit Aktivitaet erkannt. Kurze Abkuehlphase...\033[0m")
-                        time.sleep(30)
                 
                 # Regelmäßiges Zwischenspeichern
                 data_mgr.save_info_cache()
@@ -838,7 +833,7 @@ def print_run_status_header(selected_syms: List[str], portfolio_size: int, etf_o
         f"Min-Size {CONFIG.get('industry_min_size', 10)}"
     )
     print(
-        f" Delays: Batch-Sleep {min_sleep:.2f}-{max_sleep:.2f}s | "
+        f" Delays (fest): Batch-Sleep {min_sleep:.2f}-{max_sleep:.2f}s | "
         f"Info-Fetch {float(CONFIG.get('info_fetch_delay_s', 0.7) or 0.7):.2f}s"
     )
     print(f" Konsole: {console_mode}")
@@ -2001,8 +1996,9 @@ def run_analysis_pipeline(
         with make_progress(total=len(batch_queue), desc="Batch") as pbar:
             for i in range(0, len(unique_syms), chunk_size):
                 chunk = unique_syms[i:i+chunk_size]
+                # Wir merken uns, ob für diesen Chunk ein Netzwerkzugriff nötig war
                 data_map = data_mgr.get_history_batch(chunk)
-
+                
                 for y_sym, (curr, sma, vol_eur, flags) in data_map.items():
                     if y_sym in batch_map:
                         for u_key, orig, _, row in batch_map[y_sym]:
@@ -2131,11 +2127,6 @@ def run_analysis_pipeline(
                             complex_queue.append((u_key, orig, row))
                             pbar.update(1)
                         del batch_map[unresolved_sym] 
-                min_sleep = float(CONFIG.get('batch_sleep_min_s', 0.5))
-                max_sleep = float(CONFIG.get('batch_sleep_max_s', 1.5))
-                if max_sleep < min_sleep: max_sleep = min_sleep
-                if data_mgr.last_history_batch_used_network and max_sleep > 0:
-                    time.sleep(random.uniform(min_sleep, max_sleep))
                     
     # WICHTIG: Cache speichern, damit Option 1 beim nächsten Mal schnell ist!
     if data_mgr:
@@ -2364,6 +2355,7 @@ def run_analysis_pipeline(
 
     # --- UNIVERSE AUDIT DATAFRAME BAUEN ---
     rsl_drops_map = {str(row['ticker']).strip().upper(): row['drop_reasons'] for _, row in integrity_drops_df.iterrows()} if not integrity_drops_df.empty else {}
+    failed_map = {str(r['ticker']).strip().upper(): r['top_reason'] for r in data_mgr.get_failed_records()} if data_mgr else {}
     
     audit_rows = []
     for orig, trail in audit_trail.items():
@@ -2372,7 +2364,9 @@ def run_analysis_pipeline(
         status = "ANALYZED"
         detail = "Erfolgreich verarbeitet"
         
-        if orig in sector_skips:
+        if y_upper in failed_map:
+            status, detail = "FAILED_DOWNLOAD", failed_map[y_upper]
+        elif orig in sector_skips:
             status, detail = "SKIPPED_SECTOR", f"Typ: {sector_skips[orig]}"
         elif not y_upper:
             status, detail = "SKIPPED_UNRESOLVED", "Kein Yahoo-Ticker gefunden"
@@ -2483,12 +2477,10 @@ def run_analysis_pipeline(
 
     watchlist_symbols = load_watchlist_symbols(str(CONFIG.get('watchlist_file', ''))) or set()
     
-    # Rate-Limit Statistik
+    # Lauf-Statistik
     try:
-        total_hits = _consume_rate_limit_hits()
         save_json_config(CONFIG['run_stats_file'], {
-            'last_run_at': datetime.datetime.now().isoformat(timespec='seconds'),
-            'last_rate_limit_hits': total_hits
+            'last_run_at': datetime.datetime.now().isoformat(timespec='seconds')
         })
     except Exception: pass
 

@@ -19,7 +19,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import concurrent.futures
-from typing import Dict, Any, Optional, List, Tuple, Union, cast
+from typing import Dict, Any, Optional, List, Tuple, Union, cast, Set
 from threading import Lock
 from dataclasses import dataclass, asdict, field
 from core import rsl_integrity as rsl_integrity_core
@@ -100,6 +100,7 @@ class StockData:
     market_cap: float = 0.0
     first_seen_date: str = ""
     is_new: bool = False
+    is_size_proxy: bool = False
 
     # RSL INTEGRITY / RANKING
     integrity_warnings: List[str] = field(default_factory=list)
@@ -124,40 +125,10 @@ class StockData:
         # Manuelle Konvertierung ist ca. 15x schneller als dataclasses.asdict
         return {attr: getattr(self, attr) for attr in self.__slots__}
 
-# --- RATE LIMITING STATE ---
-INFO_RATE_LIMIT_STATE = {
-    'rate_limit_hits': 0,
-    'extra_delay_s': 0.0,
-    'last_hit_time': 0.0
-}
-
-def _consume_rate_limit_hits() -> int:
-    hits = int(cast(int, INFO_RATE_LIMIT_STATE['rate_limit_hits']))
-    INFO_RATE_LIMIT_STATE['rate_limit_hits'] = 0
-    return hits
-
-def retry_decorator(func):
-    def wrapper(*args, **kwargs):
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                if "429" in str(e) or "Too Many Requests" in str(e):
-                    INFO_RATE_LIMIT_STATE['rate_limit_hits'] += 1
-                    wait = 60 * (attempt + 1)
-                    logger.warning(f"Rate Limit (429). Warte {wait}s...")
-                    time.sleep(wait)
-                else:
-                    if attempt == max_retries - 1: raise e
-                    time.sleep(2)
-        return None
-    return wrapper
-
 # --- MANAGER KLASSEN ---
 
 class MarketDataManager:
-    def __init__(self, config: Union[Dict, str], currency_rates: Union[Dict, str, None]):
+    def __init__(self, config: Union[Dict, str], currency_rates: Union[Dict, str, None], whitelist: Optional[Set[str]] = None):
         if isinstance(config, str):
             info_cache_file = str(currency_rates or "ticker_info_cache.json")
             config = {
@@ -197,6 +168,8 @@ class MarketDataManager:
             "atr_multiplier_limit": 1.0,
             "atr_multiplier_exit": 0.15,
             "twss_decay_days": 60.0,
+            "not_found_expiry_days": 30,
+            "info_cache_expiry_days": 7,
         }
 
         merged_config = dict(default_config)
@@ -204,12 +177,13 @@ class MarketDataManager:
 
         self.config: Dict[str, Any] = merged_config
         self.currency_rates = dict(currency_rates)
+        self.whitelist = whitelist or set()
         self.lock = Lock()
         self.cache: Dict[str, Any] = {}
         self.info_cache = self._load_json(str(self.config.get('ticker_info_cache_file', 'ticker_info_cache.json')))
+        self.auto_sieved_count = 0
         self.failed_tickers: Dict[str, Any] = {}
         self.young_tickers: Dict[str, Any] = {}
-        self.last_history_batch_used_network = False
         
         # Cache für Historien laden
         h_file = self.config.get('history_cache_file')
@@ -316,7 +290,15 @@ class MarketDataManager:
                 return self.currency_rates[full_suffix]
         return self.currency_rates.get("DEFAULT", 1.0)
 
-    def _calculate_flags(self, hist_data: pd.DataFrame, curr_price: float, sma: float, is_young_history: bool = False, price_series: Optional[pd.Series] = None) -> Dict[str, Any]:
+    def _calculate_flags(
+        self, 
+        hist_data: pd.DataFrame, 
+        curr_price: float, 
+        sma: float, 
+        is_young_history: bool = False, 
+        price_series: Optional[pd.Series] = None,
+        market_cap: float = 0.0
+    ) -> Dict[str, Any]:
         flags: Dict[str, Any] = {
             'flag_gap': "OK", 'flag_liquidity': "OK", 'flag_stale': "OK", 'flag_scale': "OK",
             'scale_reason': "", 'price_scale_ratio': 1.0, 'stale_days': 0, 'trend_sma50': "OK",
@@ -333,11 +315,13 @@ class MarketDataManager:
         
         # Nutze die reparierte Serie, falls vorhanden, sonst Fallback auf Spalten
         if price_series is not None:
-            hist_close = price_series.ffill()
+            # price_series wird nun bereits vor-gefüllt übergeben (Zentralisierung)
+            hist_close = price_series
         else:
             calc_col = 'Adj Close' if 'Adj Close' in hist_data.columns else 'Close'
             if calc_col not in hist_data.columns or hist_data.empty: return flags
-            hist_close = hist_data[calc_col].dropna()
+            # Fallback Pfad: Sicherstellen dass auch hier das Limit greift
+            hist_close = hist_data[calc_col].ffill(limit=2)
 
         if len(hist_close) < 20: return flags
 
@@ -388,6 +372,14 @@ class MarketDataManager:
         if flags['stale_days'] >= int(self.config.get('max_flat_days', 25)):
             flags['flag_stale'] = "WARN"
             flags['stale_reason'] = f"Geringe Liquiditaet ({flags['stale_days']} Tage flach)"
+            
+        # HEBEL: Hard-Filter für faktisch tote Listings (10 Tage am Stück kein Volumen)
+        # Verhindert Selection-Bias durch "Zombie-Kurse", die SMA/RSL verzerren.
+        if 'Volume' in hist_data.columns:
+            v_recent = hist_data['Volume'].tail(10)
+            if len(v_recent) >= 10 and (v_recent == 0).all():
+                flags['flag_liquidity'] = "CRITICAL"
+                flags['stale_reason'] = "Dead Listing: 10 Tage kein Handelsvolumen"
 
         if (hist_close <= 0).any():
             flags['flag_stale'] = "CRITICAL"
@@ -395,9 +387,10 @@ class MarketDataManager:
 
         # 3. Trend Smoothness & Direction (Linear Regression)
         window_r2 = 130
-        if len(hist_close) >= window_r2:
-            subset = hist_close.tail(window_r2)
-            if (subset > 0).all():
+        if len(hist_close.dropna()) >= window_r2:
+            # Regression braucht saubere Daten ohne NaNs im Berechnungsfenster
+            subset = hist_close.tail(window_r2).dropna()
+            if not subset.empty and (subset > 0).all():
                 y = np.log(subset.values.astype(float))
                 x = np.arange(len(y))
                 
@@ -504,10 +497,14 @@ class MarketDataManager:
         # 6. ATR & Timing
         if 'High' in hist_data.columns and 'Low' in hist_data.columns:
             try:
-                # Index-Alignment sicherstellen und Lücken füllen
-                h, l, c = hist_data['High'].ffill(), hist_data['Low'].ffill(), hist_close.ffill()
+                # Index-Alignment: c muss synchron zu h/l sein, damit shift() für ATR korrekt arbeitet.
+                # Wir mappen die (evtl. verkürzte) hist_close zurück auf das Original-Gitter.
+                h = hist_data['High'].ffill(limit=2)
+                l = hist_data['Low'].ffill(limit=2)
+                c = hist_close.reindex(hist_data.index).ffill(limit=2)
+                
                 tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-                atr_series = tr.rolling(int(self.config.get('atr_period', 14)), min_periods=1).mean().ffill()
+                atr_series = tr.rolling(int(self.config.get('atr_period', 14)), min_periods=1).mean()
                 atr = float(atr_series.dropna().iloc[-1]) if not atr_series.dropna().empty else 0.0
                 
                 flags['atr'] = atr
@@ -520,48 +517,151 @@ class MarketDataManager:
             flags['flag_history_length'] = "CRITICAL"
             flags['history_length_reason'] = f"Historie zu kurz (<{self.config.get('sma_length', 130)} Tage)"
 
-        # 7. Trust Score
-        t_score = 3
+        # HEBEL: Erweiterter Trust Score (Confidence) auf einer 5er-Skala.
+        # Bestraft nicht nur schlechte Daten, sondern auch fehlende fundamentale Basisdaten.
+        t_score = 5
         if flags['flag_stale'] != "OK": t_score -= 1
         if flags['flag_gap'] != "OK": t_score -= 1
         if flags['flag_liquidity'] != "OK": t_score -= 1
+        if flags['flag_scale'] != "OK": t_score -= 1
+
+        # Fehlende Market Cap ist ein Risikofaktor für falsche Faktor-Klassifizierung
+        if market_cap <= 0:
+            t_score -= 1
         
-        if flags['flag_scale'] == "CRITICAL" or flags['flag_history_length'] == "CRITICAL":
+        if flags['flag_scale'] == "CRITICAL" or flags['flag_history_length'] == "CRITICAL" or flags['flag_liquidity'] == "CRITICAL":
             flags['trust_score'] = 0
         else:
-            if flags['flag_scale'] != "OK":
-                t_score -= 1
             flags['trust_score'] = max(0, t_score)
 
         return flags
 
     def get_history_batch(self, tickers: List[str]) -> Dict[str, Tuple[float, float, float, Dict]]:
+        from core.data_pipeline import fetch_ticker_prices_robustly
+        
         version = self._get_cache_version_string()
         results = {}
         to_fetch = []
         
         sma_len = int(self.config.get('sma_length', 130))
-        for t in tickers:
+        for t in sorted(list(set(tickers))):
             key = f"{t}_{version}"
+            
+            # Hebel B: Bekannte Yahoo-Leichen (Not Found) überspringen
+            info = self.info_cache.get(t, {})
+            if info.get('not_found') is True and t not in self.whitelist:
+                # Prüfe Ablaufdatum für Negative Caching
+                cached_at_str = info.get('cached_at', "")
+                try:
+                    cached_at = datetime.datetime.fromisoformat(cached_at_str)
+                    age_days = (datetime.datetime.now() - cached_at).days
+                    if age_days < int(self.config.get('not_found_expiry_days', 30)):
+                        continue
+                except:
+                    continue # Bei Fehlern im Datumsformat lieber überspringen
+                
             if key in self.cache:
                 c = self.cache[key]
                 results[t] = (c['curr'], c['sma'], c.get('vol_eur', 0.0), c['flags'])
             else:
                 to_fetch.append(t)
         
+        def _mark_as_failed_persistently(ticker_sym, reason="empty_history"):
+            """Markiert einen Ticker im Info-Cache als dauerhaft (30 Tage) blockiert."""
+            with self.lock:
+                self.info_cache[ticker_sym] = {
+                    'not_found': True,
+                    'cached_at': datetime.datetime.now().isoformat(),
+                    'reason': reason,
+                    'sector': 'Unknown',
+                    'industry': 'Unknown'
+                }
+
         if not to_fetch:
-            self.last_history_batch_used_network = False
             return results
 
-        self.last_history_batch_used_network = True
         try:
-            # Batch-Download bleibt wie gehabt
-            data = yf.download(to_fetch, period=self.config.get('history_period', '18mo'), group_by='ticker', auto_adjust=False, threads=True, progress=False)
-            
+            # Hebel C: Primärer Batch-Download
+            batch_data = yf.download(
+                to_fetch,
+                period=self.config.get('history_period', '18mo'),
+                group_by='ticker',
+                auto_adjust=False,
+                threads=False,
+                progress=False
+            )
+
+            is_multi = isinstance(batch_data.columns, pd.MultiIndex)
+
+            # Hebel: Falls nur 1 Ticker im Batch ist, liefert yfinance keinen MultiIndex.
+            # Wir erzwingen die Struktur, damit _extract_ticker_df immer funktioniert.
+            if not is_multi and len(to_fetch) == 1:
+                batch_data = pd.concat({to_fetch[0]: batch_data}, axis=1)
+                is_multi = True
+
+            def _extract_ticker_df(data, ticker, multi):
+                """Hilfsfunktion zur robusten Extraktion von Ticker-Daten aus Batch-Resultaten."""
+                if multi:
+                    if ticker not in data.columns.get_level_values(0):
+                        return None
+                    return data[ticker].copy()
+                return data.copy()
+
             def _process_single(t):
-                hist = data[t] if len(to_fetch) > 1 else data # type: ignore
-                if hist.empty or len(hist) < 10:
+                # 1. Versuche Daten aus dem Batch-Resultat zu extrahieren
+                hist = _extract_ticker_df(batch_data, t, is_multi)
+
+                # HEBEL: Vorab-Check auf offensichtlichen "Trash" im Batch
+                # (Ticker im Batch vorhanden, aber unbrauchbar). Verhindert nutzlose Retries.
+                is_trash_in_batch = False
+                if hist is not None:
+                    if hist.empty:
+                        is_trash_in_batch = True
+                    elif "Close" in hist.columns and hist["Close"].isna().all():
+                        is_trash_in_batch = True
+
+                if hist is not None and not hist.empty:
+                    # Datenbereinigung vor Validierung zur Vermeidung künstlicher NaNs
+                    hist = hist.sort_index()
+                    hist = hist[~hist.index.duplicated(keep="last")]
+                    hist = hist.ffill(limit=2)
+                
+                # 2. Validierung der Batch-Daten (NaN-Anteil, Länge)
+                # HEBEL: Dynamischer Threshold nach Markt (Asien braucht mehr Toleranz)
+                ticker_upper = str(t).upper()
+                if ticker_upper.endswith((".T", ".HK", ".KS", ".KQ", ".TW")):
+                    nan_limit = 0.25 # Asien: Sehr tolerant wegen Feiertags-Artefakten
+                else:
+                    nan_limit = 0.10 # US/Europa: Strenger (max 10% Lücken)
+
+                # Konsistenz-Fix: Batch muss dieselbe Spalte prüfen wie der Einzel-Download (Adj Close Prio)
+                check_col = "Adj Close" if "Adj Close" in (hist.columns if hist is not None else []) else "Close"
+                
+                is_valid = False
+                if hist is not None and not hist.empty:
+                    is_valid = (len(hist) >= 50 and 
+                                check_col in hist.columns and hist[check_col].isna().mean() < nan_limit)
+                
+                # 3. Gezielter robuster Einzel-Download NUR als Fallback bei fehlerhaften Batch-Daten
+                if hist is None:
+                    # Fall A: Ticker fehlte komplett im Batch -> Volle 3 Versuche
+                    hist = fetch_ticker_prices_robustly(t, period=self.config.get('history_period', '18mo'))
+                elif not is_valid:
+                    # Fall B: Daten waren da, aber unbrauchbar.
+                    # Wenn es nach "Trash" aussieht (leeres DF), versuchen wir es nur 1x dediziert.
+                    # Wenn es fast okay war (z.B. zu viele NaNs), nutzen wir die volle Retry-Logik.
+                    attempts = 1 if is_trash_in_batch else 3
+                    hist = fetch_ticker_prices_robustly(
+                        ticker=t,
+                        period=self.config.get('history_period', '18mo'),
+                        max_attempts=attempts,
+                        nan_threshold=nan_limit,
+                        fixed_sleep=0.2
+                    )
+
+                if hist is None or hist.empty or len(hist) < 50:
                     self.failed_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': 'Download leer oder zu kurz'}
+                    _mark_as_failed_persistently(t, "empty_or_short_history")
                     return None
                 
                 info = self.info_cache.get(t, {})
@@ -578,9 +678,21 @@ class MarketDataManager:
                 
                 repaired_df = analysis['history']
                 clean_col = analysis['rsl_price_column']
-                clean_series = repaired_df[clean_col].ffill()
                 
-                curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
+                # Hebel: Preis-Stabilisierung fuer SMA/Flags (limit=2)
+                clean_series = repaired_df[clean_col].ffill(limit=2)
+                
+                # Hebel: Aktueller Preis muss FRISCH sein.
+                # Wir nehmen den echten letzten Wert. Wenn dieser NaN ist, 
+                # maximal 2 Tage Fallback (limit=2).
+                raw_last = repaired_df[clean_col].iloc[-1]
+                if pd.notna(raw_last):
+                    curr = float(raw_last)
+                else:
+                    # Letzter Versuch: nur 2 Tage zurueck schauen
+                    valid_tail = clean_series.tail(3).dropna()
+                    curr = float(valid_tail.iloc[-1]) if not valid_tail.empty else 0.0
+                
                 sma = analysis.get('rsl_sma', curr)
                 rsl = analysis.get('rsl_value', 0.0)
                 
@@ -588,14 +700,45 @@ class MarketDataManager:
                 if is_young_history:
                     self.young_tickers[t] = {'ticker': t, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
 
-                vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-                
-                flags = self._calculate_flags(repaired_df, curr, sma, is_young_history, price_series=clean_series)
+                # HEBEL: Robuste Liquiditäts-Berechnung (Median Turnover 20T)
+                # Verhindert Verzerrung durch einzelne Volumen-Spikes bei Yahoo.
+                try:
+                    v_series = repaired_df.get('Volume', hist.get('Volume'))
+                    if v_series is not None:
+                        # Umsatz pro Tag berechnen (Volumen * Preis)
+                        daily_turnover = v_series.tail(20) * clean_series.tail(20)
+                        vol_eur = float(daily_turnover.median())
+                    else:
+                        vol_eur = 0.0
+                except:
+                    vol_eur = 0.0
 
                 # Marktkapitalisierung und Marktwert (EUR) berechnen
                 info = self.info_cache.get(t, {})
                 mkt_cap_raw = float(info.get('marketCap', 0) or 0)
                 mkt_val_eur = mkt_cap_raw * f
+                
+                # HEBEL: Robuster Größen-Proxy (falls Market Cap missing/0)
+                # Wir nutzen 252 * Median Turnover * 0.5 (Penalty) als konservative Schätzung.
+                is_proxy = mkt_cap_raw <= 0
+                if is_proxy and vol_eur > 0:
+                    mkt_val_eur = vol_eur * 252 * 0.5
+
+                # Flags berechnen (inkl. Trust Score 5er-Skala)
+                flags = self._calculate_flags(
+                    repaired_df, 
+                    curr, 
+                    sma, 
+                    is_young_history=is_young_history, 
+                    price_series=clean_series, 
+                    market_cap=mkt_cap_raw
+                )
+
+                # --- AUTO-SIEVE LOGIK (Bereinigt) ---
+                if analysis.get('excluded_from_ranking', False):
+                    # Markiere Ticker als persistent fehlerhaft, wenn sie nicht auf der Whitelist stehen
+                    reason = analysis.get('integrity_reasons', ["unknown_fail"])[0]
+                    # Wir geben die Daten trotzdem zurück, damit sie im Audit/Integrity-Sheet erscheinen
 
                 flags.update({
                     'rsl': rsl,
@@ -608,7 +751,8 @@ class MarketDataManager:
                     'rsl_price_source': (analysis.get('diagnostics', {}) or {}).get('rsl_price_source_mode', 'adj_close'),
                     'fallback_fraction': float((analysis.get('diagnostics', {}) or {}).get('fallback_fraction', 0.0) or 0.0),
                     'market_cap': mkt_cap_raw,
-                    'market_value': mkt_val_eur
+                    'market_value': mkt_val_eur,
+                    'is_size_proxy': is_proxy
                 })
                 return t, (curr, sma, vol_eur, flags)
 
@@ -631,13 +775,43 @@ class MarketDataManager:
     def get_history_single(self, ticker: str) -> Optional[Tuple[float, float, float, Dict]]:
         version = self._get_cache_version_string()
         key = f"{ticker}_{version}"
+
+        # Vorab-Check auf persistente Fehler (30-Tage-Sperre)
+        info = self.info_cache.get(ticker, {})
+        if info.get('not_found') is True and ticker not in self.whitelist:
+            cached_at_str = info.get('cached_at', "")
+            try:
+                cached_at = datetime.datetime.fromisoformat(cached_at_str)
+                age_days = (datetime.datetime.now() - cached_at).days
+                if age_days < int(self.config.get('not_found_expiry_days', 30)):
+                    return None
+            except:
+                pass
+
         if key in self.cache:
             c = self.cache[key]
             return (c['curr'], c['sma'], c.get('vol_eur', 0.0), c['flags'])
         
         try:
             hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=False)
-            if hist.empty: return None
+            
+            if not hist.empty:
+                # Datenbereinigung für Konsistenz zum Batch-Pfad
+                hist = hist.sort_index()
+                hist = hist[~hist.index.duplicated(keep="last")]
+                hist = hist.ffill(limit=2)
+
+            if hist.empty or len(hist) < 50:
+                with self.lock:
+                    self.info_cache[ticker] = {
+                        'not_found': True,
+                        'cached_at': datetime.datetime.now().isoformat(),
+                        'reason': 'empty_history_single',
+                        'sector': 'Unknown',
+                        'industry': 'Unknown'
+                    }
+                return None
+
             info = self.get_cached_info(ticker) or {}
             f = self._get_currency_factor(ticker, info_currency=info.get('currency'))
             hist_adj = hist.copy()
@@ -650,20 +824,43 @@ class MarketDataManager:
             
             repaired_df = analysis['history']
             clean_col = analysis['rsl_price_column']
-            clean_series = repaired_df[clean_col].ffill()
             
-            curr = float(clean_series.iloc[-1]) if not clean_series.empty else 0.0
+            # Zentrales Filling: Ab hier arbeiten wir auf der stabilisierten Serie
+            clean_series = repaired_df[clean_col].ffill(limit=2)
+            
+            # Kursermittlung nutzt dropna für Robustheit am Ende
+            cs_tmp = clean_series.dropna()
+            curr = float(cs_tmp.iloc[-1]) if not cs_tmp.empty else 0.0
             sma = analysis.get('rsl_sma', curr)
             rsl = analysis.get('rsl_value', 0.0)
             is_young_history = len(clean_series.dropna()) < sma_len
             if is_young_history:
                 self.young_tickers[ticker] = {'ticker': ticker, 'count': 1, 'top_reason': f'Historie zu kurz (<{sma_len})'}
 
-            vol_eur = float(hist['Volume'].ffill().tail(20).mean() * curr) if 'Volume' in hist.columns else 0.0
-            flags = self._calculate_flags(repaired_df, curr, sma, is_young_history, price_series=clean_series)
-            
+            # HEBEL: Robuste Liquiditäts-Berechnung (Median Turnover 20T)
+            try:
+                v_series = repaired_df.get('Volume', hist.get('Volume'))
+                if v_series is not None:
+                    daily_turnover = v_series.tail(20) * clean_series.tail(20)
+                    vol_eur = float(daily_turnover.median())
+                else:
+                    vol_eur = 0.0
+            except:
+                vol_eur = 0.0
+
             info = self.info_cache.get(ticker, {})
             mkt_cap_raw = float(info.get('marketCap', 0) or 0)
+
+            # Flags berechnen (inkl. Trust Score 5er-Skala)
+            flags = self._calculate_flags(
+                repaired_df, 
+                curr, 
+                sma, 
+                is_young_history=is_young_history, 
+                price_series=clean_series,
+                market_cap=mkt_cap_raw
+            )
+            
             mkt_val_eur = mkt_cap_raw * f
             
             flags.update({
@@ -683,23 +880,70 @@ class MarketDataManager:
             with self.lock:
                 self.cache[key] = {'curr': curr, 'sma': sma, 'vol_eur': vol_eur, 'flags': flags, 'timestamp': time.time()}
             return (curr, sma, vol_eur, flags)
-        except: return None
+        except Exception as e:
+            logger.debug(f"Fehler bei get_history_single für {ticker}: {e}")
+            return None
 
-    @retry_decorator
     def fetch_and_cache_info(self, ticker: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         # Cache nur nutzen, wenn kein Force-Refresh angefordert wurde
-        # UND wenn die Marktkapitalisierung im Cache valide (> 0) ist.
         if not force_refresh and ticker in self.info_cache:
             cached = self.info_cache[ticker]
-            if float(cached.get('marketCap', 0) or 0) > 0:
-                return cached
+            
+            # Falls bereits bekannt als "not_found", prüfe Ablaufdatum
+            if cached.get('not_found') is True and ticker not in self.whitelist:
+                try:
+                    cached_at = datetime.datetime.fromisoformat(cached.get('cached_at', ""))
+                    age_days = (datetime.datetime.now() - cached_at).days
+                    if age_days < int(self.config.get('not_found_expiry_days', 30)):
+                        return None # Immer noch im "Not Found" Cache-Zeitraum
+                except:
+                    return None
+
+            # Hebel: TTL für existierende Daten (Standard: 7 Tage), nutzt support.to_float
+            mkt_cap = support.to_float(cached.get('marketCap', 0))
+            if mkt_cap > 0:
+                try:
+                    cached_at = datetime.datetime.fromisoformat(cached.get('cached_at', ""))
+                    age_days = (datetime.datetime.now() - cached_at).days
+                    if age_days < int(self.config.get('info_cache_expiry_days', 7)):
+                        return cached
+                except:
+                    pass # Bei Datumsfehlern einfach neu laden
 
         # Präventiver Delay vor dem Request, um Rate Limits zu vermeiden
         delay = float(self.config.get('info_fetch_delay_s', 2.0))
         if delay > 0:
             time.sleep(delay)
 
-        info = yf.Ticker(ticker).info
+        try:
+            t_obj = yf.Ticker(ticker)
+            info = t_obj.info
+            
+            # Stabilitäts-Hebel: fast_info Fallback für Market Cap & Currency
+            # info ist oft leer oder unvollständig, fast_info nutzt einen stabileren Endpoint
+            try:
+                fast = getattr(t_obj, "fast_info", None)
+                if fast:
+                    if not info: info = {}
+
+                    def _safe_fast_get(obj: Any, key: str) -> Any:
+                        if hasattr(obj, "get"):
+                            return obj.get(key) or obj.get(key.lower()) or obj.get(key.upper())
+                        # Fallback fuer Wrapper-Objekte
+                        val = getattr(obj, key, None)
+                        if val is None:
+                            val = getattr(obj, key.lower(), None)
+                        return val
+
+                    mc = _safe_fast_get(fast, "market_cap") or _safe_fast_get(fast, "marketCap")
+                    curr = _safe_fast_get(fast, "currency")
+                    if not info.get('marketCap'): info['marketCap'] = mc
+                    if not info.get('currency'): info['currency'] = curr
+            except:
+                pass
+        except Exception:
+            info = None
+
         if info:
             # ISIN Validierung: Verhindert, dass 'nan' oder '0' als ISIN gecached werden
             raw_isin = str(info.get('isin', '')).strip().upper()
@@ -732,7 +976,16 @@ class MarketDataManager:
             with self.lock:
                 self.info_cache[ticker] = clean_info
             return clean_info
-        return None
+        else:
+            # Not Found im Cache vermerken, um Yahoo-Anfragen in Zukunft zu sparen
+            with self.lock:
+                self.info_cache[ticker] = {
+                    'not_found': True,
+                    'cached_at': datetime.datetime.now().isoformat(),
+                    'sector': 'Unknown',
+                    'industry': 'Unknown'
+                }
+            return None
 
     def get_cached_info(self, ticker: str) -> Optional[Dict[str, Any]]:
         return self.info_cache.get(ticker)
