@@ -722,48 +722,6 @@ def show_ticker_history_interactive(yf_module: Any = yf) -> None:
     except Exception as exc:
         print(f"\033[91mFehler beim Abrufen der Historie: {exc}\033[0m")
 
-
-def auto_adjust_delays(
-    config: Dict[str, Any], 
-    load_json_config: Callable[..., Any], 
-    save_json_config: Callable[[str, Any], None],
-    logger: Any
-) -> None:
-    try:
-        stats = load_json_config(config["run_stats_file"])
-        last_hits = int(stats.get("last_rate_limit_hits", -1))
-        if last_hits == -1:
-            return
-        min_s = float(config.get("batch_sleep_min_s", 0.5))
-        max_s = float(config.get("batch_sleep_max_s", 1.5))
-        info_s = float(config.get("info_fetch_delay_s", 0.7))
-        if last_hits == 0:
-            factor = 0.95
-            min_s = max(0.05, min_s * factor)
-            max_s = max(0.1, max_s * factor)
-            info_s = max(0.05, info_s * factor)
-            logger.info(f"AUTO-OPTIMIZE: Keine Rate-Limits im letzten Lauf. Delays werden verkuerzt (Faktor {factor}).")
-        elif last_hits > 10:
-            factor = 1.10
-            min_s = min(2.0, min_s * factor)
-            max_s = min(3.0, max_s * factor)
-            info_s = min(2.5, info_s * factor)
-            logger.info(f"AUTO-OPTIMIZE: {last_hits} Rate-Limits im letzten Lauf. Delays werden erhoeht (Faktor {factor}).")
-        config["batch_sleep_min_s"], config["batch_sleep_max_s"], config["info_fetch_delay_s"] = min_s, max_s, info_s
-        
-        # Persistente Speicherung der optimierten Werte in user_settings.json
-        user_settings = load_json_config(config["user_settings_file"])
-        if isinstance(user_settings, dict):
-            user_settings["batch_sleep_min_s"] = round(min_s, 3)
-            user_settings["batch_sleep_max_s"] = round(max_s, 3)
-            user_settings["info_fetch_delay_s"] = round(info_s, 3)
-            save_json_config(config["user_settings_file"], user_settings)
-            logger.info("AUTO-OPTIMIZE: Optimierte Werte wurden in den Benutzereinstellungen gespeichert.")
-
-    except Exception:
-        pass
-
-
 def initialize_run_settings(
     data_mgr: MarketDataManager,
     config: Dict[str, Any],
@@ -773,7 +731,6 @@ def initialize_run_settings(
     currency_rates: Dict[str, Any],
 ) -> None:
     logger.info("\n--- INITIALISIERUNG ANALYSE-LAUF ---")
-    auto_adjust_delays(config, load_json_config, save_json_config, logger)
     update_live_currency_rates(currency_rates, logger)
     if os.path.exists(config["history_cache_file"]):
         try:

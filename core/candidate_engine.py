@@ -50,6 +50,15 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
+def _winsorize_array(arr: np.ndarray, limits: Tuple[float, float] = (1, 99)) -> np.ndarray:
+    """Clippt extreme Ausreisser auf Perzentil-Basis zur numerischen Stabilitaet."""
+    if arr.size < 10: return arr
+    # HEBEL: 1/99 Winsorization fuer grosse Universen (erhaelt mehr Trend-Information)
+    low = np.nanpercentile(arr, limits[0]) 
+    high = np.nanpercentile(arr, limits[1])
+    return np.clip(arr, low, high)
+
+
 def suggest_portfolio_candidates(
     stock_results: List[Any],
     industry_summary: Any,
@@ -113,15 +122,53 @@ def suggest_portfolio_candidates(
 
     # 2. Data Preparation & Orthogonalization
     # Wir extrahieren Vektoren fuer die vektorisierte Berechnung
-    # FIX: Nutze Raw Momentum (mom_score) statt Risk-Adjusted (mom_score_adj),
-    # da Volatilitaet explizit im Risk-Modell (z_vol) beruecksichtigt wird.
-    mom_vec = np.asarray([_coerce_float(s.mom_score, _coerce_float(s.mom_score_adj, s.rsl - 1.0)) for s in analysis_pool], dtype=float).ravel()
-    accel_vec = np.asarray([_coerce_float(s.mom_accel) for s in analysis_pool], dtype=float).ravel()
-    dd_vec = np.asarray([abs(_coerce_float(s.max_drawdown_6m)) for s in analysis_pool], dtype=float).ravel()
-    ulcer_vec = np.asarray([_coerce_float(getattr(s, "ulcer_index_6m", 0.0)) for s in analysis_pool], dtype=float).ravel()
-    peer_vec = np.asarray([_coerce_float(s.peer_spread) for s in analysis_pool], dtype=float).ravel()
-    vol_vec = np.asarray([_coerce_float(s.mom_vol, 0.2) for s in analysis_pool], dtype=float).ravel()
-    rsl_1w_vec = np.asarray([_coerce_float(s.rsl_change_1w) for s in analysis_pool], dtype=float).ravel()
+    # HEBEL: Sofortige Winsorization (1/99) aller Inputs zur Vermeidung von GS-Explosionen
+    win_limits = (1, 99)
+    mom_vec = _winsorize_array(np.asarray([_coerce_float(s.mom_score, s.rsl - 1.0) for s in analysis_pool], dtype=float), win_limits)
+    accel_vec = _winsorize_array(np.asarray([_coerce_float(s.mom_accel) for s in analysis_pool], dtype=float), win_limits)
+    dd_vec = _winsorize_array(np.asarray([abs(_coerce_float(s.max_drawdown_6m)) for s in analysis_pool], dtype=float), win_limits)
+    ulcer_vec = _winsorize_array(np.asarray([_coerce_float(getattr(s, "ulcer_index_6m", 0.0)) for s in analysis_pool], dtype=float), win_limits)
+    peer_vec = _winsorize_array(np.asarray([_coerce_float(s.peer_spread) for s in analysis_pool], dtype=float), win_limits)
+    vol_vec = _winsorize_array(np.asarray([_coerce_float(s.mom_vol, 0.2) for s in analysis_pool], dtype=float), win_limits)
+    rsl_1w_vec = _winsorize_array(np.asarray([_coerce_float(s.rsl_change_1w) for s in analysis_pool], dtype=float), win_limits)
+    mkt_val_vec = np.asarray([_coerce_float(s.market_value) for s in analysis_pool], dtype=float)
+
+    # HEBEL: Dual-Regime Definition (Large vs. Small Cap)
+    # Wir trennen das Universum, um Large-Cap Faktorstrukturen nicht auf Small-Caps zu projizieren.
+    large_cap_threshold = 500_000_000
+    large_mask = np.asarray([
+        (_coerce_float(s.market_value) > large_cap_threshold and 
+         _coerce_float(getattr(s, "primary_liquidity_eur", 0.0)) > 250_000)
+        for s in analysis_pool
+    ], dtype=bool)
+    # Falls zu wenig Large-Caps (z.B. Ad-hoc), nutzen wir das volle Universum als Basis
+    if large_mask.sum() < 30: large_mask = np.ones(len(analysis_pool), dtype=bool)
+
+    def _dual_orthogonalize(target_v, base_v_list, shrink_val):
+        """Rechnet getrennte Regressionen für Large/Small und blendet diese."""
+        # 1. Large Cap Modell
+        res_large = np.array(orthogonalize_multi(target_v.tolist(), base_v_list, shrinkage=shrink_val, train_mask=large_mask))
+        
+        # 2. Small Cap Modell (nur wenn genug Daten vorhanden)
+        small_mask = ~large_mask
+        if small_mask.sum() >= 30:
+            res_small = np.array(orthogonalize_multi(target_v.tolist(), base_v_list, shrinkage=shrink_val, train_mask=small_mask))
+            # Soft Blend via Sigmoid um die 500 Mio. EUR Grenze
+            # 5% Floor/Ceiling verhindert totale Regime-Dominanz
+            blend_weights = 0.05 + 0.90 / (1 + np.exp(-(mkt_val_vec - 500_000_000) / 250_000_000))
+            blended = (blend_weights * res_large + (1.0 - blend_weights) * res_small)
+            
+            med, sig = _compute_robust_stats(blended.tolist())
+            if sig < 1e-6: return np.zeros_like(blended).tolist()
+            
+            z_blended = np.array([_zscore(x, med, sig) for x in blended])
+            return np.clip(z_blended, -5.0, 5.0).tolist() # Stabilisierung gegen Fehlerfortpflanzung
+        
+        med, sig = _compute_robust_stats(res_large.tolist())
+        if sig < 1e-6: return np.zeros_like(res_large).tolist()
+        
+        z_large = np.array([_zscore(x, med, sig) for x in res_large])
+        return np.clip(z_large, -5.0, 5.0).tolist()
 
     # FIX 1: Stabilisierte Dynamische Shrinkage via Spearman-Rangkorrelation
     def _dynamic_shrink(target_v, base_v):
@@ -134,10 +181,12 @@ def suggest_portfolio_candidates(
             return 0.5
 
         try:
-            # Spearman ist robuster gegen Fat-Tails und instabile Regimes
+            pearson = float(np.corrcoef(t_v, b_v)[0, 1])
             res = scipy.stats.spearmanr(t_v, b_v)
-            # Statistik extrahieren und sicherstellen, dass es ein skalarer float ist
             corr = float(getattr(res, 'statistic', res[0]))
+            
+            # HEBEL: Gewichtetes Blending (70% min / 30% max) - weniger Informationsverlust
+            corr = np.sign(pearson) * (0.7 * min(abs(pearson), abs(corr)) + 0.3 * max(abs(pearson), abs(corr)))
         except Exception:
             return 0.5
 
@@ -153,20 +202,19 @@ def suggest_portfolio_candidates(
     shrink_dd_accel = float(_dynamic_shrink(dd_vec, accel_vec))
     shrink_dd_peer = float(_dynamic_shrink(dd_vec, peer_vec))
 
-    # FIX 3: Gram-Schmidt Style Orthogonalisierung (Sequential & Clean)
-    # Verhindert Factor-Leakage durch saubere Trennung der Signale
+    # HEBEL: Residualisierung via Core-Universe (Betas von stabilen Aktien)
+    # Verhindert, dass Müll-Daten das Alpha-Signal verzerren.
     
     # 1. Accel gegen Momentum (Partial: dynamische Shrinkage)
-    accel_res = orthogonalize_multi(accel_vec.tolist(), [mom_vec.tolist()], shrinkage=shrink_accel_mom)
+    accel_res = _dual_orthogonalize(accel_vec, [mom_vec.tolist()], shrink_accel_mom)
     
     # 2. Peer gegen Momentum UND Accel (bereinigt)
-    # FIX: Durchschnittliche Shrinkage statt Max, um Signalverlust zu vermeiden
     peer_shrink = float(np.mean([shrink_peer_mom, shrink_peer_accel]))
-    peer_res = orthogonalize_multi(peer_vec.tolist(), [mom_vec.tolist(), accel_res], shrinkage=peer_shrink)
+    peer_res = _dual_orthogonalize(peer_vec, [mom_vec.tolist(), accel_res], peer_shrink)
     
     # 3. Drawdown gegen Momentum, Accel UND Peer (alle bereinigt)
     dd_shrink = float(np.mean([shrink_dd_mom, shrink_dd_accel, shrink_dd_peer]))
-    dd_res = orthogonalize_multi(dd_vec.tolist(), [mom_vec.tolist(), accel_res, peer_res], shrinkage=dd_shrink)
+    dd_res = _dual_orthogonalize(dd_vec, [mom_vec.tolist(), accel_res, peer_res], dd_shrink)
     
     # 3. Sector-Neutral Z-Scoring (Within-Sector Standardization)
     # Wir berechnen Z-Scores pro Sektor. Fallback auf Global, wenn Sektor zu klein.
@@ -188,10 +236,10 @@ def suggest_portfolio_candidates(
     z_scores: List[Dict[str, float]] = [{} for _ in analysis_pool]
 
     for sector, indices in sector_map.items():
-        # FIX 2: Sector Blending statt Hard Switch (Pro-Level Stabilitaet)
-        # Kleine Sektoren verursachen instabile Z-Scores -> Blending mit Global Stats
         size = len(indices)
-        w = min(1.0, size / 30.0) # Ab 30 Aktien voll sektor-neutral, darunter blending
+        # HEBEL: Unter 5 Aktien ist ein Sektor-Signal statistisch wertlos (Rauschen)
+        if size < 5: w = 0.0
+        else: w = min(1.0, size / 30.0) 
         
         # Sektor-lokale Daten extrahieren
         s_mom = [mom_vec[i] for i in indices]
@@ -222,8 +270,25 @@ def suggest_portfolio_candidates(
         }
         
         for i_local, idx_global in enumerate(indices):
+            # Korrekturmission: Konsistente Momentum-Z-Score Logik
+            val = float(mom_vec[idx_global])
+            mean, std = stats_source['mom']
+
+            zero_sigma = std < 1e-6
+            if zero_sigma:
+                raw_z = 0.0
+                final_z = 0.0
+            else:
+                raw_z = (val - mean) / std
+                final_z = float(np.clip(raw_z, -5.0, 5.0))
+            
+            clipped = abs(raw_z) > 5.0
+
             z_scores[idx_global] = {
-                'z_mom': float(_zscore(float(mom_vec[idx_global]), *stats_source['mom'])),
+                'z_mom_final': final_z,
+                'z_mom_raw': raw_z,
+                'z_mom_clipped': clipped,
+                'z_mom_zero_sigma': zero_sigma,
                 'z_accel': float(_zscore(float(accel_res[idx_global]), *stats_source['accel'])),
                 'z_peer': float(_zscore(float(peer_res[idx_global]), *stats_source['peer'])),
                 'z_dd': float(_zscore(float(dd_res[idx_global]), *stats_source['dd'])),
@@ -277,8 +342,6 @@ def suggest_portfolio_candidates(
         # --- RISING STAR LOGIC ---
         # Fokus auf Top 1% (hold_rank). Wir lassen Aktien bis Top 3% zu, 
         # WENN sie eine starke Aufwärtsdynamik haben (Wildcard).
-        zs = z_scores[i]
-        
         is_rising_star = False
         # Wenn nicht in Top 1%, aber in Top 3% -> Check auf "Auf dem Weg nach oben"
         if require_top and hold_rank is not None and not is_top_tier and current_rank <= (hold_rank * 3):
@@ -286,7 +349,7 @@ def suggest_portfolio_candidates(
             # UPDATE: Zusätzlicher Schutz durch R²-Smoothness (>0.6) und Volatilitäts-Cap (Z_Vol < 1.5)
             r2_val = _coerce_float(stock.trend_smoothness)
             if _coerce_float(stock.rsl_change_1w) > 0.005 and _coerce_float(stock.mom_accel) > 0:
-                if r2_val > 0.6 and zs['z_vol'] < 1.5:
+                if r2_val > 0.6 and z_scores[i]['z_vol'] < 1.5:
                     is_rising_star = True
         
         if require_top and hold_rank is not None and not is_top_tier and not is_rising_star:
@@ -321,7 +384,7 @@ def suggest_portfolio_candidates(
         if use_cluster_filter and allowed_clusters and stock.mom_cluster not in allowed_clusters:
             penalties_context['cluster_out'] = 0.3
             
-        final_score, details = _calculate_institutional_score(stock, zs, config, penalties_context, regime_status)
+        final_score, details = _calculate_institutional_score(stock, z_scores[i], config, penalties_context, regime_status)
         industry_row = industry_lookup.get(str(stock.industry or "").strip(), {})
         cluster_key = str(getattr(stock, "mom_cluster", "") or "").strip()
         cluster_row = cluster_lookup.get(cluster_key, {})
@@ -346,6 +409,11 @@ def suggest_portfolio_candidates(
                 "distance_52w_high_pct": getattr(stock, "distance_52w_high_pct", None),
                 "max_distance_52w_high_pct": max_distance_52w_high_pct,
                 "peer_spread": getattr(stock, "peer_spread", None),
+                "z_mom_raw": z_scores[i]["z_mom_raw"],
+                "z_mom_clipped": z_scores[i]["z_mom_clipped"],
+                "z_mom_zero_sigma": z_scores[i]["z_mom_zero_sigma"],
+                "z_mom_final": z_scores[i]["z_mom_final"],
+                "size_proxy_used": getattr(stock, "is_size_proxy", False),
             }
         )
          
@@ -424,10 +492,11 @@ def orthogonalize_multi(
     target: List[float],
     bases: List[List[float]],
     shrinkage: float = 1.0,
-    min_obs: int = 30
+    min_obs: int = 30,
+    train_mask: Optional[np.ndarray] = None
 ) -> List[float]:
     """
-    Residualisiert target linear gegen die Basisfaktoren mittels OLS.
+    Residualisiert target linear gegen die Basisfaktoren mittels OLS (Betas via train_mask).
     shrinkage = 0.0 -> original
     shrinkage = 1.0 -> vollständiges Residuum
     """
@@ -442,36 +511,31 @@ def orthogonalize_multi(
         return y_raw.tolist()
 
     # NaN-Handling: Nur Zeilen ohne NaNs für die Regression nutzen
-    mask = np.isfinite(y_raw) & np.all(np.isfinite(X_raw), axis=1)
-    if mask.sum() < min_obs:
+    finite_mask = np.isfinite(y_raw) & np.all(np.isfinite(X_raw), axis=1)
+    
+    # HEBEL: Nutze nur Core-Universe fuer Beta-Berechnung, falls Maske vorhanden
+    reg_mask = finite_mask & train_mask if train_mask is not None else finite_mask
+    
+    if reg_mask.sum() < min_obs:
         return y_raw.tolist()
 
-    y = y_raw[mask]
-    X = X_raw[mask]
+    y_train = y_raw[reg_mask]
+    X_train = X_raw[reg_mask]
 
-    # Robuste Standardisierung vor der Regression
-    y_med, y_mad = np.median(y), np.median(np.abs(y - np.median(y)))
-    y_scale = max(1.4826 * y_mad, 1e-8)
-    y_std = (y - y_med) / y_scale
-
-    X_std = np.zeros_like(X, dtype=float)
-    for j in range(X.shape[1]):
-        xj = X[:, j]
-        x_med, x_mad = np.median(xj), np.median(np.abs(xj - np.median(xj)))
-        X_std[:, j] = (xj - x_med) / max(1.4826 * x_mad, 1e-8)
-
-    X_design = np.column_stack([np.ones(len(y_std)), X_std])
-
+    # Regression auf dem Training-Set (Core)
+    X_design_train = np.column_stack([np.ones(len(y_train)), X_train])
     try:
-        beta, _, _, _ = np.linalg.lstsq(X_design, y_std, rcond=None)
-        residual = y_std - (X_design @ beta)
-        out_valid = (1.0 - shrinkage) * y_std + shrinkage * residual
+        beta, _, _, _ = np.linalg.lstsq(X_design_train, y_train, rcond=None)
+        
+        # Anwendung auf den GESAMTEN Vektor
+        X_design_full = np.column_stack([np.ones(len(y_raw)), X_raw])
+        residual = y_raw - (X_design_full @ beta)
+        out_valid = (1.0 - shrinkage) * y_raw + shrinkage * residual
     except Exception:
         return y_raw.tolist()
 
-    out = np.full_like(y_raw, np.nan, dtype=float)
-    out[mask] = out_valid
-    out[~mask] = y_raw[~mask] # Fallback auf Original bei NaNs
+    out = out_valid.copy()
+    out[~finite_mask] = y_raw[~finite_mask] # Fallback auf Original bei NaNs
     return out.tolist()
 
 
@@ -483,8 +547,8 @@ def _compute_robust_stats(values: List[float], min_sigma: float = 1e-6) -> Tuple
     if arr.size == 0:
         return 0.0, 1.0
 
-    if arr.size > 20:
-        arr = np.clip(arr, np.percentile(arr, 2.5), np.percentile(arr, 97.5))
+    # Konsistente Winsorization (2/98) wie im Haupttool
+    if arr.size > 20: arr = np.clip(arr, np.percentile(arr, 1), np.percentile(arr, 99))
 
     median = float(np.median(arr))
     mad = float(np.median(np.abs(arr - median)))
@@ -494,10 +558,10 @@ def _compute_robust_stats(values: List[float], min_sigma: float = 1e-6) -> Tuple
 
 
 def _zscore(val: float, mean: float, std: float) -> float:
-    if std <= 0: return 0.0
+    if std < 1e-6: return 0.0
     z = (val - mean) / std
-    # Clamp to avoid outliers dominating (-3 to +3)
-    return float(max(-3.0, min(3.0, float(z))))
+    # Clipping erfolgt nun zentral in der Regressions-Helper-Logik auf +/- 5
+    return float(z)
 
 
 def _calculate_institutional_score(
@@ -519,7 +583,7 @@ def _calculate_institutional_score(
 
     # 1) ALPHA (Regime-unabhängige Trendstärke)
     alpha = (
-        1.00 * zs.get('z_mom', 0.0) +
+        1.00 * zs.get('z_mom_final', 0.0) +
         accel_w * zs.get('z_accel', 0.0) +
         peer_w * zs.get('z_peer', 0.0) +
         rsl_1w_w * zs.get('z_rsl_1w', 0.0)
@@ -547,9 +611,22 @@ def _calculate_institutional_score(
     if getattr(stock, 'flag_scale', 'OK') != 'OK': quality_penalty += 0.20
     if getattr(stock, 'flag_history_length', 'OK') != 'OK': quality_penalty += 0.10
 
-    # Trust Bonus nur bei perfekter Datenbasis
-    trust_bonus = 0.03 * max(0, min(getattr(stock, 'trust_score', 3), 3) - 2)
-    quality = np.clip(1.0 - quality_penalty + trust_bonus, 0.65, 1.03)
+    # HEBEL: Confidence-Multiplikator (0.0 bis 1.0) basierend auf Trust Score 5.
+    # Eine Confidence < 0.8 drückt den Score massiv (Schutz vor Selection Bias).
+    # UPDATE: Wechsel auf additives Penalty-System zur Vermeidung von EM-Märkte Bias.
+    raw_trust = float(getattr(stock, 'trust_score', 3))
+    confidence = np.clip(raw_trust / 5.0, 0.5, 1.0)
+    
+    confidence_penalty = (1.0 - confidence) * 0.4 # Gewicht k=0.4
+
+    # MODELL-INTELLIGENZ: Quality Control Layer
+    if zs.get('z_mom_zero_sigma'):
+        confidence_penalty += 0.15  # Harte Strafe für fehlende Varianz (Modell-Instabilität)
+    if zs.get('z_mom_clipped'):
+        confidence_penalty += 0.05  # Leichte Strafe für extreme Ausreißer (Clipping)
+
+    quality = np.clip((1.0 - quality_penalty), 0.60, 1.0)
+    # confidence fliesst nun subtraktiv in den final_score ein
 
     # 5) DENSITY (Belohnt nur Übereinstimmung positiver Signale)
     # FIX: Robustes Handling von Z-Scores für die Dichte-Berechnung
@@ -557,14 +634,16 @@ def _calculate_institutional_score(
     alpha_signals = [max(0.0, _coerce_float(zs.get(k, 0.0))) for k in z_keys]
     
     density_strength = sum(alpha_signals) / max(1.0, len(alpha_signals))
-    density_boost = np.clip(1.0 + 0.05 * density_strength, 1.0, 1.10)
+    # HEBEL: Cap bei 1.05 zur Vermeidung von Momentum-Doubling / Crowding-Risk
+    density_boost = np.clip(1.0 + 0.05 * density_strength, 1.0, 1.05)
 
     # Echte Factor Density für das Profil-Monitoring (Summe der absoluten Alpha-Z-Scores)
-    active_factor_sum = sum(abs(_coerce_float(zs.get(k, 0.0))) for k in ['z_mom', 'z_accel', 'z_peer', 'z_dd', 'z_vol', 'z_ulcer'])
+    active_factor_sum = sum(abs(_coerce_float(zs.get(k, 0.0))) for k in ['z_mom_final', 'z_accel', 'z_peer', 'z_dd', 'z_vol', 'z_ulcer'])
 
     # 6) FINALE BERECHNUNG
     raw_score = alpha - (lambda_risk * risk)
-    final_score = raw_score * quality * density_boost
+    # HEBEL: Alpha bleibt interpretierbar, Confidence bestraft unsaubere Daten am Ende.
+    final_score = (raw_score * quality * density_boost) - confidence_penalty
 
     return float(final_score), {
         "alpha": float(alpha),
@@ -574,7 +653,7 @@ def _calculate_institutional_score(
         "raw_score": float(raw_score),
         "active_factor_score": float(active_factor_sum),
         "penalty_multiplier": float(quality),
-        "base_score": _coerce_float(zs.get('z_mom', 0.0))
+        "base_score": _coerce_float(zs.get('z_mom_final', 0.0))
     }
 
 

@@ -96,7 +96,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # RSL Parameter
     "rsl_sma_window": 130,
-    "min_history_rows_for_rsl": 130,
+    "min_history_rows_for_rsl": 110,
 
     # Sekundärmarkthinweis nur als Review
     "foreign_secondary_suffixes": [".F", ".BE", ".MU", ".DU", ".SG", ".HM"],
@@ -300,8 +300,11 @@ def _safe_pct_diff(a: pd.Series, b: pd.Series) -> pd.Series:
     return ((a - b).abs() / denom.abs()).replace([np.inf, -np.inf], np.nan)
 
 
-def _rolling_sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window, min_periods=window).mean()
+def _rolling_sma(series: pd.Series, window: int, min_periods_ratio: float = 0.9) -> pd.Series:
+    # Hebel: Reduziert Age-Bias. Aktien ab ca. 117 Tagen Historie (bei 130er SMA)
+    # werden bereits gewertet, anstatt hart auf NaN zu bleiben.
+    mp = int(window * min_periods_ratio)
+    return series.rolling(window=window, min_periods=mp).mean()
 
 
 def _compute_rsl_from_series(price: pd.Series, sma_window: int = 130) -> pd.Series:
@@ -517,7 +520,8 @@ def validate_basic_history_integrity(
         diagnostics["avg_volume_20d"] = median_vol
         
         if median_vol <= 0:
-            reasons.add("zero_volume_listing_dead", "warning")
+            # Hebel: Ein Listing ohne Median-Volumen ist fuer Strategien unbrauchbar.
+            reasons.add("zero_volume_listing_dead", "hard_fail")
         elif (vol_series == 0).sum() > 15: # Mehr als 15 von 20 Tagen kein Handel
             reasons.add("extreme_intermittent_trading", "warning")
 
@@ -679,10 +683,16 @@ def detect_dividend_adjustment_issues(
     close = pd.to_numeric(df[close_col], errors="coerce")
     adj = pd.to_numeric(df[adj_col], errors="coerce")
 
+    # HEBEL: Penny-Stock Schutz. Unter 1.50 EUR ist Yahoo-Daten-Noise zu hoch.
+    # Wir skippen hier den komplexen Check, um Small Caps nicht zu zerstoeren.
+    if not close.empty and close.iloc[-1] < 1.50:
+        return reasons, diagnostics, pd.DataFrame()
+
     event_rows: List[Dict[str, Any]] = []
+    full_ratio_series = (adj / close.replace(0, np.nan))
 
     for dt in dividend_dates:
-        if dt not in df.index:
+        if dt not in df.index: 
             continue
 
         loc = df.index.get_loc(dt)
@@ -724,9 +734,37 @@ def detect_dividend_adjustment_issues(
 
         explained_gap = abs(ex_div / prior_close) if prior_close > 0 else np.nan
 
-        gap_series = _safe_pct_diff(w_adj, w_close)
-        median_gap = float(gap_series.median(skipna=True)) if len(gap_series.dropna()) else np.nan
-        max_gap = float(gap_series.max(skipna=True)) if len(gap_series.dropna()) else np.nan
+        # HEBEL: Zeitbasierte Anomalie statt Level. 
+        # Wir pruefen, ob sich das Verhaeltnis am Ex-Tag sprunghaft aendert.
+        window_ratio = full_ratio_series.iloc[start:end]
+        ratio_changes = full_ratio_series.iloc[start:end] / full_ratio_series.iloc[start:end].shift(1).replace(0, np.nan)
+        ratio_jump = float(ratio_changes.abs().max())
+        
+        # HEBEL: Reverse-Split Detektion. Wenn der Preis springt (> 5x), ist es ein Split.
+        # Wir skippen dann den Dividenden-Check, da Adj Close hier legitim springen muss.
+        raw_price_jump = float((close.iloc[loc] / close.iloc[loc-1]) if loc > 0 else 1.0)
+        likely_split = raw_price_jump > 4.5 or raw_price_jump < 0.22
+
+        # HEBEL: Drift Detection. Erkennt schleichende Fehlskalierungen bei Yahoo.
+        # Wenn sich die Ratio über 10 Tage stetig ändert (> 5% ohne Jump).
+        ratio_drift = float((full_ratio_series.iloc[loc] / full_ratio_series.iloc[max(0, loc-10)] - 1.0))
+
+        # HEBEL: Corporate Action Detection (Spin-offs etc.)
+        # Starker Preisabfall ohne Dividende deutet auf Spin-off hin.
+        # Das System soll hier NICHT auf Close switchen, da Yahoo Adj-Close oft korrekt anpasst.
+        likely_corp_action = (raw_price_jump < 0.75 and ex_div == 0)
+
+        # HEBEL: Post-Event Stability Check
+        # Wenn die Ratio nach dem Sprung stabil bleibt (niedrige StdDev), 
+        # ist es wahrscheinlich ein legitimes Event und kein Yahoo-Bug.
+        post_ratio = full_ratio_series.iloc[loc : min(len(full_ratio_series), loc + 6)]
+        is_post_stable = False
+        if len(post_ratio) >= 3:
+            is_post_stable = float(post_ratio.std()) < 0.02
+
+        # Abweichung vom gleitenden Median der Ratio (robust gegen Splits)
+        rolling_median = full_ratio_series.rolling(20, min_periods=5).median()
+        ratio_deviation = float(abs(full_ratio_series.loc[dt] / rolling_median.loc[dt] - 1.0)) if dt in rolling_median.index else 0.0
 
         close_ret = w_close.pct_change().replace([np.inf, -np.inf], np.nan)
         adj_ret = w_adj.pct_change().replace([np.inf, -np.inf], np.nan)
@@ -747,17 +785,22 @@ def detect_dividend_adjustment_issues(
             event_problem_severity = "hard_fail"
             event_reasons.append("negative_adjclose_in_dividend_window")
 
-        if np.isfinite(median_gap) and np.isfinite(explained_gap):
-            if median_gap > explained_gap + cfg["dividend_multiplier_tolerance"]:
-                event_reasons.append("adjclose_close_gap_unplausible_for_dividend")
-
-        if np.isfinite(max_gap):
-            if max_gap >= cfg["adj_close_gap_hard_threshold"]:
-                event_reasons.append("extreme_adjclose_close_gap_in_dividend_window")
-                event_problem_severity = event_problem_severity or "hard_fail"
-            elif max_gap >= cfg["adj_close_gap_warn_threshold"]:
-                event_reasons.append("large_adjclose_close_gap_in_dividend_window")
-                event_problem_severity = event_problem_severity or "warning"
+        # Neuer Trigger: Plötzliche Ratio-Änderung ohne ausreichende Dividende UND kein Split
+        if ratio_jump > 1.10 and explained_gap < 0.05 and not likely_split and not likely_corp_action and not is_post_stable:
+            event_reasons.append("unexplained_ratio_jump_likely_yahoo_bug")
+            event_problem_severity = "warning"
+        
+        if abs(ratio_drift) > 0.15 and ratio_jump < 1.05: # Drift ohne Jump
+            event_reasons.append("suspicious_adjustment_drift")
+            event_problem_severity = "warning"
+        
+        if likely_corp_action:
+            event_reasons.append("uncertain_corporate_action_detected")
+            event_problem_severity = "warning"
+        
+        if ratio_deviation > 0.25:
+            event_reasons.append("ratio_deviation_from_rolling_median")
+            event_problem_severity = event_problem_severity or "warning"
 
         if adj_worse_than_close:
             event_reasons.append("adjclose_discontinuity_worse_than_close")
@@ -774,7 +817,7 @@ def detect_dividend_adjustment_issues(
             if "adjclose_close_gap_unplausible_for_dividend" in event_reasons and sev != "hard_fail":
                 reasons.add("bad_dividend_adjustment", "warning")
             if "extreme_adjclose_close_gap_in_dividend_window" in event_reasons:
-                reasons.add("bad_dividend_adjustment", "warning")
+                reasons.add("bad_dividend_adjustment", "warning")            
             elif "large_adjclose_close_gap_in_dividend_window" in event_reasons:
                 reasons.add("bad_dividend_adjustment", "warning")
 
@@ -891,7 +934,12 @@ def build_rsl_price_series(
     diagnostics.update(div_diag)
 
     if not used_close_fallback and close_col is not None and adj_col is not None and not event_df.empty:
-        problem_events = event_df[event_df["event_reasons"].astype(str) != ""].copy()
+        # Nur Ticker mit echten Daten-Bugs (likely_yahoo_bug oder unplausible Gaps) triggern den Fallback.
+        # Uncertain Corporate Actions (Spin-offs) bleiben auf Adj-Close, da Yahoo dies meist korrekt berechnet.
+        problem_events = event_df[
+            (event_df["event_reasons"].astype(str).str.contains("likely_yahoo_bug")) |
+            (event_df["event_reasons"].astype(str).str.contains("unplausible"))
+        ].copy()
 
         if len(problem_events) > 0:
             before_n = int(cfg["dividend_window_before"])
@@ -937,8 +985,10 @@ def build_rsl_price_series(
     if len(valid_rsl_price.dropna()) < min_rows:
         reasons.add("insufficient_history_for_rsl", "hard_fail")
 
-    # Berechne RSL auf ffilled Preisen, um Lücken in der Historie zu überbrücken
-    rsl_series = _compute_rsl_from_series(valid_rsl_price.ffill(), int(cfg["rsl_sma_window"]))
+    # HEBEL: Kein unbounded ffill! Wir schliessen nur kleine Luecken (2 Tage).
+    # Verhindert kuenstliches Momentum bei Handelsaussetzungen.
+    price_stabilized = valid_rsl_price.ffill(limit=2)
+    rsl_series = _compute_rsl_from_series(price_stabilized, int(cfg["rsl_sma_window"]))
     df["rsl_value"] = rsl_series
 
     if len(rsl_series.dropna()) == 0 and len(valid_rsl_price.dropna()) >= min_rows:

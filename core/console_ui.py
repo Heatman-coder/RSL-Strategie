@@ -126,6 +126,12 @@ RAW_EXPORT_COLUMN_ORDER = [
     "multiscope_pct_global",
     "multiscope_pct_sector",
     "multiscope_pct_industry",
+    "candidate_z_mom_raw",
+    "candidate_z_mom_clipped",
+    "candidate_z_mom_zero_sigma",
+    "candidate_z_mom_final",
+    "candidate_size_proxy_used",
+    "candidate_final_score"
 ]
 
 
@@ -1115,6 +1121,16 @@ def render_analysis_output(
             suggested_candidates = candidate_result
         if not suggested_candidates:
             suggested_candidates = []
+
+        # MODELL-DEBUG SUMMARY (Korrekturmission)
+        debug_counts = {"clipped": 0, "zero_sigma": 0, "size_proxy": 0}
+        for det in candidate_details_map.values():
+            if det.get("z_mom_clipped"): debug_counts["clipped"] += 1
+            if det.get("z_mom_zero_sigma"): debug_counts["zero_sigma"] += 1
+            if det.get("size_proxy_used"): debug_counts["size_proxy"] += 1
+
+        print(f"\n[DEBUG] Modell-Transparenz: {debug_counts['clipped']} Clipped | "
+              f"{debug_counts['zero_sigma']} Zero-Sigma | {debug_counts['size_proxy']} Size-Proxies genutzt.")
 
         if suggested_candidates:
             def _fmt_component(value: Any) -> str:

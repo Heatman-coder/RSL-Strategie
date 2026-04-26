@@ -54,8 +54,14 @@ def apply_standard_rankings(stock_results: List[Any]) -> None:
     if not stock_results:
         return
 
-    # 1. RSL Ranking (Bester RSL = Rang 1)
-    stock_results.sort(key=lambda x: (float(getattr(x, 'rsl', 0.0)) if not np.isnan(float(getattr(x, 'rsl', 0.0))) else -1.0), reverse=True)
+    # 1. RSL Ranking (Bester RSL = Rang 1) mit Winsorization-Key
+    def _robust_rsl_sort(s):
+        val = float(getattr(s, 'rsl', 0.0))
+        if np.isnan(val) or np.isinf(val): return -1.0
+        # Cap fuer Ranking-Plausibilitaet (verhindert dominierende Bad Ticks)
+        return min(val, 5.0) 
+
+    stock_results.sort(key=_robust_rsl_sort, reverse=True)
     for i, s in enumerate(stock_results): s.rsl_rang = i + 1
     
     # 2. MktCap Ranking (Größte Firma = Rang 1)

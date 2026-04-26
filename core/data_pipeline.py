@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import io
 import re
 import requests # type: ignore
@@ -8,7 +9,12 @@ from typing import Any, Callable, Dict, List, Tuple, Optional
 
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from core.entity_matching import normalize_name_for_dedup
+
+# Globaler Logger für Download-Ereignisse
+import logging
+logger = logging.getLogger(__name__)
 
 # Falls yfinance in get_history_batch None zurückgibt
 def _safe_get_columns(data):
@@ -412,3 +418,64 @@ def perform_final_deduplication(results: List[Any]) -> List[Any]:
         final_deduped.append(best)
 
     return final_deduped
+
+def fetch_ticker_prices_robustly(
+    ticker: str,
+    period: str = "18mo",
+    max_attempts: int = 3,
+    nan_threshold: float = 0.20,
+    fixed_sleep: float = 0.2
+) -> Optional[pd.DataFrame]:
+    """
+    Robuste Download-Logik für einen einzelnen Ticker mit Retries und Qualitätsprüfung.
+    Stellt sicher, dass nur valide Daten in die Pipeline gelangen.
+    """
+    import time
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # UPDATE: Zufälliger Sleep zur Vermeidung von Pattern-basierten Rate-Limits
+            if attempt > 1:
+                time.sleep(random.uniform(0.2, 0.8))
+
+            # Isolierter Download pro Ticker
+            df = yf.download(
+                ticker,
+                period=period,
+                auto_adjust=False,
+                progress=False,
+                threads=False
+            )
+
+            if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+                # Vorab-Bereinigung zur Reduktion künstlicher NaNs durch Yahoo-Artefakte
+                df = df.sort_index()
+                df = df[~df.index.duplicated(keep="last")]
+                df = df.ffill(limit=2)
+
+                # Validierung der Spalte, die für RSL entscheidend ist (Adj Close Prio)
+                check_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+                if check_col in df.columns:
+                    nan_share = df[check_col].isna().mean()
+                    if nan_share < nan_threshold:
+                        return df
+                    else:
+                        logger.warning(f"Ticker {ticker}: Hoher NaN-Anteil ({nan_share:.2%}) in Versuch {attempt}.")
+                else:
+                    logger.warning(f"Ticker {ticker}: 'Close'-Spalte fehlt in Versuch {attempt}.")
+            else:
+                logger.debug(f"Ticker {ticker}: Download leer in Versuch {attempt}.")
+
+        except (ValueError, TypeError) as e:
+            # Fängt yfinance-interne Fehler ab (z.B. "No objects to concatenate" oder "Ambiguous truth value")
+            # Diese treten auf, wenn Yahoo Metadaten für einen Ticker hat, aber keine Kurs-Historie.
+            err_msg = str(e)
+            if "concatenate" in err_msg or "ambiguous" in err_msg:
+                logger.debug(f"Ticker {ticker}: Yahoo-Datenfehler ({err_msg}) in Versuch {attempt}.")
+                continue 
+            logger.error(f"Ticker {ticker}: Fehler in Versuch {attempt}: {e}")
+        except Exception as e:
+            logger.error(f"Ticker {ticker}: Fehler in Versuch {attempt}: {e}")
+
+    if max_attempts > 0: logger.debug(f"Ticker {ticker}: Final fehlgeschlagen nach {max_attempts} Versuchen.")
+    return None
