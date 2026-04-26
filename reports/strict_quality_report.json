@@ -1,32 +1,35 @@
 {
-  "created_at": "2026-04-24T15:54:38",
+  "created_at": "2026-04-26T10:22:01",
   "metrics": {
-    "analyzed_count": 16066,
+    "analyzed_count": 10974,
     "candidate_count": 26498,
-    "failed_records_count": 0,
-    "young_records_count": 2098,
-    "dropped_critical_count": 5218,
-    "stale_warn_count": 914,
-    "gap_warn_count": 2391,
+    "failed_records_count": 3990,
+    "young_records_count": 4,
+    "dropped_critical_count": 7207,
+    "stale_warn_count": 84,
+    "gap_warn_count": 908,
     "liquidity_warn_count": 0,
-    "low_trust_count": 448,
-    "invalid_numeric_count": 0,
+    "low_trust_count": 18,
+    "invalid_numeric_count": 8,
     "duplicate_symbols": 0,
     "portfolio_total_count": 6,
-    "portfolio_found_count": 6
+    "portfolio_found_count": 5
   },
   "ratios": {
-    "coverage_ratio": 0.6063099101819005,
-    "failed_ratio": 0.0,
-    "young_ratio": 0.07917578685183788,
-    "critical_drop_ratio": 0.19692052230357007,
-    "stale_warn_ratio": 0.05689032739947716,
-    "gap_warn_ratio": 0.14882360263911365,
+    "coverage_ratio": 0.4141444637331119,
+    "failed_ratio": 0.15057740206808062,
+    "young_ratio": 0.0001509547890406823,
+    "critical_drop_ratio": 0.2719827911540494,
+    "stale_warn_ratio": 0.007654455986878075,
+    "gap_warn_ratio": 0.08274102423911063,
     "liquidity_warn_ratio": 0.0,
-    "low_trust_ratio": 0.02788497448026889,
-    "portfolio_coverage_ratio": 1.0
+    "low_trust_ratio": 0.0016402405686167304,
+    "portfolio_coverage_ratio": 0.8333333333333334
   },
   "strict_mode": false,
   "strict_status": "PASS",
-  "strict_failures": []
+  "strict_failures": [
+    "Coverage zu niedrig: 41.41% < 55.00%",
+    "Ungueltige numerische Werte: 8 > 0"
+  ]
 }
