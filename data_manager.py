@@ -24,6 +24,7 @@ from threading import Lock
 from dataclasses import dataclass, asdict, field
 from core import rsl_integrity as rsl_integrity_core
 from core import final_support as support
+from core.data_pipeline import YF_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -582,14 +583,15 @@ class MarketDataManager:
 
         try:
             # Hebel C: Primärer Batch-Download
-            batch_data = yf.download(
-                to_fetch,
-                period=self.config.get('history_period', '18mo'),
-                group_by='ticker',
-                auto_adjust=False,
-                threads=False,
-                progress=False
-            )
+            with YF_LOCK:
+                batch_data = yf.download(
+                    to_fetch,
+                    period=self.config.get('history_period', '18mo'),
+                    group_by='ticker',
+                    auto_adjust=False,
+                    threads=False,
+                    progress=False
+                )
 
             is_multi = isinstance(batch_data.columns, pd.MultiIndex)
 
@@ -793,7 +795,8 @@ class MarketDataManager:
             return (c['curr'], c['sma'], c.get('vol_eur', 0.0), c['flags'])
         
         try:
-            hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=False)
+            with YF_LOCK:
+                hist = yf.Ticker(ticker).history(period=self.config.get('history_period', '18mo'), auto_adjust=False)
             
             if not hist.empty:
                 # Datenbereinigung für Konsistenz zum Batch-Pfad
@@ -916,8 +919,9 @@ class MarketDataManager:
             time.sleep(delay)
 
         try:
-            t_obj = yf.Ticker(ticker)
-            info = t_obj.info
+            with YF_LOCK:
+                t_obj = yf.Ticker(ticker)
+                info = t_obj.info
             
             # Stabilitäts-Hebel: fast_info Fallback für Market Cap & Currency
             # info ist oft leer oder unvollständig, fast_info nutzt einen stabileren Endpoint
