@@ -148,6 +148,9 @@ def save_excel_report_safely(sheets: Dict[str, pd.DataFrame], filename: str, log
             "re:^candidate_.*score.*": FORMAT_FLOAT_4,
             "re:^candidate_.*component$": FORMAT_FLOAT_4,
             "re:^candidate_.*pct$": FORMAT_PERCENT_1,
+            "re:^candidate_z_.*": FORMAT_FLOAT_4,
+            "candidate_sector_blend": FORMAT_FLOAT_4,
+            "candidate_data_quality_flag": None, # Standard-Boolean Format
             "fallback_fraction": FORMAT_PERCENT_1,
         },
         "etf_summary": {

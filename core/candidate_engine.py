@@ -5,6 +5,8 @@ from typing import List, Dict, Any, Optional, Tuple, Set
 from collections import defaultdict
 import scipy.stats
 
+from .rsl_integrity import _extract_history_object
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,11 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+def _group_weight(size: int) -> float:
+    """FIX 5: Berechnet ein statistisches Vertrauensgewicht (n < 5 = 0.0)."""
+    if size < 5: return 0.0
+    return min(1.0, size / 20.0)
 
 def _winsorize_array(arr: np.ndarray, limits: Tuple[float, float] = (1, 99)) -> np.ndarray:
     """Clippt extreme Ausreisser auf Perzentil-Basis zur numerischen Stabilitaet."""
@@ -285,6 +292,7 @@ def suggest_portfolio_candidates(
             clipped = abs(raw_z) > 5.0
 
             z_scores[idx_global] = {
+                'symbol': getattr(analysis_pool[idx_global], "yahoo_symbol", ""),
                 'z_mom_final': final_z,
                 'z_mom_raw': raw_z,
                 'z_mom_clipped': clipped,
@@ -325,11 +333,25 @@ def suggest_portfolio_candidates(
     require_top = bool(config.get("candidate_require_top_percent", True))
     hold_rank = max(1, int(math.ceil(len(stock_results) * threshold))) if stock_results else None
 
+    def normalize(s):
+        return str(s).strip().upper()
+
     for i, stock in enumerate(analysis_pool):
         # Kandidaten-Filter (jetzt erst anwenden)
         if stock.rsl <= 1.0: continue
         if stock.yahoo_symbol in portfolio_symbols: continue
         
+        symbol = getattr(stock, "yahoo_symbol", "Unknown")
+        zs = z_scores[i]
+        # Verschärfter Drift-Schutz: Konsistenzprüfung zwischen Stock-Objekt und Z-Score Pool (robust via normalize)
+        zs_symbol = zs.get("symbol") if zs else None
+        if not zs or not zs_symbol or normalize(stock.yahoo_symbol) != normalize(zs_symbol):
+            logger.error(
+                f"Z-Score mismatch: stock={stock.yahoo_symbol}, "
+                f"zs={zs_symbol if zs_symbol else 'None'} | idx={i}"
+            )
+            continue
+
         # Metriken für Filterung vorbereiten
         current_rank = int(getattr(stock, "rsl_rang", 0) or 0)
         is_top_tier = (hold_rank is not None and current_rank <= hold_rank)
@@ -377,17 +399,24 @@ def suggest_portfolio_candidates(
             if not (y_sym.endswith(".DE") or y_sym.endswith(".F")):
                 continue
         
-        # Soft-Filter Evaluation
+        # Soft-Filter Evaluation (Point 5: Small-Sample-Schutz analog anwenden)
         penalties_context = {}
-        if allowed_industries and stock.industry not in allowed_industries:
-            penalties_context['industry_out'] = 0.2 # FIX: Soften penalty to avoid Sector Momentum Bias
-        if use_cluster_filter and allowed_clusters and stock.mom_cluster not in allowed_clusters:
-            penalties_context['cluster_out'] = 0.3
-            
-        final_score, details = _calculate_institutional_score(stock, z_scores[i], config, penalties_context, regime_status)
         industry_row = industry_lookup.get(str(stock.industry or "").strip(), {})
+        peer_group_size = int(industry_row.get("Aktien", 0) or 0)
+        ind_w = _group_weight(peer_group_size)
+
+        if allowed_industries and stock.industry not in allowed_industries:
+            penalties_context['industry_out'] = 0.2 * ind_w
+
         cluster_key = str(getattr(stock, "mom_cluster", "") or "").strip()
         cluster_row = cluster_lookup.get(cluster_key, {})
+        clu_w = _group_weight(int(cluster_row.get("Anzahl", 0) or 0))
+
+        if use_cluster_filter and allowed_clusters and cluster_key not in allowed_clusters:
+            penalties_context['cluster_out'] = 0.3 * clu_w
+
+        final_score, details = _calculate_institutional_score(stock, zs, config, penalties_context, regime_status, peer_group_size)
+
         details.update(
             {
                 "symbol": getattr(stock, "yahoo_symbol", ""),
@@ -396,7 +425,6 @@ def suggest_portfolio_candidates(
                 "accel_component": _coerce_float(getattr(stock, "mom_accel", 0.0)) * accel_weight if bool(config.get("candidate_use_accel", True)) else 0.0,
                 "rsl_change_component": _coerce_float(getattr(stock, "rsl_change_1w", 0.0)) * rsl_1w_weight if bool(config.get("candidate_use_rsl_change_1w", True)) else 0.0,
                 "peer_spread_component": _coerce_float(getattr(stock, "peer_spread", 0.0)) * peer_weight if bool(config.get("candidate_use_peer_spread", True)) else 0.0,
-                "industry_neutral_component": _coerce_float(getattr(stock, "mom_score_adj", None), _coerce_float(getattr(stock, "mom_score", None))) - _coerce_float(industry_row.get("Avg_MomScore_Adj"), _coerce_float(industry_row.get("Avg_MomScore"), 0.0)),
                 "industry_rank": industry_row.get("Rank"),
                 "industry_score": industry_row.get("Score"),
                 "cluster": cluster_key or None,
@@ -409,14 +437,88 @@ def suggest_portfolio_candidates(
                 "distance_52w_high_pct": getattr(stock, "distance_52w_high_pct", None),
                 "max_distance_52w_high_pct": max_distance_52w_high_pct,
                 "peer_spread": getattr(stock, "peer_spread", None),
-                "z_mom_raw": z_scores[i]["z_mom_raw"],
-                "z_mom_clipped": z_scores[i]["z_mom_clipped"],
-                "z_mom_zero_sigma": z_scores[i]["z_mom_zero_sigma"],
-                "z_mom_final": z_scores[i]["z_mom_final"],
+                "z_mom_raw": zs.get("z_mom_raw"),
+                "z_mom_clipped": zs.get("z_mom_clipped"),
+                "z_mom_zero_sigma": zs.get("z_mom_zero_sigma"),
+                "z_mom_final": zs.get("z_mom_final"),
+                "z_accel": zs.get("z_accel"),
+                "z_peer": zs.get("z_peer"),
+                "z_dd": zs.get("z_dd"),
+                "z_ulcer": zs.get("z_ulcer"),
+                "z_vol": zs.get("z_vol"),
+                "z_rsl_1w": zs.get("z_rsl_1w"),
+                "sector_blend": zs.get("is_sector_neutral"),
                 "size_proxy_used": getattr(stock, "is_size_proxy", False),
             }
         )
          
+        # Robustheits-Verbesserungen: Validierung & Outlier-Behandlung
+        REQUIRED_FIELDS = [
+            "z_mom_final",
+            "z_accel",
+            "z_peer",
+            "z_dd",
+            "z_vol"
+        ]
+        MAX_ABS_Z = 5.0
+        OUTLIER_PENALTY = 0.5
+
+        def is_invalid(v):
+            return v is None or (isinstance(v, float) and math.isnan(v))
+
+        def is_outlier(v):
+            return isinstance(v, (int, float)) and abs(v) > MAX_ABS_Z
+
+        missing = [f for f in REQUIRED_FIELDS if is_invalid(details.get(f))]
+        if missing:
+            # Logging erweitert um Index und alle Keys
+            logger.warning(
+                f"{symbol} | idx={i} | missing={missing} | "
+                f"z_mom_final={details.get('z_mom_final')} | "
+                f"z_peer={details.get('z_peer')} | "
+                f"raw_zs_keys={list(zs.keys())}"
+            )
+            continue
+
+        outliers = [f for f in REQUIRED_FIELDS if is_outlier(details.get(f))]
+        if outliers:
+            # Point 2: Outlier-Penalty verfeinern (faktor-basiert statt pauschal)
+            logger.warning(f"{symbol}: extreme z-score values detected: {outliers}")
+            outlier_penalty = sum(
+                min(abs(_coerce_float(details.get(f))) / MAX_ABS_Z, 2.0)
+                for f in outliers
+            )
+            final_score -= 0.3 * outlier_penalty
+
+        # FIX 5: Gesamt-Z-Profil prüfen (erkennt unnatürliche/extreme Kombinationen)
+        z_vector = np.array([
+            _coerce_float(zs.get("z_mom_final")),
+            _coerce_float(zs.get("z_accel")),
+            _coerce_float(zs.get("z_peer")),
+            _coerce_float(zs.get("z_dd")),
+            _coerce_float(zs.get("z_vol"))
+        ])
+        z_norm = np.linalg.norm(z_vector)
+        if z_norm > 6.0:
+            final_score *= 0.8
+            details["z_profile_outlier"] = True
+
+        # Point 5: Factor-Fatigue Check (differenziert nach Alpha/Risk)
+        risk_factors = ["z_dd", "z_vol"]
+        alpha_factors = ["z_mom_final", "z_accel", "z_peer"]
+        risk_extreme = sum(abs(_coerce_float(details.get(f))) > 3 for f in risk_factors)
+        alpha_extreme = sum(abs(_coerce_float(details.get(f))) > 3 for f in alpha_factors)
+
+        if risk_extreme >= 2:
+            final_score -= 0.4  # Hohes Risiko wird stärker bestraft
+        elif alpha_extreme >= 3:
+            final_score -= 0.2  # Reine Momentum-Überhitzung milder bestraft
+
+        # Data Quality Flag für den Excel-Export (jetzt inkl. Timing/Profile/Penalty Impact)
+        details["data_quality_flag"] = (
+            len(missing) == 0 and len(outliers) == 0 and not details.get("z_profile_outlier", False)
+        )
+
         if float(final_score) > -10.0: # Filter groben Muell
             scored_candidates.append((final_score, stock, details))
 
@@ -564,12 +666,115 @@ def _zscore(val: float, mean: float, std: float) -> float:
     return float(z)
 
 
+def _calculate_timing_score(stock: Any, config: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+    """
+    Berechnet einen Timing-Score zur Einstiegsoptimierung (Pullback-Logik).
+    Addiert Boni für Nähe zur SMA50, stattgefundene Pullbacks und Bounces.
+    """
+    hist = _extract_history_object(stock)
+    
+    score = 0.0
+    info = {}
+    
+    # Benötigt genügend Historie für SMA50
+    if hist is None or hist.empty or len(hist) < 60:
+        return 0.0, info
+
+    try:
+        # Extraktion der Kursdaten
+        close = hist['Close']
+        low = hist['Low']
+        vol = hist['Volume']
+        
+        curr_price = float(close.iloc[-1])
+        sma_len = int(config.get('sma_short_length', 50))
+        sma50_series = close.rolling(window=sma_len).mean()
+        sma50 = float(sma50_series.iloc[-1])
+        
+        # 1. Nähe zur SMA50 (Proximity)
+        dist_sma50 = (curr_price / sma50) - 1
+        
+        # Trend-Check: Steigt die SMA50? (Über 10 Tage für Glättung)
+        sma_slope_up = sma50 > float(sma50_series.iloc[-10])
+
+        # Ideale Zone: Leicht über der SMA50 (0% bis 4%)
+        if 0 < dist_sma50 <= 0.04:
+            # Voller Bonus nur wenn der Trend (SMA) auch wirklich nach oben zeigt
+            score += 0.5 if sma_slope_up else 0.2
+            info['timing_signal'] = "NEAR_SMA50"
+        # Überdehnt: Weit weg von der SMA50 (>18%)
+        elif dist_sma50 > 0.18:
+            score -= 0.6
+            info['timing_signal'] = "OVEREXTENDED"
+            
+        # 2. Pullback-Struktur (Stattgefundenes Tief)
+        # Suchen nach einem Tiefpunkt nahe der SMA50 in den letzten 10 Handelstagen
+        recent_window = 10
+        min_recent_low = float(low.tail(recent_window).min())
+        
+        pullback_detected = min_recent_low <= sma50 * 1.02 # Tiefpunkt war <= 2% über SMA50
+        if pullback_detected:
+            score += 0.3
+            info['timing_structure'] = "PULLBACK"
+            
+        # 3. Bounce-Bestätigung (Robustere Logik gegen Fake-Bounces)
+        prev_close = float(close.iloc[-2])
+        
+        # Point 3: "Fake Bounce" Schutz durch 3-Tages-Sequenz (Bestätigung)
+        bounce_confirmed = float(close.iloc[-1]) > float(close.iloc[-2]) and float(close.iloc[-2]) > float(close.iloc[-3])
+        is_robust_up = curr_price > prev_close and bounce_confirmed
+        
+        avg_vol = float(vol.tail(20).mean())
+        high_vol = vol.iloc[-1] > avg_vol
+
+        # Sonderfall: SMA50 Rückeroberung (nur valide mit Volumen-Support)
+        reclaimed = (prev_close < sma50_series.iloc[-2]) and (curr_price > sma50)
+        
+        if reclaimed and high_vol:
+            score += 0.5
+            info['timing_confirmation'] = "SMA50_RECLAIMED"
+        elif is_robust_up and pullback_detected:
+            score += 0.2
+            info['timing_confirmation'] = "BOUNCE"
+
+        # FIX 2 & 4: Kontinuierlicher Volumen-Boost (unterscheidet Akkumulation/Distribution)
+        vol_ratio = vol.iloc[-1] / (avg_vol + 1e-6)
+        vol_boost = np.clip((vol_ratio - 1.0), 0.0, 1.0)
+        if is_robust_up and vol_boost > 0:
+            price_change = float(close.iloc[-1]) - float(close.iloc[-2])
+            if price_change > 0:
+                score += 0.3 * vol_boost
+                info['timing_vol'] = f"ACCUM_{vol_boost:.2f}"
+            else:
+                score -= 0.2 * vol_boost
+                info['timing_vol'] = f"DISTR_{vol_boost:.2f}"
+
+        # FIX 3: Trendpersistenz-Filter (SMA50 Slope der letzten 5 Tage)
+        trend_strength = sum(sma50_series.iloc[-i] > sma50_series.iloc[-i-1] for i in range(1, 6))
+        if trend_strength < 3:
+            score *= 0.6
+            info['timing_persistence'] = "WEAK"
+
+        # FIX: Lower-High Filter (Distribution Phasen erkennen)
+        recent_highs = close.iloc[-5:-1]
+        if recent_highs.max() > float(close.iloc[-1]) * 1.05:
+            score *= 0.7
+            info['timing_structure'] = "LOWER_HIGH"
+
+    except Exception:
+        return 0.0, {}
+
+    # Moderates Gewicht: Begrenzung auf +/- 1.0
+    return float(np.clip(score, -1.0, 1.0)), info
+
+
 def _calculate_institutional_score(
     stock: Any, 
     zs: Dict[str, float], 
     config: Dict[str, Any], 
     external_penalties: Dict[str, float], 
-    regime: str
+    regime: str,
+    peer_group_size: int = 0
 ) -> Tuple[float, Dict[str, Any]]:
     """
     Berechnet den Score basierend auf der 'Barra-Style' Logik:
@@ -581,13 +786,20 @@ def _calculate_institutional_score(
     rsl_1w_w = float(config.get("candidate_rsl_change_weight", 0.10))
     peer_w = float(config.get("candidate_peer_spread_weight", 0.40)) if bool(config.get("candidate_use_peer_spread", False)) else 0.0
 
+    # FIX 1: Soft-Cap für Momentum via tanh
+    def soft_cap(z, cap=3.0):
+        return np.tanh(z / cap) * cap
+
     # 1) ALPHA (Regime-unabhängige Trendstärke)
-    alpha = (
-        1.00 * zs.get('z_mom_final', 0.0) +
-        accel_w * zs.get('z_accel', 0.0) +
-        peer_w * zs.get('z_peer', 0.0) +
-        rsl_1w_w * zs.get('z_rsl_1w', 0.0)
-    )
+    z_mom_capped = soft_cap(zs.get('z_mom_final', 0.0), 3.0)
+    peer_w_eff = peer_w * _group_weight(peer_group_size)
+
+    # FIX 1: Acceleration nur bei "nicht-saturiertem" Momentum voll zählen
+    mom_saturation = min(1.0, abs(z_mom_capped) / 3.0)
+    accel_damp = 1.0 - 0.5 * mom_saturation
+
+    alpha = (1.00 * z_mom_capped + accel_w * accel_damp * zs.get('z_accel', 0.0) +
+             peer_w_eff * zs.get('z_peer', 0.0) + rsl_1w_w * zs.get('z_rsl_1w', 0.0))
 
     # 2) RISK (Downside-fokussiert)
     z_ulcer = zs.get('z_ulcer', 0.0)
@@ -629,28 +841,33 @@ def _calculate_institutional_score(
     # confidence fliesst nun subtraktiv in den final_score ein
 
     # 5) DENSITY (Belohnt nur Übereinstimmung positiver Signale)
-    # FIX: Robustes Handling von Z-Scores für die Dichte-Berechnung
-    z_keys = ['z_mom', 'z_accel', 'z_peer', 'z_rsl_1w']
+    # Robustes Handling von Z-Scores für die Dichte-Berechnung
+    z_keys = ['z_mom_final', 'z_accel', 'z_peer', 'z_rsl_1w']
     alpha_signals = [max(0.0, _coerce_float(zs.get(k, 0.0))) for k in z_keys]
     
     density_strength = sum(alpha_signals) / max(1.0, len(alpha_signals))
     # HEBEL: Cap bei 1.05 zur Vermeidung von Momentum-Doubling / Crowding-Risk
     density_boost = np.clip(1.0 + 0.05 * density_strength, 1.0, 1.05)
 
+    # 5.5) TIMING (Wurde in den Main-Loop verschoben für explizites Ranking)
+
     # Echte Factor Density für das Profil-Monitoring (Summe der absoluten Alpha-Z-Scores)
     active_factor_sum = sum(abs(_coerce_float(zs.get(k, 0.0))) for k in ['z_mom_final', 'z_accel', 'z_peer', 'z_dd', 'z_vol', 'z_ulcer'])
 
-    # 6) FINALE BERECHNUNG
-    raw_score = alpha - (lambda_risk * risk)
-    # HEBEL: Alpha bleibt interpretierbar, Confidence bestraft unsaubere Daten am Ende.
-    final_score = (raw_score * quality * density_boost) - confidence_penalty
+    # 6) FINALE BERECHNUNG (FIX 4: Risiko als Multiplikator)
+    # FIX 2: Risiko als Multiplikator mit Konvexität (bestraft mittleres Risiko stärker)
+    risk_adj = 1.0 / (1.0 + lambda_risk * (max(0.0, risk) ** 1.3))
+    # HEBEL: Alpha wird durch Risiko skaliert (erwürgt bei Gefahr)
+    final_score = (alpha * risk_adj * quality * density_boost) - confidence_penalty
 
     return float(final_score), {
         "alpha": float(alpha),
+        "z_mom_capped": float(z_mom_capped),
         "risk": float(risk),
+        "risk_adj": float(risk_adj),
         "quality": float(quality),
         "density_boost": float(density_boost),
-        "raw_score": float(raw_score),
+        "raw_score": float(alpha * risk_adj),
         "active_factor_score": float(active_factor_sum),
         "penalty_multiplier": float(quality),
         "base_score": _coerce_float(zs.get('z_mom_final', 0.0))

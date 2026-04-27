@@ -4,6 +4,7 @@ import random
 import io
 import re
 import requests # type: ignore
+import threading
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Tuple, Optional
 
@@ -15,6 +16,9 @@ from core.entity_matching import normalize_name_for_dedup
 # Globaler Logger für Download-Ereignisse
 import logging
 logger = logging.getLogger(__name__)
+
+# Globaler Lock für yfinance-Abrufe zur Vermeidung von Concurrency-Bugs (dictionary changed size)
+YF_LOCK = threading.Lock()
 
 # Falls yfinance in get_history_batch None zurückgibt
 def _safe_get_columns(data):
@@ -439,13 +443,14 @@ def fetch_ticker_prices_robustly(
                 time.sleep(random.uniform(0.2, 0.8))
 
             # Isolierter Download pro Ticker
-            df = yf.download(
-                ticker,
-                period=period,
-                auto_adjust=False,
-                progress=False,
-                threads=False
-            )
+            with YF_LOCK:
+                df = yf.download(
+                    ticker,
+                    period=period,
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False
+                )
 
             if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
                 # Vorab-Bereinigung zur Reduktion künstlicher NaNs durch Yahoo-Artefakte

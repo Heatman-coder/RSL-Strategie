@@ -130,6 +130,14 @@ RAW_EXPORT_COLUMN_ORDER = [
     "candidate_z_mom_clipped",
     "candidate_z_mom_zero_sigma",
     "candidate_z_mom_final",
+    "candidate_z_accel",
+    "candidate_z_peer",
+    "candidate_z_dd",
+    "candidate_z_ulcer",
+    "candidate_z_vol",
+    "candidate_z_rsl_1w",
+    "candidate_sector_blend",
+    "candidate_data_quality_flag",
     "candidate_size_proxy_used",
     "candidate_final_score"
 ]
@@ -1205,6 +1213,17 @@ def render_analysis_output(
                         f" | Peer-Spread={_fmt_plain(detail.get('peer_spread'))}"
                         f" | Auswahl={detail.get('selection_reason', '-')}"
                     )
+
+                    # NEU: Timing-Details anzeigen (Pullback / SMA50 logic)
+                    timing_line = ""
+                    t_bonus = float(detail.get("timing_bonus", 0.0))
+                    if t_bonus != 0.0:
+                        # Dashboard-Signale für Volumen-Boost und Trend-Persistenz vervollständigen
+                        sig_keys = ["timing_signal", "timing_structure", "timing_confirmation", 
+                                   "timing_vol", "timing_persistence", "timing_penalty"]
+                        t_signals = [str(detail.get(k)) for k in sig_keys if detail.get(k)]
+                        sig_txt = f" ({', '.join(t_signals)})" if t_signals else ""
+                        timing_line = f"    Timing:  Bonus={_fmt_component(t_bonus)}{sig_txt}"
                     
                     # NEU: Penalty-Details anzeigen (Monitoring fuer Factor Overlap)
                     penalties_line = ""
@@ -1231,6 +1250,8 @@ def render_analysis_output(
                             penalties_line = f"    Risk-Adj: Mult={mult:.2f}{density_info} ({', '.join(active_p)})"
 
                     block = f"{line1}\n{line2}\n{line3}\n{score_line}\n{filter_line}\n{context_line}"
+                    if timing_line:
+                        block += f"\n{timing_line}"
                     if penalties_line:
                         block += f"\n{penalties_line}"
                     print(f"{s_color}{block}\033[0m")
